@@ -14,25 +14,37 @@
       "uttid": "videoSRC01_1280x720_30_0-150",
       "num_frame": 141,
       "height": 384,
-      "width": 640
+      "width": 640,
+      "source_video_stem": "videoSRC01_1280x720_30",
+      "cut_start": 0,
+      "cut_end": 150
     },
     {
       "uttid": "videoSRC02_1280x720_30_0-150",
       "num_frame": 141,
       "height": 384,
-      "width": 640
+      "width": 640,
+      "source_video_stem": "videoSRC02_1280x720_30",
+      "cut_start": 0,
+      "cut_end": 150
     },
     {
       "uttid": "videoSRC03_1280x720_30_0-150",
       "num_frame": 141,
       "height": 384,
-      "width": 640
+      "width": 640,
+      "source_video_stem": "videoSRC03_1280x720_30",
+      "cut_start": 0,
+      "cut_end": 150
     },
     {
       "uttid": "videoSRC04_1280x720_30_0-150",
       "num_frame": 141,
       "height": 384,
-      "width": 640
+      "width": 640,
+      "source_video_stem": "videoSRC04_1280x720_30",
+      "cut_start": 0,
+      "cut_end": 150
     }
   ]
 }
