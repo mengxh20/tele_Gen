@@ -64,6 +64,7 @@ from helios.utils.utils_helios_post import (
 )
 from helios.utils.utils_recycle_batch import get_timesteps
 from helios.videoalign.inference import VideoVLMRewardInference
+from omegaconf import OmegaConf
 from packaging import version
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
@@ -103,12 +104,32 @@ if is_wandb_available():
 check_min_version("0.36.0.dev0")
 
 logger = get_logger(__name__)
+HELIOS_ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_helios_path(path: str | None) -> str | None:
+    if path is None:
+        return None
+
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return str(candidate)
+
+    helios_relative = HELIOS_ROOT / candidate
+    if helios_relative.exists():
+        return str(helios_relative)
+
+    return path
 
 if is_torch_npu_available():
     torch.npu.config.allow_internal_format = False
 
 
 def main(args):
+    ema_deepspeed_config_file = _resolve_helios_path(args.training_config.ema_deepspeed_config_file)
+    dmd_generator_deepspeed_config = _resolve_helios_path(args.training_config.dmd_generator_deepspeed_config)
+    dmd_critic_deepspeed_config = _resolve_helios_path(args.training_config.dmd_critic_deepspeed_config)
+
     if args.data_config.use_stage3_dataset:
         from helios.dataset.dataloader_dmd import (
             BucketedFeatureDataset,
@@ -152,12 +173,12 @@ def main(args):
     deepspeed_plugins = None
     dmd_deepspeed_training = (
         args.training_config.is_train_dmd
-        and args.training_config.dmd_generator_deepspeed_config is not None
-        and args.training_config.dmd_critic_deepspeed_config is not None
+        and dmd_generator_deepspeed_config is not None
+        and dmd_critic_deepspeed_config is not None
     )
     if dmd_deepspeed_training:
-        generator_zero_plugin = DeepSpeedPlugin(hf_ds_config=args.training_config.dmd_generator_deepspeed_config)
-        critic_zero_plugin = DeepSpeedPlugin(hf_ds_config=args.training_config.dmd_critic_deepspeed_config)
+        generator_zero_plugin = DeepSpeedPlugin(hf_ds_config=dmd_generator_deepspeed_config)
+        critic_zero_plugin = DeepSpeedPlugin(hf_ds_config=dmd_critic_deepspeed_config)
         deepspeed_plugins = {"generator": generator_zero_plugin, "critic_model": critic_zero_plugin}
 
     accelerator = Accelerator(
@@ -171,8 +192,8 @@ def main(args):
     if (
         accelerator.distributed_type == DistributedType.DEEPSPEED
         and args.training_config.is_train_dmd
-        and not args.training_config.dmd_generator_deepspeed_config
-        and not args.training_config.dmd_critic_deepspeed_config
+        and not dmd_generator_deepspeed_config
+        and not dmd_critic_deepspeed_config
     ):
         raise ValueError("`--deepspeed_config` is required for DMD distillation.")
 
@@ -258,7 +279,7 @@ def main(args):
         noise_scheduler_copy = copy.deepcopy(noise_scheduler)
     else:
         noise_scheduler = UniPCMultistepScheduler.from_pretrained(
-            "scripts/accelerate_configs/scheduler_config.json"
+            _resolve_helios_path("scripts/accelerate_configs")
         )
         noise_scheduler_copy = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
         if args.training_config.is_train_dmd:
@@ -429,7 +450,7 @@ def main(args):
     if args.training_config.use_ema:
         model_cls = HeliosTransformer3DModel
         transformer_cpu = copy.deepcopy(transformer)
-        with open(args.training_config.ema_deepspeed_config_file, "r") as f:
+        with open(ema_deepspeed_config_file, "r") as f:
             ds_config = json.load(f)
 
     # get fake score model
@@ -1222,9 +1243,9 @@ def main(args):
                     prompt_embeds = batch["prompt_embeds"].to(accelerator.device)
 
                     # Prepare stage1 clean data
-                    history_latents = batch["history_latents"].to(accelerator.device)
+                    history_latents = batch["history_latents"].to(accelerator.device) # 似乎模型学习的是history和target latents的关系，数据集里就没有存原始视频
                     target_latents = batch["target_latents"].to(accelerator.device)
-                    x0_latents = batch["x0_latents"].to(accelerator.device)
+                    x0_latents = batch["x0_latents"].to(accelerator.device)  # 首帧的latent
                     (
                         model_input,  # torch.Size([2, 16, 9, 60, 104])
                         indices_hidden_states,  # torch.Size([2, 9])
@@ -2443,8 +2464,6 @@ def log_validation(
 
 
 if __name__ == "__main__":
-    from omegaconf import OmegaConf
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     args = parser.parse_args()

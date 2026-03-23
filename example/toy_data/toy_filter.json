@@ -2,45 +2,661 @@
   {
     "cut": [
       0,
-      81
+      150
     ],
     "crop": [
       0,
-      832,
+      1280,
       0,
-      480
+      720
     ],
-    "fps": 24.0,
-    "num_frames": 81,
+    "fps": 30.0,
+    "num_frames": 150,
     "resolution": {
-      "height": 480,
-      "width": 832
+      "height": 720,
+      "width": 1280
     },
     "cap": [
-      "A stunning mid-afternoon landscape photograph with a low camera angle, showcasing several giant wooly mammoths treading through a snowy meadow. Their long, wooly fur gently billows in the brisk wind as they move, creating a sense of natural movement. Snow-covered trees and dramatic snow-capped mountains loom in the distance, adding to the majestic setting. Wispy clouds and a high sun cast a warm glow over the scene, enhancing the serene and awe-inspiring atmosphere. The depth of field brings out the detailed textures of the mammoths and the snowy environment, capturing every nuance of these prehistoric giants in breathtaking clarity."
+      ""
     ],
-    "path": "videos/2_240_ori81.mp4"
+    "path": "videos/videoSRC01_1280x720_30.mp4"
   },
   {
     "cut": [
       0,
-      129
+      150
     ],
     "crop": [
       0,
-      832,
+      1280,
       0,
-      480
+      720
     ],
-    "fps": 24.0,
-    "num_frames": 129,
+    "fps": 30.0,
+    "num_frames": 150,
     "resolution": {
-      "height": 480,
-      "width": 832
+      "height": 720,
+      "width": 1280
     },
     "cap": [
-      "An old man in blue jeans and a white T-shirt takes a leisurely stroll along a bustling street in Mumbai, India, during a breathtaking sunset. He walks with a gentle sway, his weathered face reflecting the warm hues of the setting sun. His hands rest casually in his pockets, and he appears content and at peace. The background features a vibrant mix of colorful buildings, street vendors, and pedestrians, with the sky painted in shades of orange, pink, and purple. The photo has a nostalgic and documentary style, capturing the essence of a serene moment amidst the city's energy. A medium shot with a soft focus on the old man."
+      ""
     ],
-    "path": "videos/239_120_ori129.mp4"
+    "path": "videos/videoSRC02_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC03_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC04_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      125
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 25.0,
+    "num_frames": 125,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC05_1280x720_25.mp4"
+  },
+  {
+    "cut": [
+      0,
+      125
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 25.0,
+    "num_frames": 125,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC06_1280x720_25.mp4"
+  },
+  {
+    "cut": [
+      0,
+      125
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 25.0,
+    "num_frames": 125,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC07_1280x720_25.mp4"
+  },
+  {
+    "cut": [
+      0,
+      125
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 25.0,
+    "num_frames": 125,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC08_1280x720_25.mp4"
+  },
+  {
+    "cut": [
+      0,
+      125
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 25.0,
+    "num_frames": 125,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC09_1280x720_25.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC10_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC11_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC12_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC13_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC14_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC15_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC16_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      120
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 24.0,
+    "num_frames": 120,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC17_1280x720_24.mp4"
+  },
+  {
+    "cut": [
+      0,
+      125
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 25.0,
+    "num_frames": 125,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC18_1280x720_25.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC19_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      125
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 25.0,
+    "num_frames": 125,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC20_1280x720_25.mp4"
+  },
+  {
+    "cut": [
+      0,
+      120
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 24.0,
+    "num_frames": 120,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC21_1280x720_24.mp4"
+  },
+  {
+    "cut": [
+      0,
+      120
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 24.0,
+    "num_frames": 120,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC22_1280x720_24.mp4"
+  },
+  {
+    "cut": [
+      0,
+      120
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 24.0,
+    "num_frames": 120,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC23_1280x720_24.mp4"
+  },
+  {
+    "cut": [
+      0,
+      120
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 24.0,
+    "num_frames": 120,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC24_1280x720_24.mp4"
+  },
+  {
+    "cut": [
+      0,
+      120
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 24.0,
+    "num_frames": 120,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC25_1280x720_24.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC26_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC27_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC28_1280x720_30.mp4"
+  },
+  {
+    "cut": [
+      0,
+      120
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 24.0,
+    "num_frames": 120,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC29_1280x720_24.mp4"
+  },
+  {
+    "cut": [
+      0,
+      150
+    ],
+    "crop": [
+      0,
+      1280,
+      0,
+      720
+    ],
+    "fps": 30.0,
+    "num_frames": 150,
+    "resolution": {
+      "height": 720,
+      "width": 1280
+    },
+    "cap": [
+      ""
+    ],
+    "path": "videos/videoSRC30_1280x720_30.mp4"
   }
 ]

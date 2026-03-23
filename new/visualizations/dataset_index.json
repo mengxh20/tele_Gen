@@ -1,0 +1,38 @@
+{
+  "num_files_considered": 4,
+  "files": [
+    "/gemini/platform/public/luojx/team/mengxh/codes/Helios/example/toy_data/latents_short/toy_data/videoSRC01_1280x720_30_0-150_141_384_640.pt",
+    "/gemini/platform/public/luojx/team/mengxh/codes/Helios/example/toy_data/latents_short/toy_data/videoSRC02_1280x720_30_0-150_141_384_640.pt",
+    "/gemini/platform/public/luojx/team/mengxh/codes/Helios/example/toy_data/latents_short/toy_data/videoSRC03_1280x720_30_0-150_141_384_640.pt",
+    "/gemini/platform/public/luojx/team/mengxh/codes/Helios/example/toy_data/latents_short/toy_data/videoSRC04_1280x720_30_0-150_141_384_640.pt"
+  ],
+  "bucket_counts": {
+    "141x384x640": 4
+  },
+  "samples": [
+    {
+      "uttid": "videoSRC01_1280x720_30_0-150",
+      "num_frame": 141,
+      "height": 384,
+      "width": 640
+    },
+    {
+      "uttid": "videoSRC02_1280x720_30_0-150",
+      "num_frame": 141,
+      "height": 384,
+      "width": 640
+    },
+    {
+      "uttid": "videoSRC03_1280x720_30_0-150",
+      "num_frame": 141,
+      "height": 384,
+      "width": 640
+    },
+    {
+      "uttid": "videoSRC04_1280x720_30_0-150",
+      "num_frame": 141,
+      "height": 384,
+      "width": 640
+    }
+  ]
+}

@@ -283,7 +283,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="BestWishYsh/Helios-Base",
+        default="/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base",
         help="Pretrained model path",
     )
     args = parser.parse_args()

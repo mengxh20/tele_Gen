@@ -62,12 +62,19 @@ export NCCL_IB_TIMEOUT=22
 #################################################################
 ## ACCELERATE CONFIG
 #################################################################
-MASTER_ADDR=$ARNOLD_WORKER_0_HOST
-ports=(`echo $METIS_WORKER_0_PORT | tr ',' ' '`)
-export MASTER_PORT=${ports[0]}
-NUM_MACHINES=$ARNOLD_WORKER_NUM
-MACHINE_RANK=$ARNOLD_ID
-NUM_PROCESSES_PER_MACHINE=$ARNOLD_WORKER_GPU
+# MASTER_ADDR=$ARNOLD_WORKER_0_HOST
+# ports=(`echo $METIS_WORKER_0_PORT | tr ',' ' '`)
+# export MASTER_PORT=${ports[0]}
+# NUM_MACHINES=$ARNOLD_WORKER_NUM
+# MACHINE_RANK=$ARNOLD_ID
+# NUM_PROCESSES_PER_MACHINE=$ARNOLD_WORKER_GPU
+export MASTER_ADDR=127.0.0.1      # 或 localhost
+export MASTER_PORT=29500          # 任意一个没被占用的端口
+export NUM_MACHINES=1
+export MACHINE_RANK=0
+export NUM_PROCESSES_PER_MACHINE=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
 
 # export CUDA_VISIBLE_DEVICES=0
 # NUM_PROCESSES_PER_MACHINE=1

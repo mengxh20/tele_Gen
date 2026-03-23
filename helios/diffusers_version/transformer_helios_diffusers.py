@@ -149,6 +149,10 @@ class HeliosAttnProcessor:
             # Reference: https://github.com/huggingface/diffusers/pull/12909
             parallel_config=(self._parallel_config if encoder_hidden_states is None else None),
         )
+        # Some hub attention kernels (for example flash-attn 3 hub) return
+        # `(output, lse, ...)` even when callers only expect the attention output.
+        if isinstance(hidden_states, (tuple, list)):
+            hidden_states = hidden_states[0]
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 

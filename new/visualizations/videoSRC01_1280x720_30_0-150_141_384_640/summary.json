@@ -1,0 +1,55 @@
+{
+  "file_path": "/gemini/platform/public/luojx/team/mengxh/codes/Helios/example/toy_data/latents_short/toy_data/videoSRC01_1280x720_30_0-150_141_384_640.pt",
+  "parsed_from_filename": {
+    "uttid": "videoSRC01_1280x720_30_0-150",
+    "num_frame": 141,
+    "height": 384,
+    "width": 640
+  },
+  "keys": [
+    "first_frames_image",
+    "prompt_embed",
+    "prompt_raw",
+    "vae_latent"
+  ],
+  "payload": {
+    "vae_latent": {
+      "type": "tensor",
+      "shape": [
+        4,
+        16,
+        9,
+        48,
+        80
+      ],
+      "dtype": "torch.float32",
+      "numel": 2211840,
+      "min": -2.6885359287261963,
+      "max": 3.4049127101898193,
+      "mean": -0.1560865342617035,
+      "std": 0.8256452083587646
+    },
+    "prompt_embed": {
+      "type": "tensor",
+      "shape": [
+        512,
+        4096
+      ],
+      "dtype": "torch.bfloat16",
+      "numel": 2097152,
+      "min": -0.75,
+      "max": 0.50390625,
+      "mean": -6.724505396960012e-07,
+      "std": 0.0011391914449632168
+    },
+    "first_frames_image": {
+      "type": "PIL.Image",
+      "mode": "RGB",
+      "size": [
+        640,
+        384
+      ]
+    },
+    "prompt_raw": ""
+  }
+}

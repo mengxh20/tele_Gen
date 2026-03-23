@@ -26,13 +26,14 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
 from diffusers.loaders import HeliosLoraLoaderMixin
-from diffusers.models import AutoencoderKLWan, HeliosTransformer3DModel
+from diffusers.models import AutoencoderKLWan
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.schedulers import HeliosScheduler
 from diffusers.utils import is_ftfy_available, is_torch_xla_available, logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 
+from .scheduling_helios_diffusers import HeliosScheduler
+from .transformer_helios_diffusers import HeliosTransformer3DModel
 from ..pipelines.pipeline_output import HeliosPipelineOutput
 
 

@@ -8,6 +8,9 @@ export TORCH_LOGS="+dynamo,recompiles,graph_breaks"
 export TORCHDYNAMO_VERBOSE=1
 export TORCH_NCCL_ENABLE_MONITORING=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.9"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 #################################################################
 
 
@@ -35,24 +38,35 @@ export NCCL_IB_TIMEOUT=22
 #################################################################
 ## DIST
 #################################################################
-MASTER_ADDR=$ARNOLD_WORKER_0_HOST
-ports=(`echo $METIS_WORKER_0_PORT | tr ',' ' '`)
-MASTER_PORT=${ports[0]}
-NNODES=$ARNOLD_WORKER_NUM
-NODE_RANK=$ARNOLD_ID
-GPUS_PER_NODE=$ARNOLD_WORKER_GPU
+# MASTER_ADDR=$ARNOLD_WORKER_0_HOST
+# ports=(`echo $METIS_WORKER_0_PORT | tr ',' ' '`)
+# MASTER_PORT=${ports[0]}
+# NUM_MACHINES=$ARNOLD_WORKER_NUM
+# MACHINE_RANK=$ARNOLD_ID
+# NUM_PROCESSES_PER_MACHINE=$ARNOLD_WORKER_GPU
+export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}      # 或 localhost
+export MASTER_PORT=${MASTER_PORT:-29500}          # 任意一个没被占用的端口
+export NUM_MACHINES=${NUM_MACHINES:-1}
+export MACHINE_RANK=${MACHINE_RANK:-0}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+export NUM_PROCESSES_PER_MACHINE=${NUM_PROCESSES_PER_MACHINE:-1}
 
 # export CUDA_VISIBLE_DEVICES=1
-# MASTER_PORT=12345
-# GPUS_PER_NODE=1
-# NNODES=1
-# NODE_RANK=0
+# export MASTER_PORT=12345
+# export NUM_PROCESSES_PER_MACHINE=1
+# export NUM_MACHINES=1
+# export MACHINE_RANK=0
 
-WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+VISIBLE_GPU_COUNT=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l)
+if [ "${NUM_PROCESSES_PER_MACHINE}" -gt "${VISIBLE_GPU_COUNT}" ]; then
+    echo "NUM_PROCESSES_PER_MACHINE (${NUM_PROCESSES_PER_MACHINE}) exceeds visible GPUs (${VISIBLE_GPU_COUNT})."
+    exit 1
+fi
 
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
-if [ ! -z $RDZV_BACKEND ]; then
-    DISTRIBUTED_ARGS="${DISTRIBUTED_ARGS} --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT --rdzv_id 9863 --rdzv_backend c10d"
+WORLD_SIZE=$((NUM_PROCESSES_PER_MACHINE * NUM_MACHINES))
+DISTRIBUTED_ARGS="--nproc_per_node ${NUM_PROCESSES_PER_MACHINE} --nnodes ${NUM_MACHINES} --node_rank ${MACHINE_RANK} --master_addr ${MASTER_ADDR} --master_port ${MASTER_PORT}"
+if [ -n "${RDZV_BACKEND}" ]; then
+    DISTRIBUTED_ARGS="${DISTRIBUTED_ARGS} --rdzv_endpoint ${MASTER_ADDR}:${MASTER_PORT} --rdzv_id 9863 --rdzv_backend ${RDZV_BACKEND}"
     export NCCL_SHM_DISABLE=1
 fi
 

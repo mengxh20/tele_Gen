@@ -34,6 +34,27 @@ from diffusers.models import AutoencoderKLWan
 from diffusers.utils import export_to_video, load_image, load_video
 
 
+def set_transformer_attention_backend(transformer, enable_compile: bool) -> str:
+    if enable_compile:
+        # flash-attn3 backend will be traced by torch.compile and fails on fake tensors.
+        backend_candidates = ("_native_flash", "native", "_native_efficient", "_native_math")
+    else:
+        backend_candidates = ("_flash_3_hub", "flash_hub")
+
+    last_error = None
+    for backend in backend_candidates:
+        try:
+            transformer.set_attention_backend(backend)
+            print(f"[attention] backend={backend}")
+            return backend
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(
+        f"Failed to set attention backend from {backend_candidates}. Last error: {last_error}"
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate video with model")
 
@@ -214,10 +235,7 @@ def main():
         transformer = replace_rmsnorm_with_fp32(transformer)
         transformer = replace_all_norms_with_flash_norms(transformer)
         replace_rope_with_flash_rope()
-    try:
-        transformer.set_attention_backend("_flash_3_hub")
-    except Exception:
-        transformer.set_attention_backend("flash_hub")
+    set_transformer_attention_backend(transformer, args.enable_compile)
 
     vae = AutoencoderKLWan.from_pretrained(
         args.base_model_path,

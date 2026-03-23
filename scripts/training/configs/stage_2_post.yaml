@@ -30,8 +30,8 @@ data_config:
 
 model_config:
   # ---- Path ----
-  pretrained_model_name_or_path: "BestWishYsh/Helios-Base"
-  transformer_model_name_or_path: "BestWishYsh/Helios-Mid"
+  pretrained_model_name_or_path: "/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base"
+  transformer_model_name_or_path: "/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Mid"
   subfolder: "transformer_init"
   load_checkpoints_custom: false
   # load_model_path:
