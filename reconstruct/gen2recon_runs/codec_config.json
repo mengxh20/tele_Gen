@@ -1,0 +1,6 @@
+{
+  "temporal_factor": 2,
+  "spatial_factor": 2,
+  "quant_dtype": "int8",
+  "keyframe_dtype": "float16"
+}

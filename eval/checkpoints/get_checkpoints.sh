@@ -1,0 +1,1 @@
+hf download BestWishYsh/HeliosBench-Weights --local-dir ./

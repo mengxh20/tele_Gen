@@ -1,0 +1,2 @@
+# Please refer to here for installation: https://github.com/Ascend/pytorch?tab=readme-ov-file#ascend-auxiliary-software
+torch_npu==2.7.1    # or torch_npu=2.7.1.post2
