@@ -11,6 +11,7 @@ from diffusers.video_processor import VideoProcessor
 DEFAULT_BASE_MODEL_PATH = "/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base"
 LATENT_FORMAT_V1 = "helios_vae_latent_v1"
 LATENT_FORMAT_V2 = "helios_vae_latent_v2"
+LOW_LATENT_FORMAT_V1 = "helios_low_latent_v1"
 ModelBundle = Tuple[AutoencoderKLWan, VideoProcessor, torch.Tensor, torch.Tensor]
 _RESOLUTION_PATTERN = re.compile(r"^(?P<width>\d+)x(?P<height>\d+)$")
 
@@ -191,6 +192,27 @@ def build_chunk_frame_ranges(chunk_frame_counts: Sequence[int]) -> List[Tuple[in
         frame_ranges.append((start, end))
         start = end
     return frame_ranges
+
+
+def flatten_latent_chunks(latent_chunks: Sequence[torch.Tensor]) -> torch.Tensor:
+    if not latent_chunks:
+        raise ValueError("Expected at least one latent chunk.")
+    return torch.cat([chunk.float().contiguous() for chunk in latent_chunks], dim=1)
+
+
+def split_full_latents(full_latents: torch.Tensor, chunk_lengths: Sequence[int]) -> List[torch.Tensor]:
+    restored_chunks: List[torch.Tensor] = []
+    start = 0
+    for length in chunk_lengths:
+        end = start + int(length)
+        restored_chunks.append(full_latents[:, start:end].contiguous())
+        start = end
+
+    if start != full_latents.shape[1]:
+        raise ValueError(
+            f"Chunk lengths do not match full latent length: used {start}, total {full_latents.shape[1]}."
+        )
+    return restored_chunks
 
 
 def resolve_model_path(

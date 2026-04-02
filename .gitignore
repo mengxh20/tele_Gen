@@ -42,7 +42,9 @@ Videoreward
 1_formal_ckpts
 demo_data
 example
-reconstruct/latents
+reconstruct/latent*
 reconstruct/recovered*
-reconstruct/gen2recon_runs*
+reconstruct/recover_runs*
+reconstruct/recover_outputs*
 reconstruct/__pycache__
+reconstruct/video*

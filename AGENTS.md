@@ -23,17 +23,17 @@
 - 如果需求或当前实现偏离“压缩与恢复主线”，需要明确指出
 
 ## 关键入口
-- 训练启动脚本：`scripts/training/train_ddp.sh`
-- 训练主程序：`train_helios.py`
+- 训练启动脚本：`scripts/training/train_recover_ddp.sh`
+- 训练主程序：`reconstruct/recover.py`
 - 压缩入口：`reconstruct/encoder.py`
-- 恢复入口：`reconstruct/decoder.py`
-- 说明：`reconstruct/gen2recon.py` 当前不是正式主入口；文档、方案和实现中不要将其默认视为稳定入口
+- 恢复入口：`reconstruct/recover.py`
+- 辅助解码工具：`reconstruct/decoder.py` 保留，但不是压缩恢复主线入口
 
 ## 目录职责理解
 - `reconstruct/`：压缩、latent 表达、恢复、实验验证、可视化，以及与压缩恢复链路直接相关的新逻辑
 - `helios/`：Helios 的核心模型、pipeline、scheduler、dataset、utils 等底层实现
-- `scripts/training/`：训练脚本与配置，作为可复用的 Helios 训练能力入口
-- `scripts/inference/`：原始 Helios 推理脚本，主要服务 t2v / i2v / v2v 等通用生成能力
+- `scripts/training/`：训练脚本与配置；压缩恢复主线训练入口为 `train_recover_ddp.sh`
+- `scripts/inference/`：推理脚本；压缩恢复主线入口为 `infer_recover_ddp.sh`，其余脚本主要服务 t2v / i2v / v2v 等通用生成能力
 
 ## 改动边界
 - 新增代码默认优先放在 `reconstruct/`
@@ -57,6 +57,7 @@
   - 恢复视频的时序连续性、结构稳定性、清晰度与细节表现
   - 训练与推理链路是否贴合真实压缩恢复场景
 - 如果通用生成能力优化与压缩恢复目标冲突，应优先选择压缩恢复目标
+- 推理主链路默认只输出 `low_latents`、`recover_latents` 和 `metrics`，不默认生成视频
 
 ## 协作要求
 - 每次接到需求时，先解释方案，再改代码
