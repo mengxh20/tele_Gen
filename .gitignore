@@ -44,3 +44,5 @@ demo_data
 example
 reconstruct/latents
 reconstruct/recovered*
+reconstruct/gen2recon_runs*
+reconstruct/__pycache__
