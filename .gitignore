@@ -47,4 +47,4 @@ reconstruct/recovered*
 reconstruct/recover_runs*
 reconstruct/recover_outputs*
 reconstruct/__pycache__
-reconstruct/video*
+reconstruct/*video*
