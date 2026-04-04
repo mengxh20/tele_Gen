@@ -13,6 +13,7 @@ recover.py 是压缩与恢复主线的核心入口，负责两类工作：
 """
 
 import argparse
+import inspect
 import json
 import math
 import os
@@ -393,6 +394,13 @@ def import_stage1_prepare_fn():
     from helios.utils.utils_helios_base import prepare_stage1_clean_input_from_latents
 
     return prepare_stage1_clean_input_from_latents
+
+
+def import_schedule_shift_fn():
+    """导入 Helios 的动态调度偏移函数。"""
+    from helios.utils.utils_base import apply_schedule_shift
+
+    return apply_schedule_shift
 
 
 def parse_accelerator_mixed_precision(weight_dtype: str) -> str:
@@ -1062,13 +1070,22 @@ def command_infer(args: argparse.Namespace) -> None:
                     metrics_dir=metrics_dir,
                 )
                 low_payload = build_low_latent_payload(sequence)
+                torch.save(low_payload, low_latent_path)
+                ensure_finite_recover_state(
+                    stage="final_output",
+                    input_path=sequence.path,
+                    section_start=None,
+                    step_idx=None,
+                    timestep=None,
+                    sigma=None,
+                    latents=recovered_full_latents,
+                )
                 recover_payload = build_recover_latent_payload(
                     sequence=sequence,
                     recovered_full_latents=recovered_full_latents,
                     base_model_path=str(base_model_path),
                     checkpoint_dir=checkpoint_dir,
                 )
-                torch.save(low_payload, low_latent_path)
                 torch.save(recover_payload, recover_latent_path)
 
                 # direct_low_metrics 衡量“只做低码率编解码、不做 recover”时的基线失真；
@@ -1642,6 +1659,157 @@ def build_valid_mask(
     return mask
 
 
+def get_scheduler_config_value(scheduler: object, key: str, default=None):
+    """兼容 ConfigMixin / dict 风格读取 scheduler 配置。"""
+    config = getattr(scheduler, "config", None)
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def get_model_cache_context(model: torch.nn.Module, cache_key: str):
+    """优先复用模型自带 cache_context，缺失时退化为 no-op。"""
+    cache_context = getattr(model, "cache_context", None)
+    if callable(cache_context):
+        return cache_context(cache_key)
+    return nullcontext()
+
+
+def model_supports_argument(model: torch.nn.Module, argument_name: str) -> bool:
+    """检查模型 forward 是否支持某个关键字参数。"""
+    try:
+        signature = inspect.signature(model.forward)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+    if argument_name in signature.parameters:
+        return True
+    return any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+
+
+def tensor_abs_max(tensor: torch.Tensor) -> float:
+    """计算 tensor 的绝对值最大值，NaN 会被保留为可诊断的 inf 级异常。"""
+    if tensor.numel() == 0:
+        return 0.0
+    safe_tensor = torch.nan_to_num(tensor.detach().float(), nan=0.0, posinf=float("inf"), neginf=float("-inf"))
+    return float(safe_tensor.abs().max().item())
+
+
+def ensure_finite_recover_state(
+    *,
+    stage: str,
+    input_path: Path,
+    section_start: Optional[int],
+    step_idx: Optional[int],
+    timestep: Optional[torch.Tensor | float],
+    sigma: Optional[float],
+    latents: torch.Tensor,
+    noise_pred: Optional[torch.Tensor] = None,
+) -> None:
+    """在 recover 推理中对关键 tensor 做 fail-fast 非有限值检查。"""
+    latents_finite = bool(torch.isfinite(latents).all().item())
+    noise_pred_finite = True if noise_pred is None else bool(torch.isfinite(noise_pred).all().item())
+    if latents_finite and noise_pred_finite:
+        return
+
+    if torch.is_tensor(timestep):
+        timestep_value = float(timestep.detach().float().item())
+    elif timestep is None:
+        timestep_value = float("nan")
+    else:
+        timestep_value = float(timestep)
+
+    sigma_value = float("nan") if sigma is None else float(sigma)
+    noise_pred_abs_max = "n/a" if noise_pred is None else f"{tensor_abs_max(noise_pred):.6f}"
+    raise RuntimeError(
+        "Non-finite recover tensor detected "
+        f"stage={stage} input_path={input_path} "
+        f"section_start={'n/a' if section_start is None else section_start} "
+        f"step_idx={'n/a' if step_idx is None else step_idx} "
+        f"timestep={timestep_value:.6f} sigma={sigma_value:.6f} "
+        f"latents_finite={latents_finite} latents_abs_max={tensor_abs_max(latents):.6f} "
+        f"noise_pred_finite={noise_pred_finite} noise_pred_abs_max={noise_pred_abs_max}"
+    )
+
+
+def get_scheduler_sigma_for_step(scheduler: object, step_idx: int) -> Optional[float]:
+    """读取当前 denoise step 对应的 sigma，便于错误日志定位。"""
+    sigmas = getattr(scheduler, "sigmas", None)
+    if not isinstance(sigmas, torch.Tensor) or step_idx < 0 or step_idx >= sigmas.shape[0]:
+        return None
+    return float(sigmas[step_idx].detach().float().item())
+
+
+def validate_stage1_inference_scheduler(scheduler: object) -> None:
+    """校验 recover 推理阶段的 scheduler 是否处于数值安全状态。"""
+    timesteps = getattr(scheduler, "timesteps", None)
+    sigmas = getattr(scheduler, "sigmas", None)
+    if not isinstance(timesteps, torch.Tensor) or not isinstance(sigmas, torch.Tensor):
+        raise RuntimeError("Recover scheduler must expose tensor timesteps and sigmas.")
+    if timesteps.ndim != 1 or sigmas.ndim != 1:
+        raise RuntimeError(
+            f"Recover scheduler expects 1D timesteps/sigmas, got timesteps={tuple(timesteps.shape)} "
+            f"sigmas={tuple(sigmas.shape)}."
+        )
+    if sigmas.shape[0] != timesteps.shape[0] + 1:
+        raise RuntimeError(
+            f"Recover scheduler expects len(sigmas)=len(timesteps)+1, got "
+            f"{sigmas.shape[0]} vs {timesteps.shape[0]}."
+        )
+    if not torch.isfinite(timesteps).all():
+        raise RuntimeError("Recover scheduler timesteps contain non-finite values.")
+    if not torch.isfinite(sigmas).all():
+        raise RuntimeError("Recover scheduler sigmas contain non-finite values.")
+
+    first_sigma = float(sigmas[0].detach().float().item())
+    last_sigma = float(sigmas[-1].detach().float().item())
+    if not (0.0 < first_sigma < 1.0):
+        raise RuntimeError(
+            f"Recover scheduler first sigma must satisfy 0 < sigma < 1 for stable stage1 inference, "
+            f"got {first_sigma:.6f}."
+        )
+    if not math.isclose(last_sigma, 0.0, abs_tol=1e-8):
+        raise RuntimeError(f"Recover scheduler last sigma must be 0, got {last_sigma:.6f}.")
+
+
+def prepare_stage1_inference_scheduler(
+    scheduler: object,
+    latents: torch.Tensor,
+    num_inference_steps: int,
+    device: torch.device,
+) -> None:
+    """把 recover 推理调度对齐到 Helios stage1 的时序设置。"""
+    use_dynamic_shifting = bool(get_scheduler_config_value(scheduler, "use_dynamic_shifting", False))
+    # 某些 Helios scheduler 实现在 `use_dynamic_shifting=True` 时会要求 `mu` 非空，
+    # 即使我们随后会按 stage1 逻辑手动覆盖 timesteps/sigmas，这里也先给一个占位值，
+    # 避免其内部初始化阶段直接因 `mu=None` 报错。
+    if use_dynamic_shifting:
+        scheduler.set_timesteps(num_inference_steps=num_inference_steps, device=device, mu=1.0)
+    else:
+        scheduler.set_timesteps(num_inference_steps=num_inference_steps, device=device)
+
+    if use_dynamic_shifting:
+        apply_schedule_shift = import_schedule_shift_fn()
+        sigmas = torch.linspace(0.999, 0.0, steps=num_inference_steps + 1, dtype=torch.float32, device=device)[:-1]
+        sigmas = apply_schedule_shift(
+            sigmas=sigmas,
+            noise=latents,
+            base_seq_len=get_scheduler_config_value(scheduler, "base_image_seq_len", 256),
+            max_seq_len=get_scheduler_config_value(scheduler, "max_image_seq_len", 4096),
+            base_shift=get_scheduler_config_value(scheduler, "base_shift", 0.5),
+            max_shift=get_scheduler_config_value(scheduler, "max_shift", 1.15),
+        )
+        num_train_timesteps = float(get_scheduler_config_value(scheduler, "num_train_timesteps", 1000))
+        scheduler.timesteps = sigmas * num_train_timesteps
+        scheduler.sigmas = torch.cat([sigmas, torch.zeros(1, dtype=sigmas.dtype, device=sigmas.device)])
+        if hasattr(scheduler, "reset_scheduler_history"):
+            scheduler.reset_scheduler_history()
+
+    validate_stage1_inference_scheduler(scheduler)
+
+
 @torch.inference_mode()
 def reconstruct_sequence(
     sequence: PreparedSequence,
@@ -1732,6 +1900,8 @@ def reconstruct_sequence(
             prompt_embeds=prompt_embeds,
             device=device,
             weight_dtype=weight_dtype,
+            input_path=sequence.path,
+            section_start=section_start,
             latent_shape=(1, clean_full.shape[0], latent_window_size, clean_full.shape[2], clean_full.shape[3]),
             indices_hidden_states=indices_hidden_states,
             indices_latents_history_short=indices_latents_history_short,
@@ -1804,6 +1974,8 @@ def run_stage1_denoise(
     prompt_embeds: torch.Tensor,
     device: torch.device,
     weight_dtype: torch.dtype,
+    input_path: Path,
+    section_start: int,
     latent_shape: Tuple[int, int, int, int, int],
     indices_hidden_states: torch.Tensor,
     indices_latents_history_short: torch.Tensor,
@@ -1817,29 +1989,76 @@ def run_stage1_denoise(
 ) -> torch.Tensor:
     """执行单个 section 的扩散式去噪恢复。"""
     base_transformer = unwrap_model(transformer)
-    scheduler.set_timesteps(num_inference_steps=num_inference_steps, device=device, mu=1.0)
     generator = torch.Generator(device=device).manual_seed(seed)
     # 从纯噪声初始化，逐 timestep 向恢复结果逼近。
     latents = torch.randn(latent_shape, device=device, dtype=torch.float32, generator=generator)
+    prepare_stage1_inference_scheduler(
+        scheduler=scheduler,
+        latents=latents,
+        num_inference_steps=num_inference_steps,
+        device=device,
+    )
+    scheduler_type = str(get_scheduler_config_value(scheduler, "scheduler_type", "")).lower()
+    supports_first_step_flag = model_supports_argument(base_transformer, "is_first_denoising_step")
 
-    for timestep in scheduler.timesteps:
+    for step_idx, timestep in enumerate(scheduler.timesteps):
+        current_sigma = get_scheduler_sigma_for_step(scheduler, step_idx)
+        ensure_finite_recover_state(
+            stage="pre_model",
+            input_path=input_path,
+            section_start=section_start,
+            step_idx=step_idx,
+            timestep=timestep,
+            sigma=current_sigma,
+            latents=latents,
+        )
         timestep_batch = timestep.expand(latents.shape[0])
         latent_model_input = latents.to(weight_dtype)
-        with base_transformer.cache_context("cond"):
+        transformer_kwargs = {
+            "hidden_states": latent_model_input,
+            "timestep": timestep_batch,
+            "encoder_hidden_states": prompt_embeds,
+            "indices_hidden_states": indices_hidden_states,
+            "indices_latents_history_short": indices_latents_history_short,
+            "indices_latents_history_mid": indices_latents_history_mid,
+            "indices_latents_history_long": indices_latents_history_long,
+            "latents_history_short": latents_history_short.to(weight_dtype),
+            "latents_history_mid": latents_history_mid.to(weight_dtype),
+            "latents_history_long": latents_history_long.to(weight_dtype),
+            "return_dict": False,
+        }
+        if supports_first_step_flag:
+            transformer_kwargs["is_first_denoising_step"] = step_idx == 0
+
+        with get_model_cache_context(base_transformer, "cond"):
             noise_pred = transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep_batch,
-                encoder_hidden_states=prompt_embeds,
-                indices_hidden_states=indices_hidden_states,
-                indices_latents_history_short=indices_latents_history_short,
-                indices_latents_history_mid=indices_latents_history_mid,
-                indices_latents_history_long=indices_latents_history_long,
-                latents_history_short=latents_history_short.to(weight_dtype),
-                latents_history_mid=latents_history_mid.to(weight_dtype),
-                latents_history_long=latents_history_long.to(weight_dtype),
-                return_dict=False,
+                **transformer_kwargs,
             )[0]
-        latents = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+        ensure_finite_recover_state(
+            stage="post_model",
+            input_path=input_path,
+            section_start=section_start,
+            step_idx=step_idx,
+            timestep=timestep,
+            sigma=current_sigma,
+            latents=latents,
+            noise_pred=noise_pred,
+        )
+
+        if scheduler_type == "unipc" and hasattr(scheduler, "step_unipc"):
+            latents = scheduler.step_unipc(noise_pred.float(), timestep, latents, return_dict=False)[0]
+        else:
+            latents = scheduler.step(noise_pred.float(), timestep, latents, return_dict=False)[0]
+        ensure_finite_recover_state(
+            stage="post_step",
+            input_path=input_path,
+            section_start=section_start,
+            step_idx=step_idx,
+            timestep=timestep,
+            sigma=current_sigma,
+            latents=latents,
+            noise_pred=noise_pred,
+        )
 
     if hasattr(base_transformer, "clear_kv_cache"):
         # 长序列逐段推理后清 cache，避免显存逐步累积。

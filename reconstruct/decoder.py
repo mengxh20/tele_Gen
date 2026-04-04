@@ -10,9 +10,9 @@ from diffusers.video_processor import VideoProcessor
 from tqdm import tqdm
 
 
-DEFAULT_INPUT_DIR = "reconstruct/recovered_latents"
-DEFAULT_OUTPUT_DIR = "reconstruct/recovered_videos_lowbpp"
-DEFAULT_BASE_MODEL_PATH = "/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base"
+DEFAULT_INPUT_DIR = "reconstruct/latents"
+DEFAULT_OUTPUT_DIR = "reconstruct/videos"
+
 LATENT_FORMAT_V1 = "helios_vae_latent_v1"
 LATENT_FORMAT_V2 = "helios_vae_latent_v2"
 ModelBundle = Tuple[AutoencoderKLWan, VideoProcessor, torch.Tensor, torch.Tensor]
@@ -20,9 +20,9 @@ ModelBundle = Tuple[AutoencoderKLWan, VideoProcessor, torch.Tensor, torch.Tensor
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Decode normalized Helios VAE latents back into videos.")
-    parser.add_argument("--input_dir", type=Path, default=Path(DEFAULT_INPUT_DIR))
-    parser.add_argument("--output_dir", type=Path, default=Path(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--base_model_path", type=str, default=DEFAULT_BASE_MODEL_PATH)
+    parser.add_argument("--input_dir",'-I', type=Path, default=Path(DEFAULT_INPUT_DIR))
+    parser.add_argument("--output_dir",'-O', type=Path, default=Path(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--base_model_path", type=str, default="/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base")
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
 
