@@ -12,6 +12,7 @@ DEFAULT_BASE_MODEL_PATH = "/gemini/platform/public/luojx/team/mengxh/MODELS/Best
 LATENT_FORMAT_V1 = "helios_vae_latent_v1"
 LATENT_FORMAT_V2 = "helios_vae_latent_v2"
 LOW_LATENT_FORMAT_V1 = "helios_low_latent_v1"
+LOW_LATENT_FORMAT_V2 = "helios_low_latent_v2"
 ModelBundle = Tuple[AutoencoderKLWan, VideoProcessor, torch.Tensor, torch.Tensor]
 _RESOLUTION_PATTERN = re.compile(r"^(?P<width>\d+)x(?P<height>\d+)$")
 

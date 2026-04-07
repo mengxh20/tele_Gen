@@ -16,7 +16,7 @@ torchrun \
     --master_addr "${MASTER_ADDR}" \
     --master_port "${MASTER_PORT}" \
     reconstruct/recover.py infer \
-    --checkpoint_dir reconstruct/gen2recon_runs \
+    --checkpoint_dir reconstruct/gen2recon_runs_IPframe \
     --input_path reconstruct/latents \
     --output_dir reconstruct/recover_outputs \
     "$@"

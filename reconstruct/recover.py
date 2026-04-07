@@ -32,15 +32,21 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer, UMT5EncoderModel
 
+from reconstruct.codec_gop import (
+    decode_low_latents_payload,
+    encode_anchor_plus_tail_latents,
+    estimate_anchor_plus_tail_codec_bytes,
+    make_section_ranges,
+    validate_codec_config,
+)
 from reconstruct.latent_io import (
     DEFAULT_BASE_MODEL_PATH,
     LATENT_FORMAT_V2,
-    LOW_LATENT_FORMAT_V1,
+    LOW_LATENT_FORMAT_V2,
     build_chunk_frame_ranges,
     compute_bpp_from_total_pixels,
     flatten_latent_chunks,
@@ -54,7 +60,7 @@ from reconstruct.latent_io import (
 
 
 DEFAULT_INPUT_PATH = Path("reconstruct/latents")
-DEFAULT_TRAIN_OUTPUT_DIR = Path("reconstruct/gen2recon_runs")
+DEFAULT_TRAIN_OUTPUT_DIR = Path("reconstruct/gen2recon_runs_IPframe_2")
 DEFAULT_INFER_OUTPUT_DIR = Path("reconstruct/recover_outputs")
 DEFAULT_TEMPORAL_FACTOR = 2
 DEFAULT_SPATIAL_FACTOR = 2
@@ -62,6 +68,11 @@ DEFAULT_QUANT_DTYPE = "int8"
 DEFAULT_KEYFRAME_DTYPE = "float16"
 DEFAULT_HISTORY_SIZES = [16, 2, 1]
 DEFAULT_LATENT_WINDOW_SIZE = 9
+DEFAULT_SECTION_SPAN_LATENTS = DEFAULT_LATENT_WINDOW_SIZE
+DEFAULT_ANCHOR_SPAN_LATENTS = 1
+DEFAULT_TAIL_SPAN_LATENTS = DEFAULT_SECTION_SPAN_LATENTS - DEFAULT_ANCHOR_SPAN_LATENTS
+DEFAULT_ANCHOR_QUANT_DTYPE = "int8"
+DEFAULT_ANCHOR_SPATIAL_FACTOR = 1
 DEFAULT_NUM_INFERENCE_STEPS = 30
 DEFAULT_WEIGHT_DTYPE = "bf16"
 DEFAULT_LEARNING_RATE = 1e-5
@@ -75,7 +86,9 @@ DEFAULT_X_LOSS_WEIGHT = 0.25
 DEFAULT_NOISE_LOSS_WEIGHT = 0.25
 DEFAULT_AUX_LOSS_WARMUP_STEPS = 500
 DEFAULT_AUX_LOSS_RAMP_STEPS = 1000
-RECOVER_CONFIG_VERSION = "helios_recover_v1"
+DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT = 0.1
+DEFAULT_FIX_ANCHOR_DURING_DENOISE = True
+RECOVER_CONFIG_VERSION = "helios_recover_v3"
 EPS = 1e-8
 
 
@@ -83,15 +96,21 @@ EPS = 1e-8
 class CodecConfig:
     """低码率 latent 编码配置。
 
-    这里的压缩策略比较直接：
-    - 首帧 `keyframe` 直接保留较高精度，作为恢复过程中的稳定锚点。
-    - 其余帧 `remainder` 做时空下采样，再按通道量化，模拟低码率传输结果。
+    Recover V2 的 codec 不再把首帧后的 remainder 视为单一流，而是拆成：
+    - `global_keyframe(x0)`：全局唯一高精度锚点
+    - `local refresh anchor`：每个 section 的局部刷新锚点
+    - `P-tail residual`：相对 local anchor 的尾部残差表示
     """
 
     temporal_factor: int = DEFAULT_TEMPORAL_FACTOR
     spatial_factor: int = DEFAULT_SPATIAL_FACTOR
     quant_dtype: str = DEFAULT_QUANT_DTYPE
     keyframe_dtype: str = DEFAULT_KEYFRAME_DTYPE
+    section_span_latents: int = DEFAULT_SECTION_SPAN_LATENTS
+    anchor_span_latents: int = DEFAULT_ANCHOR_SPAN_LATENTS
+    tail_span_latents: int = DEFAULT_TAIL_SPAN_LATENTS
+    anchor_quant_dtype: str = DEFAULT_ANCHOR_QUANT_DTYPE
+    anchor_spatial_factor: int = DEFAULT_ANCHOR_SPATIAL_FACTOR
 
 
 @dataclass
@@ -157,6 +176,7 @@ class TrainingStepOutput:
     flow_loss: torch.Tensor
     x_loss: torch.Tensor
     noise_loss: torch.Tensor
+    temporal_delta_loss: torch.Tensor
     aux_scale: torch.Tensor
     sigma_mean: torch.Tensor
     flow_target_rms: torch.Tensor
@@ -174,6 +194,7 @@ class TrainingStepOutput:
             "flow_loss": self.flow_loss.detach().float(),
             "x_loss": self.x_loss.detach().float(),
             "noise_loss": self.noise_loss.detach().float(),
+            "temporal_delta_loss": self.temporal_delta_loss.detach().float(),
             "aux_scale": self.aux_scale.detach().float(),
             "sigma_mean": self.sigma_mean.detach().float(),
             "flow_target_rms": self.flow_target_rms.detach().float(),
@@ -201,11 +222,13 @@ class LatentWindowDataset(Dataset):
         sequences: Sequence[PreparedSequence],
         history_sizes: Sequence[int],
         latent_window_size: int,
+        anchor_span_latents: int,
     ):
         self.sequences = list(sequences)
         self.history_sizes = list(history_sizes)
         self.history_window_size = sum(history_sizes)
         self.latent_window_size = latent_window_size
+        self.anchor_span_latents = anchor_span_latents
         self.samples: List[Tuple[int, int]] = []
 
         for seq_idx, sequence in enumerate(self.sequences):
@@ -234,10 +257,15 @@ class LatentWindowDataset(Dataset):
             section_start=section_start,
             history_window_size=self.history_window_size,
         )
+        section_anchor_latents = sequence.low_full_latents[
+            :,
+            section_start : section_start + min(self.anchor_span_latents, valid_target_frames),
+        ]
 
         return {
             "history_latents": history_latents,
             "target_latents": target_latents,
+            "section_anchor_latents": section_anchor_latents,
             "x0_latents": sequence.clean_full_latents[:, :1],
             "valid_target_frames": valid_target_frames,
         }
@@ -279,6 +307,11 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--spatial_factor", type=int, default=DEFAULT_SPATIAL_FACTOR)
     parser.add_argument("--quant_dtype", type=str, default=DEFAULT_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--keyframe_dtype", type=str, default=DEFAULT_KEYFRAME_DTYPE, choices=["float16", "float32"])
+    parser.add_argument("--section_span_latents", type=int, default=None)
+    parser.add_argument("--anchor_span_latents", type=int, default=DEFAULT_ANCHOR_SPAN_LATENTS)
+    parser.add_argument("--tail_span_latents", type=int, default=None)
+    parser.add_argument("--anchor_quant_dtype", type=str, default=DEFAULT_ANCHOR_QUANT_DTYPE, choices=["int8"])
+    parser.add_argument("--anchor_spatial_factor", type=int, default=DEFAULT_ANCHOR_SPATIAL_FACTOR)
     parser.add_argument("--history_sizes", type=int, nargs="+", default=DEFAULT_HISTORY_SIZES)
     parser.add_argument("--latent_window_size", type=int, default=DEFAULT_LATENT_WINDOW_SIZE)
     parser.add_argument(
@@ -300,8 +333,14 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--flow_loss_weight", type=float, default=DEFAULT_FLOW_LOSS_WEIGHT)
     parser.add_argument("--x_loss_weight", type=float, default=DEFAULT_X_LOSS_WEIGHT)
     parser.add_argument("--noise_loss_weight", type=float, default=DEFAULT_NOISE_LOSS_WEIGHT)
+    parser.add_argument("--temporal_delta_loss_weight", type=float, default=DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
     parser.add_argument("--aux_loss_warmup_steps", type=int, default=DEFAULT_AUX_LOSS_WARMUP_STEPS)
     parser.add_argument("--aux_loss_ramp_steps", type=int, default=DEFAULT_AUX_LOSS_RAMP_STEPS)
+    parser.add_argument(
+        "--fix_anchor_during_denoise",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_FIX_ANCHOR_DURING_DENOISE,
+    )
 
 
 def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
@@ -435,6 +474,10 @@ def validate_train_args(args: argparse.Namespace) -> None:
         value = getattr(args, key)
         if value < 0.0:
             raise ValueError(f"{key} must be >= 0, got {value}.")
+    if args.temporal_delta_loss_weight < 0.0:
+        raise ValueError(
+            f"temporal_delta_loss_weight must be >= 0, got {args.temporal_delta_loss_weight}."
+        )
     if args.aux_loss_warmup_steps < 0:
         raise ValueError(f"aux_loss_warmup_steps must be >= 0, got {args.aux_loss_warmup_steps}.")
     if args.aux_loss_ramp_steps < 0:
@@ -510,8 +553,10 @@ def init_offline_wandb_run(
             "flow_loss_weight": args.flow_loss_weight,
             "x_loss_weight": args.x_loss_weight,
             "noise_loss_weight": args.noise_loss_weight,
+            "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
             "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
             "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
+            "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
         },
         reinit=True,
     )
@@ -563,6 +608,7 @@ def command_train(args: argparse.Namespace) -> None:
     set_seed(args.seed + rank)
     weight_dtype = parse_weight_dtype(args.weight_dtype)
     codec_config = build_codec_config(args)
+    latent_window_size = codec_config.section_span_latents
     history_sizes = normalize_history_sizes(args.history_sizes)
     input_root, latent_paths = discover_input_latent_paths(args.input_path)
     # 每个输入样本都会同时准备 clean / low 两套 latent 表示，为训练监督和条件输入服务。
@@ -570,7 +616,8 @@ def command_train(args: argparse.Namespace) -> None:
     dataset = LatentWindowDataset(
         sequences=prepared_sequences,
         history_sizes=history_sizes,
-        latent_window_size=args.latent_window_size,
+        latent_window_size=latent_window_size,
+        anchor_span_latents=codec_config.anchor_span_latents,
     )
     if len(dataset) == 0:
         raise RuntimeError("No training windows were built from the provided latent files.")
@@ -622,7 +669,7 @@ def command_train(args: argparse.Namespace) -> None:
             f"effective_global_batch_size={args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps} "
             f"save_every_epochs={checkpoint_save_interval_epochs} "
             f"loss_weighting_scheme={args.loss_weighting_scheme} "
-            f"flow/x/noise=({args.flow_loss_weight:.3f}/{args.x_loss_weight:.3f}/{args.noise_loss_weight:.3f}) "
+            f"flow/x/noise/delta=({args.flow_loss_weight:.3f}/{args.x_loss_weight:.3f}/{args.noise_loss_weight:.3f}/{args.temporal_delta_loss_weight:.3f}) "
             f"aux_warmup={args.aux_loss_warmup_steps} aux_ramp={args.aux_loss_ramp_steps}"
         )
     accelerator.wait_for_everyone()
@@ -649,13 +696,16 @@ def command_train(args: argparse.Namespace) -> None:
         "flow_loss_weight": args.flow_loss_weight,
         "x_loss_weight": args.x_loss_weight,
         "noise_loss_weight": args.noise_loss_weight,
+        "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
         "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
         "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
+        "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
         "loss_definition": {
             "optimized_loss": (
-                "flow_loss_weight * masked_weighted_mse(flow_pred, noise-latent) + "
-                "aux_scale * (x_loss_weight * normalized_mse(x_pred, latent) + "
-                "noise_loss_weight * normalized_mse(noise_pred, noise))"
+                "flow_loss_weight * tail_position_weighted_mse(flow_pred, noise-latent) + "
+                "aux_scale * (x_loss_weight * tail_position_weighted_normalized_mse(x_pred, latent) + "
+                "noise_loss_weight * tail_position_weighted_normalized_mse(noise_pred, noise) + "
+                "temporal_delta_loss_weight * tail_position_weighted_l1(delta(x_pred), delta(latent)))"
             ),
             "raw_loss": "masked_mse(flow_pred, noise-latent)",
             "x_prediction": "x_pred = x_t - sigma * flow_pred",
@@ -666,6 +716,7 @@ def command_train(args: argparse.Namespace) -> None:
         "flow_losses": [],
         "x_losses": [],
         "noise_losses": [],
+        "temporal_delta_losses": [],
         "aux_scales": [],
         "sigma_means": [],
         "flow_target_rms": [],
@@ -689,7 +740,7 @@ def command_train(args: argparse.Namespace) -> None:
                 args=args,
                 codec_config=codec_config,
                 history_sizes=history_sizes,
-                latent_window_size=args.latent_window_size,
+                latent_window_size=latent_window_size,
                 checkpoint_save_interval_epochs=checkpoint_save_interval_epochs,
             )
 
@@ -710,6 +761,7 @@ def command_train(args: argparse.Namespace) -> None:
                 "flow_loss": 0.0,
                 "x_loss": 0.0,
                 "noise_loss": 0.0,
+                "temporal_delta_loss": 0.0,
                 "aux_scale": 0.0,
                 "sigma_mean": 0.0,
                 "flow_target_rms": 0.0,
@@ -734,7 +786,8 @@ def command_train(args: argparse.Namespace) -> None:
                         device=device,
                         weight_dtype=weight_dtype,
                         history_sizes=history_sizes,
-                        latent_window_size=args.latent_window_size,
+                        latent_window_size=latent_window_size,
+                        anchor_span_latents=codec_config.anchor_span_latents,
                         loss_weighting_scheme=args.loss_weighting_scheme,
                         logit_mean=args.logit_mean,
                         logit_std=args.logit_std,
@@ -742,6 +795,7 @@ def command_train(args: argparse.Namespace) -> None:
                         flow_loss_weight=args.flow_loss_weight,
                         x_loss_weight=args.x_loss_weight,
                         noise_loss_weight=args.noise_loss_weight,
+                        temporal_delta_loss_weight=args.temporal_delta_loss_weight,
                         aux_loss_warmup_steps=args.aux_loss_warmup_steps,
                         aux_loss_ramp_steps=args.aux_loss_ramp_steps,
                         global_step=global_step,
@@ -781,6 +835,7 @@ def command_train(args: argparse.Namespace) -> None:
                     flow_loss_value = scalar_metrics["flow_loss"]
                     x_loss_value = scalar_metrics["x_loss"]
                     noise_loss_value = scalar_metrics["noise_loss"]
+                    temporal_delta_loss_value = scalar_metrics["temporal_delta_loss"]
                     aux_scale_value = scalar_metrics["aux_scale"]
                     sigma_mean_value = scalar_metrics["sigma_mean"]
                     flow_target_rms_value = scalar_metrics["flow_target_rms"]
@@ -801,6 +856,7 @@ def command_train(args: argparse.Namespace) -> None:
                     train_metrics["flow_losses"].append(flow_loss_value)
                     train_metrics["x_losses"].append(x_loss_value)
                     train_metrics["noise_losses"].append(noise_loss_value)
+                    train_metrics["temporal_delta_losses"].append(temporal_delta_loss_value)
                     train_metrics["aux_scales"].append(aux_scale_value)
                     train_metrics["sigma_means"].append(sigma_mean_value)
                     train_metrics["flow_target_rms"].append(flow_target_rms_value)
@@ -815,6 +871,7 @@ def command_train(args: argparse.Namespace) -> None:
                     epoch_metric_sums["flow_loss"] += flow_loss_value
                     epoch_metric_sums["x_loss"] += x_loss_value
                     epoch_metric_sums["noise_loss"] += noise_loss_value
+                    epoch_metric_sums["temporal_delta_loss"] += temporal_delta_loss_value
                     epoch_metric_sums["aux_scale"] += aux_scale_value
                     epoch_metric_sums["sigma_mean"] += sigma_mean_value
                     epoch_metric_sums["flow_target_rms"] += flow_target_rms_value
@@ -832,6 +889,7 @@ def command_train(args: argparse.Namespace) -> None:
                             flow=f"{flow_loss_value:.6f}",
                             x=f"{x_loss_value:.6f}",
                             noise=f"{noise_loss_value:.6f}",
+                            delta=f"{temporal_delta_loss_value:.6f}",
                             sigma=f"{sigma_mean_value:.3f}",
                         )
                     if progress is not None:
@@ -844,6 +902,7 @@ def command_train(args: argparse.Namespace) -> None:
                                 "train/flow_loss": flow_loss_value,
                                 "train/x_loss": x_loss_value,
                                 "train/noise_loss": noise_loss_value,
+                                "train/temporal_delta_loss": temporal_delta_loss_value,
                                 "train/aux_scale": aux_scale_value,
                                 "train/loss_ema": loss_ema_value,
                                 "train/sigma_mean": sigma_mean_value,
@@ -873,6 +932,7 @@ def command_train(args: argparse.Namespace) -> None:
                     "flow_loss_mean": epoch_metric_sums["flow_loss"] / epoch_logged_steps,
                     "x_loss_mean": epoch_metric_sums["x_loss"] / epoch_logged_steps,
                     "noise_loss_mean": epoch_metric_sums["noise_loss"] / epoch_logged_steps,
+                    "temporal_delta_loss_mean": epoch_metric_sums["temporal_delta_loss"] / epoch_logged_steps,
                     "aux_scale_mean": epoch_metric_sums["aux_scale"] / epoch_logged_steps,
                     "loss_ema_last": loss_ema_value,
                     "sigma_mean": epoch_metric_sums["sigma_mean"] / epoch_logged_steps,
@@ -892,6 +952,7 @@ def command_train(args: argparse.Namespace) -> None:
                             "epoch/flow_loss_mean": epoch_summary["flow_loss_mean"],
                             "epoch/x_loss_mean": epoch_summary["x_loss_mean"],
                             "epoch/noise_loss_mean": epoch_summary["noise_loss_mean"],
+                            "epoch/temporal_delta_loss_mean": epoch_summary["temporal_delta_loss_mean"],
                             "epoch/aux_scale_mean": epoch_summary["aux_scale_mean"],
                             "epoch/loss_ema_last": epoch_summary["loss_ema_last"],
                             "epoch/sigma_mean": epoch_summary["sigma_mean"],
@@ -926,7 +987,7 @@ def command_train(args: argparse.Namespace) -> None:
                     transformer=transformer,
                     codec_config=codec_config,
                     history_sizes=history_sizes,
-                    latent_window_size=args.latent_window_size,
+                    latent_window_size=latent_window_size,
                     args=args,
                     train_metrics=train_metrics,
                     accelerator=accelerator,
@@ -949,7 +1010,7 @@ def command_train(args: argparse.Namespace) -> None:
             transformer=transformer,
             codec_config=codec_config,
             history_sizes=history_sizes,
-            latent_window_size=args.latent_window_size,
+            latent_window_size=latent_window_size,
             args=args,
             train_metrics=train_metrics,
             accelerator=accelerator,
@@ -962,6 +1023,7 @@ def command_train(args: argparse.Namespace) -> None:
                 wandb_run.summary["train/last_flow_loss"] = train_metrics["flow_losses"][-1]
                 wandb_run.summary["train/last_x_loss"] = train_metrics["x_losses"][-1]
                 wandb_run.summary["train/last_noise_loss"] = train_metrics["noise_losses"][-1]
+                wandb_run.summary["train/last_temporal_delta_loss"] = train_metrics["temporal_delta_losses"][-1]
                 wandb_run.summary["train/last_loss_ema"] = train_metrics["losses_ema"][-1]
                 wandb_run.summary["train/trainable_params"] = train_metrics["trainable_params"]
             print(
@@ -971,6 +1033,7 @@ def command_train(args: argparse.Namespace) -> None:
                 f"last_flow_loss={train_metrics['flow_losses'][-1]:.6f} "
                 f"last_x_loss={train_metrics['x_losses'][-1]:.6f} "
                 f"last_noise_loss={train_metrics['noise_losses'][-1]:.6f} "
+                f"last_temporal_delta_loss={train_metrics['temporal_delta_losses'][-1]:.6f} "
                 f"last_raw_loss={train_metrics['raw_losses'][-1]:.6f} "
                 f"trainable_params={train_metrics['trainable_params']}"
             )
@@ -1011,10 +1074,15 @@ def command_infer(args: argparse.Namespace) -> None:
         )
         codec_config = CodecConfig(**checkpoint_config["codec_config"])
         history_sizes = normalize_history_sizes(checkpoint_config["history_sizes"])
-        latent_window_size = int(checkpoint_config["latent_window_size"])
+        latent_window_size = int(checkpoint_config.get("section_span_latents", checkpoint_config["latent_window_size"]))
+        anchor_span_latents = int(checkpoint_config.get("anchor_span_latents", codec_config.anchor_span_latents))
+        fix_anchor_during_denoise = bool(
+            checkpoint_config.get("fix_anchor_during_denoise", DEFAULT_FIX_ANCHOR_DURING_DENOISE)
+        )
         weight_dtype = parse_weight_dtype(str(weight_dtype_name))
 
         input_root, latent_paths = discover_input_latent_paths(args.input_path)
+        assigned_latent_paths = latent_paths[distributed_context.rank :: distributed_context.world_size]
         output_dir = args.output_dir.resolve()
         low_dir = output_dir / "low_latents"
         recover_dir = output_dir / "recover_latents"
@@ -1039,9 +1107,11 @@ def command_infer(args: argparse.Namespace) -> None:
         )
         transformer.eval()
 
-        for sample_idx, latent_path in enumerate(latent_paths, start=1):
-            if distributed_context.is_main_process:
-                print(f"[infer] ({sample_idx}/{len(latent_paths)}) input={latent_path}")
+        for sample_idx, latent_path in enumerate(assigned_latent_paths, start=1):
+            print(
+                f"[infer][rank={distributed_context.rank}] ({sample_idx}/{len(assigned_latent_paths)}) "
+                f"input={latent_path}"
+            )
 
             sequence = prepare_sequence(latent_path, codec_config)
             recovered_full_latents = reconstruct_sequence(
@@ -1053,93 +1123,150 @@ def command_infer(args: argparse.Namespace) -> None:
                 weight_dtype=weight_dtype,
                 history_sizes=history_sizes,
                 latent_window_size=latent_window_size,
+                anchor_span_latents=anchor_span_latents,
                 num_inference_steps=args.num_inference_steps,
                 seed=args.seed,
+                fix_anchor_during_denoise=fix_anchor_during_denoise,
                 distributed_context=distributed_context,
             )
+            low_latent_path, recover_latent_path, metrics_path = resolve_output_paths(
+                input_path=latent_path,
+                input_root=input_root,
+                low_dir=low_dir,
+                recover_dir=recover_dir,
+                metrics_dir=metrics_dir,
+            )
+            low_payload = build_low_latent_payload(sequence)
+            torch.save(low_payload, low_latent_path)
+            ensure_finite_recover_state(
+                stage="final_output",
+                input_path=sequence.path,
+                section_start=None,
+                step_idx=None,
+                timestep=None,
+                sigma=None,
+                latents=recovered_full_latents,
+            )
+            recover_payload = build_recover_latent_payload(
+                sequence=sequence,
+                recovered_full_latents=recovered_full_latents,
+                base_model_path=str(base_model_path),
+                checkpoint_dir=checkpoint_dir,
+            )
+            torch.save(recover_payload, recover_latent_path)
 
-            if distributed_context.is_main_process:
-                if recovered_full_latents is None:
-                    raise RuntimeError("Main process did not receive reconstructed latent windows.")
+            direct_low_metrics = compute_tensor_metrics(sequence.low_full_latents, sequence.clean_full_latents)
+            restored_metrics = compute_tensor_metrics(recovered_full_latents, sequence.clean_full_latents)
+            low_tail_position_metrics = compute_tail_position_metrics(
+                prediction=sequence.low_full_latents,
+                target=sequence.clean_full_latents,
+                latent_window_size=latent_window_size,
+                anchor_span_latents=anchor_span_latents,
+            )
+            recover_tail_position_metrics = compute_tail_position_metrics(
+                prediction=recovered_full_latents,
+                target=sequence.clean_full_latents,
+                latent_window_size=latent_window_size,
+                anchor_span_latents=anchor_span_latents,
+            )
+            tail_only_metrics = compute_anchor_tail_metrics(
+                prediction=recovered_full_latents,
+                target=sequence.clean_full_latents,
+                latent_window_size=latent_window_size,
+                anchor_span_latents=anchor_span_latents,
+                mode="tail",
+            )
+            anchor_reconstruction_metrics = compute_anchor_tail_metrics(
+                prediction=recovered_full_latents,
+                target=sequence.clean_full_latents,
+                latent_window_size=latent_window_size,
+                anchor_span_latents=anchor_span_latents,
+                mode="anchor",
+            )
+            temporal_delta_l1 = compute_temporal_delta_l1(
+                prediction=recovered_full_latents,
+                target=sequence.clean_full_latents,
+            )
+            low_boundary_transition_l1 = compute_boundary_transition_l1(
+                prediction=sequence.low_full_latents,
+                target=sequence.clean_full_latents,
+                latent_window_size=latent_window_size,
+            )
+            recover_boundary_transition_l1 = compute_boundary_transition_l1(
+                prediction=recovered_full_latents,
+                target=sequence.clean_full_latents,
+                latent_window_size=latent_window_size,
+            )
+            temporal_backtrack_metrics = compute_temporal_backtrack_metrics(
+                prediction=recovered_full_latents,
+                target=sequence.clean_full_latents,
+            )
+            metrics_payload = {
+                "input_path": str(sequence.path),
+                "low_latent_path": str(low_latent_path),
+                "recover_latent_path": str(recover_latent_path),
+                "raw_file_bytes": sequence.metadata.raw_file_bytes,
+                "raw_bpp": sequence.metadata.raw_bpp,
+                "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
+                "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
+                "direct_low_metrics": direct_low_metrics,
+                "restored_metrics": restored_metrics,
+                "low_tail_position_metrics": low_tail_position_metrics,
+                "recover_tail_position_metrics": recover_tail_position_metrics,
+                "tail_only_metrics": tail_only_metrics,
+                "anchor_reconstruction_metrics": anchor_reconstruction_metrics,
+                "temporal_delta_l1": temporal_delta_l1,
+                "low_boundary_transition_l1": low_boundary_transition_l1,
+                "recover_boundary_transition_l1": recover_boundary_transition_l1,
+                "section_boundary_delta_l1": recover_boundary_transition_l1,
+                "boundary_transition_l1": recover_boundary_transition_l1,
+                **temporal_backtrack_metrics,
+                "codec_config": asdict(codec_config),
+                "checkpoint_dir": str(checkpoint_dir),
+                "num_inference_steps": args.num_inference_steps,
+            }
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            with metrics_path.open("w", encoding="utf-8") as handle:
+                json.dump(metrics_payload, handle, indent=2)
 
-                low_latent_path, recover_latent_path, metrics_path = resolve_output_paths(
-                    input_path=latent_path,
-                    input_root=input_root,
-                    low_dir=low_dir,
-                    recover_dir=recover_dir,
-                    metrics_dir=metrics_dir,
-                )
-                low_payload = build_low_latent_payload(sequence)
-                torch.save(low_payload, low_latent_path)
-                ensure_finite_recover_state(
-                    stage="final_output",
-                    input_path=sequence.path,
-                    section_start=None,
-                    step_idx=None,
-                    timestep=None,
-                    sigma=None,
-                    latents=recovered_full_latents,
-                )
-                recover_payload = build_recover_latent_payload(
-                    sequence=sequence,
-                    recovered_full_latents=recovered_full_latents,
-                    base_model_path=str(base_model_path),
-                    checkpoint_dir=checkpoint_dir,
-                )
-                torch.save(recover_payload, recover_latent_path)
+            print(
+                f"[infer][rank={distributed_context.rank}] saved low={low_latent_path} recover={recover_latent_path} "
+                f"low_bpp={sequence.low_codec_payload['low_bpp']:.6f} "
+                f"direct_low_l1={direct_low_metrics['l1']:.6f} restored_l1={restored_metrics['l1']:.6f}"
+            )
 
-                # direct_low_metrics 衡量“只做低码率编解码、不做 recover”时的基线失真；
-                # restored_metrics 衡量 recover 模块真正带来的修复收益。
-                direct_low_metrics = compute_tensor_metrics(sequence.low_full_latents, sequence.clean_full_latents)
-                restored_metrics = compute_tensor_metrics(recovered_full_latents, sequence.clean_full_latents)
-                boundary_l1 = compute_boundary_transition_l1(
-                    prediction=recovered_full_latents,
-                    target=sequence.clean_full_latents,
-                    latent_window_size=latent_window_size,
-                )
-                metrics_payload = {
-                    "input_path": str(sequence.path),
-                    "low_latent_path": str(low_latent_path),
-                    "recover_latent_path": str(recover_latent_path),
-                    "raw_file_bytes": sequence.metadata.raw_file_bytes,
-                    "raw_bpp": sequence.metadata.raw_bpp,
-                    "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
-                    "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
-                    "direct_low_metrics": direct_low_metrics,
-                    "restored_metrics": restored_metrics,
-                    "boundary_transition_l1": boundary_l1,
-                    "codec_config": asdict(codec_config),
-                    "checkpoint_dir": str(checkpoint_dir),
-                    "num_inference_steps": args.num_inference_steps,
-                }
-                metrics_path.parent.mkdir(parents=True, exist_ok=True)
-                with metrics_path.open("w", encoding="utf-8") as handle:
-                    json.dump(metrics_payload, handle, indent=2)
-
-                print(
-                    f"[infer] saved low={low_latent_path} recover={recover_latent_path} "
-                    f"low_bpp={sequence.low_codec_payload['low_bpp']:.6f} "
-                    f"direct_low_l1={direct_low_metrics['l1']:.6f} restored_l1={restored_metrics['l1']:.6f}"
-                )
-
-            distributed_barrier(distributed_context)
             if device.type == "cuda":
                 # 逐样本清 cache，减轻长序列推理时的显存峰值压力。
                 torch.cuda.empty_cache()
+        distributed_barrier(distributed_context)
     finally:
         cleanup_distributed_context(distributed_context)
 
 
 def build_codec_config(args: argparse.Namespace) -> CodecConfig:
     """从命令行参数构造低码率编码配置。"""
-    if args.temporal_factor < 1 or args.spatial_factor < 1:
-        raise ValueError("temporal_factor and spatial_factor must both be >= 1.")
-    return CodecConfig(
+    section_span_latents = (
+        int(args.section_span_latents) if getattr(args, "section_span_latents", None) is not None else int(args.latent_window_size)
+    )
+    anchor_span_latents = int(getattr(args, "anchor_span_latents", DEFAULT_ANCHOR_SPAN_LATENTS))
+    if getattr(args, "tail_span_latents", None) is None:
+        tail_span_latents = section_span_latents - anchor_span_latents
+    else:
+        tail_span_latents = int(args.tail_span_latents)
+
+    codec_config = CodecConfig(
         temporal_factor=args.temporal_factor,
         spatial_factor=args.spatial_factor,
         quant_dtype=args.quant_dtype,
         keyframe_dtype=args.keyframe_dtype,
+        section_span_latents=section_span_latents,
+        anchor_span_latents=anchor_span_latents,
+        tail_span_latents=tail_span_latents,
+        anchor_quant_dtype=args.anchor_quant_dtype,
+        anchor_spatial_factor=args.anchor_spatial_factor,
     )
+    validate_codec_config(asdict(codec_config))
+    return codec_config
 
 
 def normalize_history_sizes(history_sizes: Sequence[int]) -> List[int]:
@@ -1233,51 +1360,15 @@ def encode_low_latents(
     codec_config: CodecConfig,
     chunk_lengths: Sequence[int],
 ) -> Dict[str, object]:
-    """把 clean latents 编码成低码率载荷。
-
-    当前策略强调“最小可用”的低码率链路验证：
-    - 首帧单独保留高精度，减少序列起点漂移。
-    - 其余帧时空下采样，进一步降低冗余。
-    - 下采样结果按通道做对称量化，得到可传输的低比特表示。
-    """
-    if clean_full_latents.ndim != 4:
-        raise ValueError(f"Expected clean_full_latents with shape [C, T, H, W], got {tuple(clean_full_latents.shape)}")
-
-    keyframe_dtype = torch.float16 if codec_config.keyframe_dtype == "float16" else torch.float32
-    # 第一帧直接当作关键帧保留，后续恢复都围绕它展开。
-    keyframe = clean_full_latents[:, :1].to(keyframe_dtype).contiguous()
-    remainder = clean_full_latents[:, 1:]
-
-    if remainder.shape[1] == 0:
-        return {
-            "codec_config": asdict(codec_config),
-            "chunk_lengths": [int(length) for length in chunk_lengths],
-            "keyframe": keyframe.cpu(),
-            "quantized_remainder": torch.empty(0, dtype=torch.int8),
-            "scales": torch.empty(0, dtype=torch.float32),
-            "reduced_shape": [int(clean_full_latents.shape[0]), 0, int(clean_full_latents.shape[2]), int(clean_full_latents.shape[3])],
-            "original_remainder_shape": [int(value) for value in remainder.shape],
-        }
-
-    # 三线性插值统一处理时间和空间降采样，生成低码率 remainder。
-    reduced_remainder = trilinear_resize(
-        remainder.unsqueeze(0),
-        (
-            max(1, math.ceil(remainder.shape[1] / codec_config.temporal_factor)),
-            max(1, math.ceil(remainder.shape[2] / codec_config.spatial_factor)),
-            max(1, math.ceil(remainder.shape[3] / codec_config.spatial_factor)),
-        ),
-    ).squeeze(0)
-    quantized_remainder, scales = symmetric_quantize_per_channel(reduced_remainder, codec_config.quant_dtype)
-    return {
-        "codec_config": asdict(codec_config),
-        "chunk_lengths": [int(length) for length in chunk_lengths],
-        "keyframe": keyframe.cpu(),
-        "quantized_remainder": quantized_remainder.cpu(),
-        "scales": scales.cpu(),
-        "reduced_shape": [int(value) for value in reduced_remainder.shape],
-        "original_remainder_shape": [int(value) for value in remainder.shape],
-    }
+    """把 clean latents 编码成 `x0 + local anchor + P-tail residual` 低码率载荷。"""
+    codec_payload = encode_anchor_plus_tail_latents(
+        clean_full_latents=clean_full_latents,
+        codec_config=asdict(codec_config),
+        chunk_lengths=chunk_lengths,
+    )
+    codec_payload["codec_config"] = asdict(codec_config)
+    codec_payload["format_version"] = LOW_LATENT_FORMAT_V2
+    return codec_payload
 
 
 def decode_low_latents(codec_payload: Dict[str, object]) -> torch.Tensor:
@@ -1287,46 +1378,7 @@ def decode_low_latents(codec_payload: Dict[str, object]) -> torch.Tensor:
     - 训练时的历史条件输入
     - 推理时接收端可直接得到的低质量基线
     """
-    keyframe = codec_payload["keyframe"].float()
-    quantized_remainder = codec_payload["quantized_remainder"]
-    original_remainder_shape = tuple(int(value) for value in codec_payload["original_remainder_shape"])
-    if isinstance(quantized_remainder, torch.Tensor) and quantized_remainder.numel() == 0:
-        return keyframe.float()
-
-    reduced_remainder = symmetric_dequantize_per_channel(
-        quantized_remainder=codec_payload["quantized_remainder"],
-        scales=codec_payload["scales"],
-    )
-    # 解量化后按原始 remainder 尺寸上采样，恢复成与 clean latent 同 shape 的粗结果。
-    restored_remainder = trilinear_resize(
-        reduced_remainder.unsqueeze(0),
-        (original_remainder_shape[1], original_remainder_shape[2], original_remainder_shape[3]),
-    ).squeeze(0)
-    return torch.cat([keyframe.float(), restored_remainder.float()], dim=1)
-
-
-def symmetric_quantize_per_channel(latents: torch.Tensor, quant_dtype: str) -> Tuple[torch.Tensor, torch.Tensor]:
-    """按通道做对称 int8 量化，并记录每个通道的 scale。"""
-    if quant_dtype != "int8":
-        raise ValueError(f"Unsupported quant_dtype: {quant_dtype}. Only int8 is implemented.")
-    scales = latents.abs().amax(dim=(1, 2, 3), keepdim=True).clamp_min(EPS) / 127.0
-    quantized = torch.round(latents / scales).clamp(-127, 127).to(torch.int8)
-    return quantized.contiguous(), scales.squeeze(-1).squeeze(-1).squeeze(-1).float().contiguous()
-
-
-def symmetric_dequantize_per_channel(quantized_remainder: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """按通道 scale 把量化 remainder 还原回浮点数。"""
-    if quantized_remainder.ndim != 4:
-        raise ValueError(
-            f"Expected quantized remainder with shape [C, T, H, W], got {tuple(quantized_remainder.shape)}"
-        )
-    scale_view = scales.view(-1, 1, 1, 1).to(dtype=torch.float32)
-    return quantized_remainder.float() * scale_view
-
-
-def trilinear_resize(latents: torch.Tensor, size: Tuple[int, int, int]) -> torch.Tensor:
-    """统一封装 3D latent 的时空插值。"""
-    return F.interpolate(latents.float(), size=size, mode="trilinear", align_corners=False)
+    return decode_low_latents_payload(codec_payload)
 
 
 def estimate_low_codec_bytes(codec_payload: Dict[str, object]) -> int:
@@ -1335,6 +1387,9 @@ def estimate_low_codec_bytes(codec_payload: Dict[str, object]) -> int:
     这里统计的是 tensor 数据本身加最小必要 shape 元数据，
     用来近似衡量这条低码率链路的传输成本。
     """
+    if "section_anchor_payloads" in codec_payload and "section_tail_payloads" in codec_payload:
+        return estimate_anchor_plus_tail_codec_bytes(codec_payload)
+
     total_bytes = 0
     for key in ("keyframe", "quantized_remainder", "scales"):
         value = codec_payload[key]
@@ -1480,6 +1535,7 @@ def training_step(
     weight_dtype: torch.dtype,
     history_sizes: Sequence[int],
     latent_window_size: int,
+    anchor_span_latents: int,
     loss_weighting_scheme: str,
     logit_mean: float,
     logit_std: float,
@@ -1487,6 +1543,7 @@ def training_step(
     flow_loss_weight: float,
     x_loss_weight: float,
     noise_loss_weight: float,
+    temporal_delta_loss_weight: float,
     aux_loss_warmup_steps: int,
     aux_loss_ramp_steps: int,
     global_step: int,
@@ -1505,6 +1562,7 @@ def training_step(
     compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3 = import_diffusers_training_utils()
     history_latents = batch["history_latents"].to(device=device, dtype=weight_dtype)
     target_latents = batch["target_latents"].to(device=device, dtype=weight_dtype)
+    section_anchor_latents = batch["section_anchor_latents"].to(device=device, dtype=weight_dtype)
     x0_latents = batch["x0_latents"].to(device=device, dtype=weight_dtype)
     valid_target_frames = batch["valid_target_frames"].to(device=device)
 
@@ -1544,6 +1602,7 @@ def training_step(
     sigma_view = sigma.to(dtype=weight_dtype).view(-1, 1, 1, 1, 1)
     noisy_model_input = (1.0 - sigma_view) * model_input + sigma_view * noise
     flow_target = noise - model_input
+    noisy_model_input = overwrite_anchor_latents(noisy_model_input, section_anchor_latents)
     timesteps = sigma * 1000.0
 
     base_transformer = unwrap_model(transformer)
@@ -1569,7 +1628,15 @@ def training_step(
         latent_window_size=latent_window_size,
         device=device,
         dtype=torch.float32,
+        valid_start=anchor_span_latents,
     )
+    tail_position_weights = build_tail_position_weights(
+        latent_window_size=latent_window_size,
+        anchor_span_latents=anchor_span_latents,
+        device=device,
+        dtype=torch.float32,
+    )
+    weighted_mask = mask * tail_position_weights
     sigma_view_float = sigma.view(-1, 1, 1, 1, 1)
     xt = noisy_model_input.float()
     x_target = model_input.float()
@@ -1578,6 +1645,8 @@ def training_step(
     flow_pred = flow_pred.float()
     x_pred = xt - sigma_view_float * flow_pred
     noise_pred = xt + (1.0 - sigma_view_float) * flow_pred
+    x_pred_for_temporal = overwrite_anchor_latents(x_pred.clone(), section_anchor_latents.float())
+    x_target_for_temporal = overwrite_anchor_latents(x_target.clone(), section_anchor_latents.float())
 
     flow_sq_error = (flow_pred - flow_target).pow(2)
     weighting = compute_loss_weighting_for_sd3(weighting_scheme=loss_weighting_scheme, sigmas=sigma)
@@ -1592,12 +1661,24 @@ def training_step(
         device=device,
     )
     raw_loss = masked_mean(flow_sq_error, mask)
-    flow_loss = masked_mean(flow_sq_error * weighting, mask)
-    x_loss = normalized_masked_mse(x_pred, x_target, mask)
-    noise_loss = normalized_masked_mse(noise_pred, noise_target, mask)
+    flow_loss = masked_mean(flow_sq_error * weighting, weighted_mask)
+    x_loss = normalized_masked_mse(x_pred, x_target, weighted_mask)
+    noise_loss = normalized_masked_mse(noise_pred, noise_target, weighted_mask)
+    temporal_delta_loss = compute_temporal_delta_loss(
+        prediction=x_pred_for_temporal,
+        target=x_target_for_temporal,
+        valid_target_frames=valid_target_frames,
+        device=device,
+        position_weights=tail_position_weights,
+    )
     loss = (
         flow_loss_weight * flow_loss
-        + aux_scale * (x_loss_weight * x_loss + noise_loss_weight * noise_loss)
+        + aux_scale
+        * (
+            x_loss_weight * x_loss
+            + noise_loss_weight * noise_loss
+            + temporal_delta_loss_weight * temporal_delta_loss
+        )
     )
     return TrainingStepOutput(
         loss=loss,
@@ -1605,6 +1686,7 @@ def training_step(
         flow_loss=flow_loss,
         x_loss=x_loss,
         noise_loss=noise_loss,
+        temporal_delta_loss=temporal_delta_loss,
         aux_scale=aux_scale,
         sigma_mean=sigma.mean(),
         flow_target_rms=masked_mean(flow_target.pow(2), mask).sqrt(),
@@ -1629,6 +1711,35 @@ def normalized_masked_mse(prediction: torch.Tensor, target: torch.Tensor, mask: 
     return numerator / denominator
 
 
+def build_tail_position_weights(
+    latent_window_size: int,
+    anchor_span_latents: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    weights = torch.zeros(1, 1, latent_window_size, 1, 1, device=device, dtype=dtype)
+    tail_frames = max(0, latent_window_size - anchor_span_latents)
+    if tail_frames <= 0:
+        return weights
+
+    if tail_frames == 1:
+        weights[:, :, anchor_span_latents:, :, :] = 1.0
+        return weights
+
+    tail_positions = torch.arange(tail_frames, device=device, dtype=dtype)
+    tail_weights = 1.0 + tail_positions / float(tail_frames - 1)
+    weights[:, :, anchor_span_latents:, 0, 0] = tail_weights
+    return weights
+
+
+def overwrite_anchor_latents(latents: torch.Tensor, anchor_latents: torch.Tensor) -> torch.Tensor:
+    anchor_steps = int(anchor_latents.shape[2])
+    if anchor_steps <= 0:
+        return latents
+    latents[:, :, :anchor_steps] = anchor_latents.to(device=latents.device, dtype=latents.dtype)
+    return latents
+
+
 def compute_aux_loss_scale(
     global_step: int,
     warmup_steps: int,
@@ -1650,13 +1761,38 @@ def build_valid_mask(
     latent_window_size: int,
     device: torch.device,
     dtype: torch.dtype,
+    valid_start: int = 0,
 ) -> torch.Tensor:
     """为每个样本构造目标窗口的有效帧掩码。"""
     batch_size = valid_target_frames.shape[0]
     mask = torch.zeros(batch_size, 1, latent_window_size, 1, 1, device=device, dtype=dtype)
     for idx, valid in enumerate(valid_target_frames.tolist()):
-        mask[idx, :, : int(valid)] = 1
+        mask[idx, :, valid_start : int(valid)] = 1
     return mask
+
+
+def compute_temporal_delta_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid_target_frames: torch.Tensor,
+    device: torch.device,
+    position_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if prediction.shape[2] <= 1:
+        return torch.tensor(0.0, device=device, dtype=torch.float32)
+
+    delta_prediction = prediction[:, :, 1:] - prediction[:, :, :-1]
+    delta_target = target[:, :, 1:] - target[:, :, :-1]
+    delta_mask = build_valid_mask(
+        valid_target_frames=torch.clamp(valid_target_frames - 1, min=0),
+        latent_window_size=prediction.shape[2] - 1,
+        device=device,
+        dtype=torch.float32,
+        valid_start=0,
+    )
+    if position_weights is not None:
+        delta_mask = delta_mask * position_weights[:, :, 1:, :, :]
+    return masked_mean((delta_prediction - delta_target).abs(), delta_mask)
 
 
 def get_scheduler_config_value(scheduler: object, key: str, default=None):
@@ -1820,10 +1956,12 @@ def reconstruct_sequence(
     weight_dtype: torch.dtype,
     history_sizes: Sequence[int],
     latent_window_size: int,
+    anchor_span_latents: int,
     num_inference_steps: int,
     seed: int,
+    fix_anchor_during_denoise: bool,
     distributed_context: DistributedContext,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor:
     """把一段 low latents 重建成 recover latents。
 
     这里按 section 分段恢复，每个 section 只依赖：
@@ -1835,18 +1973,12 @@ def reconstruct_sequence(
     clean_full = sequence.clean_full_latents
     low_full = sequence.low_full_latents
     if clean_full.shape[1] == 1:
-        # 只有首帧时，不存在 remainder，直接返回原始结果即可。
-        if distributed_context.is_main_process:
-            return clean_full.clone().cpu().contiguous()
-        return None
+        return clean_full.clone().cpu().contiguous()
 
     prepare_stage1_clean_input_from_latents = import_stage1_prepare_fn()
     history_sizes = list(history_sizes)
-    history_window_size = sum(history_sizes)
-    # 多卡推理时采用轮转切分 section，尽量让不同 rank 负载更均匀。
     section_starts = list(range(1, clean_full.shape[1], latent_window_size))
-    assigned_section_starts = section_starts[distributed_context.rank :: distributed_context.world_size]
-    local_section_results: List[Tuple[int, torch.Tensor]] = []
+    recovered_sections: List[torch.Tensor] = []
     dummy_target = torch.zeros(
         1,
         clean_full.shape[0],
@@ -1859,16 +1991,18 @@ def reconstruct_sequence(
     x0_latents = clean_full[:, :1].unsqueeze(0).to(device=device, dtype=weight_dtype)
 
     for section_start in tqdm(
-        assigned_section_starts,
-        desc="Reconstructing local sections",
-        disable=not distributed_context.is_main_process,
+        section_starts,
+        desc=f"Reconstructing sections rank={distributed_context.rank}",
+        disable=distributed_context.is_distributed and not distributed_context.is_main_process,
     ):
         history_latents = extract_history_window(
             low_full_latents=low_full,
             section_start=section_start,
-            history_window_size=history_window_size,
+            history_window_size=sum(history_sizes),
         ).unsqueeze(0)
         valid_target_frames = min(latent_window_size, clean_full.shape[1] - section_start)
+        anchor_steps = min(anchor_span_latents, valid_target_frames)
+        section_anchor_latents = low_full[:, section_start : section_start + anchor_steps].unsqueeze(0)
 
         (
             _,
@@ -1893,7 +2027,6 @@ def reconstruct_sequence(
             device=device,
         )
 
-        # 当前窗口从随机噪声出发，经 scheduler 逐步去噪恢复成目标 latent。
         section_latents = run_stage1_denoise(
             transformer=transformer,
             scheduler=scheduler,
@@ -1912,59 +2045,15 @@ def reconstruct_sequence(
             latents_history_long=latents_history_long,
             num_inference_steps=num_inference_steps,
             seed=seed + section_start,
+            anchor_latents=section_anchor_latents.to(device=device, dtype=weight_dtype),
+            fix_anchor_during_denoise=fix_anchor_during_denoise,
         )
-        local_section_results.append((section_start, section_latents[0, :, :valid_target_frames].contiguous()))
+        valid_section = section_latents[0, :, :valid_target_frames].contiguous()
+        recovered_sections.append(valid_section)
 
-    gathered_sections = gather_reconstructed_sections(local_section_results, distributed_context)
-    if gathered_sections is None:
-        return None
-
-    # 主进程按起始位置重新组织各个 section，避免分布式收集后时序打乱。
-    section_map: Dict[int, torch.Tensor] = {}
-    for section_start, recovered_latents in gathered_sections:
-        if section_start in section_map:
-            raise RuntimeError(f"Duplicate reconstructed section received for section_start={section_start}.")
-        section_map[section_start] = recovered_latents
-
-    missing_sections = [section_start for section_start in section_starts if section_start not in section_map]
-    if missing_sections:
-        raise RuntimeError(f"Missing reconstructed sections on rank 0: {missing_sections}.")
-
-    recovered_sections = [section_map[section_start] for section_start in section_starts]
     recovered_remainder = torch.cat(recovered_sections, dim=1)
     recovered_remainder = recovered_remainder[:, : clean_full.shape[1] - 1]
-    # 首帧继续沿用 clean keyframe，最大限度减少起始锚点误差。
     return torch.cat([clean_full[:, :1].cpu(), recovered_remainder], dim=1).contiguous()
-
-
-def gather_reconstructed_sections(
-    local_section_results: List[Tuple[int, torch.Tensor]],
-    distributed_context: DistributedContext,
-) -> Optional[List[Tuple[int, torch.Tensor]]]:
-    """把不同 rank 的 section 恢复结果收集到主进程。"""
-    if not distributed_context.is_distributed:
-        return local_section_results
-
-    if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError("Distributed reconstruction expected an initialized process group.")
-
-    gathered_section_results: Optional[List[List[Tuple[int, torch.Tensor]]]] = None
-    if distributed_context.is_main_process:
-        gathered_section_results = [list() for _ in range(distributed_context.world_size)]
-
-    dist.gather_object(
-        local_section_results,
-        object_gather_list=gathered_section_results,
-        dst=0,
-    )
-    if not distributed_context.is_main_process:
-        return None
-    assert gathered_section_results is not None
-
-    merged_section_results: List[Tuple[int, torch.Tensor]] = []
-    for rank_sections in gathered_section_results:
-        merged_section_results.extend(rank_sections)
-    return merged_section_results
 
 
 @torch.inference_mode()
@@ -1986,12 +2075,15 @@ def run_stage1_denoise(
     latents_history_long: torch.Tensor,
     num_inference_steps: int,
     seed: int,
+    anchor_latents: torch.Tensor,
+    fix_anchor_during_denoise: bool,
 ) -> torch.Tensor:
     """执行单个 section 的扩散式去噪恢复。"""
     base_transformer = unwrap_model(transformer)
     generator = torch.Generator(device=device).manual_seed(seed)
-    # 从纯噪声初始化，逐 timestep 向恢复结果逼近。
     latents = torch.randn(latent_shape, device=device, dtype=torch.float32, generator=generator)
+    if fix_anchor_during_denoise:
+        latents = overwrite_anchor_latents(latents, anchor_latents.float())
     prepare_stage1_inference_scheduler(
         scheduler=scheduler,
         latents=latents,
@@ -2002,6 +2094,8 @@ def run_stage1_denoise(
     supports_first_step_flag = model_supports_argument(base_transformer, "is_first_denoising_step")
 
     for step_idx, timestep in enumerate(scheduler.timesteps):
+        if fix_anchor_during_denoise:
+            latents = overwrite_anchor_latents(latents, anchor_latents.float())
         current_sigma = get_scheduler_sigma_for_step(scheduler, step_idx)
         ensure_finite_recover_state(
             stage="pre_model",
@@ -2049,6 +2143,8 @@ def run_stage1_denoise(
             latents = scheduler.step_unipc(noise_pred.float(), timestep, latents, return_dict=False)[0]
         else:
             latents = scheduler.step(noise_pred.float(), timestep, latents, return_dict=False)[0]
+        if fix_anchor_during_denoise:
+            latents = overwrite_anchor_latents(latents, anchor_latents.float())
         ensure_finite_recover_state(
             stage="post_step",
             input_path=input_path,
@@ -2069,19 +2165,19 @@ def run_stage1_denoise(
 def build_low_latent_payload(sequence: PreparedSequence) -> Dict[str, object]:
     """构造 low_latents 的落盘 payload。"""
     return {
-        "format_version": LOW_LATENT_FORMAT_V1,
+        "format_version": LOW_LATENT_FORMAT_V2,
         "input_path": str(sequence.path),
         "source_fps": sequence.metadata.source_fps,
         "source_num_frames": sequence.metadata.source_num_frames,
         "source_width": sequence.metadata.source_width,
         "source_height": sequence.metadata.source_height,
         "chunk_lengths": list(sequence.metadata.chunk_lengths),
+        "codec_config_v2": sequence.low_codec_payload["codec_config"],
         "codec_config": sequence.low_codec_payload["codec_config"],
-        "keyframe": sequence.low_codec_payload["keyframe"],
-        "quantized_remainder": sequence.low_codec_payload["quantized_remainder"],
-        "scales": sequence.low_codec_payload["scales"],
-        "reduced_shape": list(sequence.low_codec_payload["reduced_shape"]),
-        "original_remainder_shape": list(sequence.low_codec_payload["original_remainder_shape"]),
+        "global_keyframe": sequence.low_codec_payload["global_keyframe"],
+        "section_ranges": [list(section_range) for section_range in sequence.low_codec_payload["section_ranges"]],
+        "section_anchor_payloads": sequence.low_codec_payload["section_anchor_payloads"],
+        "section_tail_payloads": sequence.low_codec_payload["section_tail_payloads"],
         "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
         "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
     }
@@ -2148,6 +2244,101 @@ def compute_tensor_metrics(prediction: torch.Tensor, target: torch.Tensor) -> Di
     }
 
 
+def compute_anchor_tail_metrics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    latent_window_size: int,
+    anchor_span_latents: int,
+    mode: str,
+) -> Dict[str, float]:
+    if mode not in {"anchor", "tail"}:
+        raise ValueError(f"mode must be 'anchor' or 'tail', got {mode}.")
+
+    time_mask = torch.zeros(prediction.shape[1], dtype=torch.bool)
+    for section_start, section_end in make_section_ranges(
+        total_latent_frames=prediction.shape[1],
+        section_span_latents=latent_window_size,
+        start_index=1,
+    ):
+        anchor_end = min(section_end, section_start + anchor_span_latents)
+        if mode == "anchor":
+            time_mask[section_start:anchor_end] = True
+        else:
+            time_mask[anchor_end:section_end] = True
+
+    if not bool(time_mask.any().item()):
+        return {"mse": 0.0, "l1": 0.0, "psnr": float("inf")}
+
+    prediction_selected = prediction[:, time_mask]
+    target_selected = target[:, time_mask]
+    return compute_tensor_metrics(prediction_selected, target_selected)
+
+
+def compute_tail_position_metrics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    latent_window_size: int,
+    anchor_span_latents: int,
+) -> Dict[str, Dict[str, float]]:
+    tail_metrics: Dict[str, Dict[str, float]] = {}
+    tail_span = max(0, latent_window_size - anchor_span_latents)
+    total_latent_frames = prediction.shape[1]
+
+    for tail_position in range(tail_span):
+        selected_indices: List[int] = []
+        for section_start, section_end in make_section_ranges(
+            total_latent_frames=total_latent_frames,
+            section_span_latents=latent_window_size,
+            start_index=1,
+        ):
+            frame_index = section_start + anchor_span_latents + tail_position
+            if frame_index < section_end:
+                selected_indices.append(frame_index)
+
+        key = f"position_{tail_position}"
+        if not selected_indices:
+            tail_metrics[key] = {"mse": 0.0, "l1": 0.0, "psnr": float("inf"), "count": 0}
+            continue
+
+        prediction_selected = prediction[:, selected_indices]
+        target_selected = target[:, selected_indices]
+        tail_metrics[key] = compute_tensor_metrics(prediction_selected, target_selected)
+        tail_metrics[key]["count"] = int(len(selected_indices))
+    return tail_metrics
+
+
+def compute_temporal_delta_l1(prediction: torch.Tensor, target: torch.Tensor) -> float:
+    if prediction.shape[1] <= 1:
+        return 0.0
+    pred_delta = prediction[:, 1:] - prediction[:, :-1]
+    target_delta = target[:, 1:] - target[:, :-1]
+    return float((pred_delta - target_delta).abs().mean().item())
+
+
+def compute_temporal_backtrack_metrics(prediction: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
+    total_latent_frames = prediction.shape[1]
+    if total_latent_frames <= 1:
+        return {
+            "max_temporal_backtrack_latents": 0.0,
+            "mean_temporal_backtrack_latents": 0.0,
+        }
+
+    prediction_flat = prediction.permute(1, 0, 2, 3).reshape(total_latent_frames, -1).float()
+    target_flat = target.permute(1, 0, 2, 3).reshape(total_latent_frames, -1).float()
+    nearest_indices: List[torch.Tensor] = []
+    for start in range(0, total_latent_frames, 16):
+        distances = torch.cdist(prediction_flat[start : start + 16], target_flat)
+        nearest_indices.append(distances.argmin(dim=1).cpu())
+
+    nearest_clean_indices = torch.cat(nearest_indices, dim=0).to(dtype=torch.float32)
+    current_indices = torch.arange(total_latent_frames, dtype=torch.float32)
+    absolute_backtrack = (nearest_clean_indices - current_indices).abs()
+    return {
+        "max_temporal_backtrack_latents": int(absolute_backtrack.max().item()),
+        "mean_temporal_backtrack_latents": float(absolute_backtrack.mean().item()),
+    }
+
+
 def compute_boundary_transition_l1(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -2199,6 +2390,13 @@ def save_training_artifacts(
         "weight_dtype": args.weight_dtype,
         "history_sizes": list(history_sizes),
         "latent_window_size": latent_window_size,
+        "section_span_latents": codec_config.section_span_latents,
+        "anchor_span_latents": codec_config.anchor_span_latents,
+        "tail_span_latents": codec_config.tail_span_latents,
+        "anchor_quant_dtype": codec_config.anchor_quant_dtype,
+        "anchor_spatial_factor": codec_config.anchor_spatial_factor,
+        "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
+        "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
         "codec_config": asdict(codec_config),
         "train_loss_config": {
             "loss_weighting_scheme": args.loss_weighting_scheme,
@@ -2208,6 +2406,7 @@ def save_training_artifacts(
             "flow_loss_weight": args.flow_loss_weight,
             "x_loss_weight": args.x_loss_weight,
             "noise_loss_weight": args.noise_loss_weight,
+            "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
             "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
             "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
         },
@@ -2248,11 +2447,37 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     missing_keys = sorted(required_keys - config.keys())
     if missing_keys:
         raise KeyError(f"Recover config {config_path} is missing keys: {missing_keys}")
-    if config["format_version"] != RECOVER_CONFIG_VERSION:
+
+    format_version = config["format_version"]
+    if format_version not in {"helios_recover_v2", RECOVER_CONFIG_VERSION}:
         raise ValueError(
-            f"Unsupported recover config format in {config_path}: {config['format_version']}. "
-            f"Expected {RECOVER_CONFIG_VERSION}."
+            f"Unsupported recover config format in {config_path}: {format_version}. "
+            f"Expected helios_recover_v2 or {RECOVER_CONFIG_VERSION}."
         )
+
+    codec_config = dict(config["codec_config"])
+    latent_window_size = int(config["latent_window_size"])
+    codec_config.setdefault("section_span_latents", int(config.get("section_span_latents", latent_window_size)))
+    codec_config.setdefault("anchor_span_latents", int(config.get("anchor_span_latents", DEFAULT_ANCHOR_SPAN_LATENTS)))
+    codec_config.setdefault(
+        "tail_span_latents",
+        int(config.get("tail_span_latents", codec_config["section_span_latents"] - codec_config["anchor_span_latents"])),
+    )
+    codec_config.setdefault("anchor_quant_dtype", config.get("anchor_quant_dtype", DEFAULT_ANCHOR_QUANT_DTYPE))
+    codec_config.setdefault("anchor_spatial_factor", int(config.get("anchor_spatial_factor", DEFAULT_ANCHOR_SPATIAL_FACTOR)))
+
+    config["format_version"] = RECOVER_CONFIG_VERSION
+    config["codec_config"] = codec_config
+    config["section_span_latents"] = int(codec_config["section_span_latents"])
+    config["anchor_span_latents"] = int(codec_config["anchor_span_latents"])
+    config["tail_span_latents"] = int(codec_config["tail_span_latents"])
+    config["anchor_quant_dtype"] = codec_config["anchor_quant_dtype"]
+    config["anchor_spatial_factor"] = int(codec_config["anchor_spatial_factor"])
+    config.setdefault("fix_anchor_during_denoise", DEFAULT_FIX_ANCHOR_DURING_DENOISE)
+    train_loss_config = dict(config.get("train_loss_config", {}))
+    train_loss_config.setdefault("temporal_delta_loss_weight", DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
+    config["temporal_delta_loss_weight"] = train_loss_config["temporal_delta_loss_weight"]
+    config["train_loss_config"] = train_loss_config
     return config
 
 
@@ -2341,20 +2566,6 @@ def distributed_barrier(distributed_context: DistributedContext) -> None:
     """在分布式推理中做同步屏障。"""
     if distributed_context.is_distributed and dist.is_initialized():
         dist.barrier()
-
-
-def reduce_tensor_mean(tensor: torch.Tensor, distributed_context: DistributedContext) -> torch.Tensor:
-    """对分布式 tensor 做均值归约。
-
-    当前文件里几乎没有直接使用它，但保留这个工具函数便于后续扩展更多分布式指标。
-    """
-    if not distributed_context.is_distributed:
-        return tensor.detach().float()
-    reduced = tensor.detach().float().clone()
-    dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
-    reduced /= distributed_context.world_size
-    return reduced
-
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     """剥离 DDP / accelerate 外层包装，拿到真正的底层模型。"""
