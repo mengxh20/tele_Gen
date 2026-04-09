@@ -2497,6 +2497,7 @@ def build_recover_latent_payload(
             "raw_bpp": sequence.metadata.raw_bpp,
             "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
             "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
+            "section_ranges": [list(section_range) for section_range in sequence.low_codec_payload["section_ranges"]],
         },
     }
 
