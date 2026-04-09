@@ -22,4 +22,5 @@ accelerate launch \
     --num_processes "${NUM_PROCESSES}" \
     --main_process_ip "${MASTER_ADDR}" \
     --main_process_port "${MASTER_PORT}" \
-    reconstruct/recover.py train "$@"
+    reconstruct/recover.py train --output_dir "reconstruct/gen2recon_runs_CNN" \
+    "$@"

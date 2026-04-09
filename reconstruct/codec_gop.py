@@ -4,8 +4,11 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+from reconstruct.learned_codec import LEARNED_TAIL_CODEC_TYPE
+
 
 EPS = 1e-8
+TRILINEAR_TAIL_CODEC_TYPE = "trilinear"
 
 
 def _get_config_value(codec_config, key: str):
@@ -20,6 +23,18 @@ def _as_int(codec_config, key: str) -> int:
 
 def _as_str(codec_config, key: str) -> str:
     return str(_get_config_value(codec_config, key))
+
+
+def _tail_codec_type(codec_config) -> str:
+    if isinstance(codec_config, dict):
+        return str(codec_config.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
+    return str(getattr(codec_config, "tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
+
+
+def _maybe_to_cpu(tensor: torch.Tensor, move_to_cpu: bool) -> torch.Tensor:
+    if move_to_cpu:
+        return tensor.cpu().contiguous()
+    return tensor.contiguous()
 
 
 def validate_codec_config(codec_config) -> None:
@@ -54,6 +69,12 @@ def validate_codec_config(codec_config) -> None:
     keyframe_dtype = _as_str(codec_config, "keyframe_dtype")
     if keyframe_dtype not in {"float16", "float32"}:
         raise ValueError(f"Unsupported keyframe_dtype={keyframe_dtype}.")
+    tail_codec_type = _tail_codec_type(codec_config)
+    if tail_codec_type not in {TRILINEAR_TAIL_CODEC_TYPE, LEARNED_TAIL_CODEC_TYPE}:
+        raise ValueError(
+            f"Unsupported tail_codec_type={tail_codec_type}. "
+            f"Expected {TRILINEAR_TAIL_CODEC_TYPE} or {LEARNED_TAIL_CODEC_TYPE}."
+        )
 
 
 def make_section_ranges(
@@ -96,11 +117,11 @@ def symmetric_dequantize_per_channel(quantized_latents: torch.Tensor, scales: to
     return quantized_latents.float() * scale_view
 
 
-def _encode_quantized_block(latents: torch.Tensor, quant_dtype: str) -> Dict[str, object]:
+def _encode_quantized_block(latents: torch.Tensor, quant_dtype: str, move_to_cpu: bool = True) -> Dict[str, object]:
     quantized, scales = symmetric_quantize_per_channel(latents, quant_dtype)
     return {
-        "quantized": quantized.cpu(),
-        "scales": scales.cpu(),
+        "quantized": _maybe_to_cpu(quantized, move_to_cpu),
+        "scales": _maybe_to_cpu(scales, move_to_cpu),
         "reduced_shape": [int(value) for value in latents.shape],
     }
 
@@ -116,7 +137,7 @@ def _decode_quantized_block(payload: Dict[str, object]) -> torch.Tensor:
     )
 
 
-def encode_refresh_anchor(anchor_latents: torch.Tensor, codec_config) -> Dict[str, object]:
+def encode_refresh_anchor(anchor_latents: torch.Tensor, codec_config, move_to_cpu: bool = True) -> Dict[str, object]:
     if anchor_latents.ndim != 4:
         raise ValueError(f"Expected anchor latents with shape [C, T, H, W], got {tuple(anchor_latents.shape)}.")
     if anchor_latents.shape[1] == 0:
@@ -135,7 +156,7 @@ def encode_refresh_anchor(anchor_latents: torch.Tensor, codec_config) -> Dict[st
                 max(1, math.ceil(anchor_latents.shape[3] / anchor_spatial_factor)),
             ),
         ).squeeze(0)
-    payload = _encode_quantized_block(reduced_anchor, anchor_quant_dtype)
+    payload = _encode_quantized_block(reduced_anchor, anchor_quant_dtype, move_to_cpu=move_to_cpu)
     payload["original_shape"] = [int(value) for value in anchor_latents.shape]
     return payload
 
@@ -156,6 +177,9 @@ def encode_section_tail_residual(
     section_tail_latents: torch.Tensor,
     decoded_anchor_latents: torch.Tensor,
     codec_config,
+    learned_tail_codec=None,
+    use_ste_quant: bool = False,
+    move_to_cpu: bool = True,
 ) -> Dict[str, object]:
     if section_tail_latents.ndim != 4:
         raise ValueError(
@@ -164,14 +188,31 @@ def encode_section_tail_residual(
     original_shape = [int(value) for value in section_tail_latents.shape]
     if section_tail_latents.shape[1] == 0:
         return {
-            "quantized": torch.empty(0, dtype=torch.int8),
-            "scales": torch.empty(0, dtype=torch.float32),
+            "tail_codec_type": _tail_codec_type(codec_config),
+            "quantized": _maybe_to_cpu(torch.empty(0, dtype=torch.int8), move_to_cpu),
+            "scales": _maybe_to_cpu(torch.empty(0, dtype=torch.float32), move_to_cpu),
             "reduced_shape": [int(section_tail_latents.shape[0]), 0, int(section_tail_latents.shape[2]), int(section_tail_latents.shape[3])],
             "original_shape": original_shape,
         }
 
-    anchor_reference = decoded_anchor_latents[:, -1:].float().expand(-1, section_tail_latents.shape[1], -1, -1)
+    anchor_reference = (
+        decoded_anchor_latents[:, -1:]
+        .to(device=section_tail_latents.device, dtype=torch.float32)
+        .expand(-1, section_tail_latents.shape[1], -1, -1)
+    )
     residual_tail = section_tail_latents.float() - anchor_reference
+    tail_codec_type = _tail_codec_type(codec_config)
+    if tail_codec_type == LEARNED_TAIL_CODEC_TYPE:
+        if learned_tail_codec is None:
+            raise ValueError("learned_tail_codec must be provided when tail_codec_type=learned_cnn_v1.")
+        if use_ste_quant:
+            payload = learned_tail_codec.encode_to_ste_payload(residual_tail.unsqueeze(0))
+        else:
+            payload = learned_tail_codec.encode_to_quantized_payload(residual_tail.unsqueeze(0))
+        payload["tail_codec_type"] = LEARNED_TAIL_CODEC_TYPE
+        payload["original_shape"] = original_shape
+        return payload
+
     reduced_tail = trilinear_resize(
         residual_tail.unsqueeze(0),
         (
@@ -180,7 +221,12 @@ def encode_section_tail_residual(
             max(1, math.ceil(section_tail_latents.shape[3] / _as_int(codec_config, "spatial_factor"))),
         ),
     ).squeeze(0)
-    payload = _encode_quantized_block(reduced_tail, _as_str(codec_config, "quant_dtype"))
+    payload = _encode_quantized_block(
+        reduced_tail,
+        _as_str(codec_config, "quant_dtype"),
+        move_to_cpu=move_to_cpu,
+    )
+    payload["tail_codec_type"] = TRILINEAR_TAIL_CODEC_TYPE
     payload["original_shape"] = original_shape
     return payload
 
@@ -188,17 +234,26 @@ def encode_section_tail_residual(
 def decode_section_tail_residual(
     tail_payload: Dict[str, object],
     decoded_anchor_latents: torch.Tensor,
+    learned_tail_codec=None,
 ) -> torch.Tensor:
     original_shape = tuple(int(value) for value in tail_payload["original_shape"])
     if original_shape[1] == 0:
         return torch.empty(original_shape, dtype=torch.float32)
 
-    reduced_residual = _decode_quantized_block(tail_payload)
-    restored_residual = trilinear_resize(
-        reduced_residual.unsqueeze(0),
-        (original_shape[1], original_shape[2], original_shape[3]),
-    ).squeeze(0)
-    anchor_reference = decoded_anchor_latents[:, -1:].float().expand(-1, original_shape[1], -1, -1)
+    tail_codec_type = str(tail_payload.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
+    if tail_codec_type == LEARNED_TAIL_CODEC_TYPE:
+        if learned_tail_codec is None:
+            raise ValueError("learned_tail_codec must be provided to decode learned tail payloads.")
+        restored_residual = learned_tail_codec.decode_payload(tail_payload)
+        anchor_source = decoded_anchor_latents.to(device=restored_residual.device, dtype=torch.float32)
+    else:
+        reduced_residual = _decode_quantized_block(tail_payload)
+        restored_residual = trilinear_resize(
+            reduced_residual.unsqueeze(0),
+            (original_shape[1], original_shape[2], original_shape[3]),
+        ).squeeze(0)
+        anchor_source = decoded_anchor_latents.float()
+    anchor_reference = anchor_source[:, -1:].expand(-1, original_shape[1], -1, -1)
     return (anchor_reference + restored_residual.float()).contiguous()
 
 
@@ -215,6 +270,15 @@ def estimate_anchor_plus_tail_codec_bytes(codec_payload: Dict[str, object]) -> i
                 value = payload.get(tensor_key)
                 if isinstance(value, torch.Tensor):
                     total_bytes += value.numel() * value.element_size()
+            if "ste_bottleneck" in payload:
+                reduced_shape = [int(value) for value in payload.get("reduced_shape", [])]
+                if reduced_shape:
+                    channel_count = int(reduced_shape[0])
+                    bottleneck_elements = 1
+                    for value in reduced_shape:
+                        bottleneck_elements *= int(value)
+                    total_bytes += bottleneck_elements
+                    total_bytes += channel_count * 4
 
     metadata_values: List[int] = [len(codec_payload.get("chunk_lengths", []))]
     metadata_values.extend(int(value) for value in codec_payload.get("chunk_lengths", []))
@@ -234,6 +298,9 @@ def encode_anchor_plus_tail_latents(
     clean_full_latents: torch.Tensor,
     codec_config,
     chunk_lengths: Sequence[int],
+    learned_tail_codec=None,
+    use_ste_quant: bool = False,
+    move_to_cpu: bool = True,
 ) -> Dict[str, object]:
     validate_codec_config(codec_config)
     if clean_full_latents.ndim != 4:
@@ -257,23 +324,30 @@ def encode_anchor_plus_tail_latents(
         section_anchor = section_latents[:, :anchor_span].contiguous()
         section_tail = section_latents[:, anchor_span:].contiguous()
 
-        anchor_payload = encode_refresh_anchor(section_anchor, codec_config)
+        anchor_payload = encode_refresh_anchor(section_anchor, codec_config, move_to_cpu=move_to_cpu)
         decoded_anchor = decode_refresh_anchor(anchor_payload)
-        tail_payload = encode_section_tail_residual(section_tail, decoded_anchor, codec_config)
+        tail_payload = encode_section_tail_residual(
+            section_tail,
+            decoded_anchor,
+            codec_config,
+            learned_tail_codec=learned_tail_codec,
+            use_ste_quant=use_ste_quant,
+            move_to_cpu=move_to_cpu,
+        )
         section_anchor_payloads.append(anchor_payload)
         section_tail_payloads.append(tail_payload)
 
     return {
         "chunk_lengths": [int(length) for length in chunk_lengths],
         "codec_config": dict(codec_config) if isinstance(codec_config, dict) else None,
-        "global_keyframe": global_keyframe.cpu(),
+        "global_keyframe": _maybe_to_cpu(global_keyframe, move_to_cpu),
         "section_ranges": [(int(start), int(end)) for start, end in section_ranges],
         "section_anchor_payloads": section_anchor_payloads,
         "section_tail_payloads": section_tail_payloads,
     }
 
 
-def decode_anchor_plus_tail_latents(codec_payload: Dict[str, object]) -> torch.Tensor:
+def decode_anchor_plus_tail_latents(codec_payload: Dict[str, object], learned_tail_codec=None) -> torch.Tensor:
     global_keyframe = codec_payload["global_keyframe"].float()
     section_ranges = [tuple(int(value) for value in section_range) for section_range in codec_payload["section_ranges"]]
     section_anchor_payloads = codec_payload["section_anchor_payloads"]
@@ -288,11 +362,18 @@ def decode_anchor_plus_tail_latents(codec_payload: Dict[str, object]) -> torch.T
     ):
         del section_start, section_end
         decoded_anchor = decode_refresh_anchor(anchor_payload)
-        decoded_tail = decode_section_tail_residual(tail_payload, decoded_anchor)
+        decoded_tail = decode_section_tail_residual(
+            tail_payload,
+            decoded_anchor,
+            learned_tail_codec=learned_tail_codec,
+        )
+        if decoded_anchor.device != decoded_tail.device:
+            decoded_anchor = decoded_anchor.to(device=decoded_tail.device, dtype=torch.float32)
         sections.append(torch.cat([decoded_anchor, decoded_tail], dim=1))
 
     remainder = torch.cat(sections, dim=1)
-    return torch.cat([global_keyframe.float(), remainder.float()], dim=1).contiguous()
+    global_keyframe = global_keyframe.to(device=remainder.device, dtype=torch.float32)
+    return torch.cat([global_keyframe, remainder.float()], dim=1).contiguous()
 
 
 def decode_legacy_low_latents(codec_payload: Dict[str, object]) -> torch.Tensor:
@@ -313,9 +394,9 @@ def decode_legacy_low_latents(codec_payload: Dict[str, object]) -> torch.Tensor:
     return torch.cat([keyframe.float(), restored_remainder.float()], dim=1).contiguous()
 
 
-def decode_low_latents_payload(codec_payload: Dict[str, object]) -> torch.Tensor:
+def decode_low_latents_payload(codec_payload: Dict[str, object], learned_tail_codec=None) -> torch.Tensor:
     if "section_anchor_payloads" in codec_payload and "section_tail_payloads" in codec_payload:
-        return decode_anchor_plus_tail_latents(codec_payload)
+        return decode_anchor_plus_tail_latents(codec_payload, learned_tail_codec=learned_tail_codec)
     if "quantized_remainder" in codec_payload and "keyframe" in codec_payload:
         return decode_legacy_low_latents(codec_payload)
     raise KeyError("Unrecognized low codec payload. Expected either anchor+tail fields or legacy remainder fields.")

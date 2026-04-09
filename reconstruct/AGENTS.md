@@ -27,6 +27,7 @@
   - `transformer_full.pt`
   - `recover_config.json`
   - `train_metrics.json`
+  - `checkpoints/latest`：始终指向最近一次完整可推理的 checkpoint，可在训练过程中直接用于恢复推理
 - 推理输出目录默认包括：
   - `low_latents/`
   - `recover_latents/`

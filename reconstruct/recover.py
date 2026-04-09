@@ -18,7 +18,9 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
+import time
 import types
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -37,16 +39,19 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, UMT5EncoderModel
 
 from reconstruct.codec_gop import (
+    TRILINEAR_TAIL_CODEC_TYPE,
     decode_low_latents_payload,
     encode_anchor_plus_tail_latents,
     estimate_anchor_plus_tail_codec_bytes,
     make_section_ranges,
     validate_codec_config,
 )
+from reconstruct.learned_codec import LEARNED_TAIL_CODEC_TYPE, build_learned_tail_codec
 from reconstruct.latent_io import (
     DEFAULT_BASE_MODEL_PATH,
     LATENT_FORMAT_V2,
     LOW_LATENT_FORMAT_V2,
+    LOW_LATENT_FORMAT_V3,
     build_chunk_frame_ranges,
     compute_bpp_from_total_pixels,
     flatten_latent_chunks,
@@ -73,6 +78,7 @@ DEFAULT_ANCHOR_SPAN_LATENTS = 1
 DEFAULT_TAIL_SPAN_LATENTS = DEFAULT_SECTION_SPAN_LATENTS - DEFAULT_ANCHOR_SPAN_LATENTS
 DEFAULT_ANCHOR_QUANT_DTYPE = "int8"
 DEFAULT_ANCHOR_SPATIAL_FACTOR = 1
+DEFAULT_TAIL_CODEC_TYPE = LEARNED_TAIL_CODEC_TYPE
 DEFAULT_NUM_INFERENCE_STEPS = 30
 DEFAULT_WEIGHT_DTYPE = "bf16"
 DEFAULT_LEARNING_RATE = 1e-5
@@ -88,7 +94,11 @@ DEFAULT_AUX_LOSS_WARMUP_STEPS = 500
 DEFAULT_AUX_LOSS_RAMP_STEPS = 1000
 DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT = 0.1
 DEFAULT_FIX_ANCHOR_DURING_DENOISE = True
-RECOVER_CONFIG_VERSION = "helios_recover_v3"
+DEFAULT_LOW_LATENT_FORMAT_VERSION = LOW_LATENT_FORMAT_V3
+RECOVER_CONFIG_VERSION = "helios_recover_v4"
+LEARNED_CODEC_CHECKPOINT_NAME = "learned_codec.pt"
+LATEST_CHECKPOINT_LINK_NAME = "latest"
+LATEST_CHECKPOINT_POINTER_NAME = "latest_checkpoint.txt"
 EPS = 1e-8
 
 
@@ -111,6 +121,8 @@ class CodecConfig:
     tail_span_latents: int = DEFAULT_TAIL_SPAN_LATENTS
     anchor_quant_dtype: str = DEFAULT_ANCHOR_QUANT_DTYPE
     anchor_spatial_factor: int = DEFAULT_ANCHOR_SPATIAL_FACTOR
+    tail_codec_type: str = DEFAULT_TAIL_CODEC_TYPE
+    learned_codec_hidden_channels: Optional[int] = None
 
 
 @dataclass
@@ -145,8 +157,8 @@ class PreparedSequence:
     path: Path
     metadata: SequenceMetadata
     clean_full_latents: torch.Tensor
-    low_codec_payload: Dict[str, object]
-    low_full_latents: torch.Tensor
+    low_codec_payload: Optional[Dict[str, object]] = None
+    low_full_latents: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +218,19 @@ class TrainingStepOutput:
         }
 
 
+class RecoverTrainingBundle(torch.nn.Module):
+    """把 recover transformer 与 learned tail codec 组合成单一训练模块。
+
+    这样训练阶段可以继续沿用单模型的 Accelerate / DeepSpeed 主流程，
+    避免把压缩网络与恢复网络拆成两个独立 prepare 对象。
+    """
+
+    def __init__(self, transformer: torch.nn.Module, learned_tail_codec: Optional[torch.nn.Module]):
+        super().__init__()
+        self.transformer = transformer
+        self.learned_tail_codec = learned_tail_codec
+
+
 class LatentWindowDataset(Dataset):
     """把整段 latent 序列切成“历史窗口 + 目标窗口”的训练样本。
 
@@ -241,33 +266,11 @@ class LatentWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor | int]:
+    def __getitem__(self, index: int) -> Dict[str, int]:
         seq_idx, section_start = self.samples[index]
-        sequence = self.sequences[seq_idx]
-
-        # 目标窗口来自 clean latents，作为监督信号；
-        # 历史窗口来自 low latents，模拟接收端在低码率条件下可见的信息。
-        target_latents, valid_target_frames = extract_target_window(
-            clean_full_latents=sequence.clean_full_latents,
-            section_start=section_start,
-            latent_window_size=self.latent_window_size,
-        )
-        history_latents = extract_history_window(
-            low_full_latents=sequence.low_full_latents,
-            section_start=section_start,
-            history_window_size=self.history_window_size,
-        )
-        section_anchor_latents = sequence.low_full_latents[
-            :,
-            section_start : section_start + min(self.anchor_span_latents, valid_target_frames),
-        ]
-
         return {
-            "history_latents": history_latents,
-            "target_latents": target_latents,
-            "section_anchor_latents": section_anchor_latents,
-            "x0_latents": sequence.clean_full_latents[:, :1],
-            "valid_target_frames": valid_target_frames,
+            "seq_idx": seq_idx,
+            "section_start": section_start,
         }
 
 
@@ -312,6 +315,12 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tail_span_latents", type=int, default=None)
     parser.add_argument("--anchor_quant_dtype", type=str, default=DEFAULT_ANCHOR_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--anchor_spatial_factor", type=int, default=DEFAULT_ANCHOR_SPATIAL_FACTOR)
+    parser.add_argument(
+        "--tail_codec_type",
+        type=str,
+        default=DEFAULT_TAIL_CODEC_TYPE,
+        choices=[TRILINEAR_TAIL_CODEC_TYPE, LEARNED_TAIL_CODEC_TYPE],
+    )
     parser.add_argument("--history_sizes", type=int, nargs="+", default=DEFAULT_HISTORY_SIZES)
     parser.add_argument("--latent_window_size", type=int, default=DEFAULT_LATENT_WINDOW_SIZE)
     parser.add_argument(
@@ -567,6 +576,23 @@ def build_periodic_checkpoint_dir(output_dir: Path, epoch: int, global_step: int
     return output_dir / "checkpoints" / f"epoch_{epoch:04d}_step_{global_step:08d}"
 
 
+def build_temporary_checkpoint_dir(output_dir: Path) -> Path:
+    """为原子化 checkpoint 发布生成隐藏的临时目录。"""
+    stamp = f"{os.getpid()}_{time.time_ns()}"
+    return output_dir.parent / f".{output_dir.name}.tmp_{stamp}"
+
+
+def build_atomic_temp_path(output_path: Path) -> Path:
+    """为单文件原子写入生成同目录下的临时路径。"""
+    stamp = f"{os.getpid()}_{time.time_ns()}"
+    return output_path.parent / f".{output_path.name}.tmp_{stamp}"
+
+
+def is_managed_checkpoint_dir(output_dir: Path) -> bool:
+    """判断目标目录是否属于 `checkpoints/` 下的阶段性 checkpoint。"""
+    return output_dir.parent.name == "checkpoints"
+
+
 def resolve_train_device(device_arg: str) -> torch.device:
     """解析训练设备。
 
@@ -611,8 +637,16 @@ def command_train(args: argparse.Namespace) -> None:
     latent_window_size = codec_config.section_span_latents
     history_sizes = normalize_history_sizes(args.history_sizes)
     input_root, latent_paths = discover_input_latent_paths(args.input_path)
-    # 每个输入样本都会同时准备 clean / low 两套 latent 表示，为训练监督和条件输入服务。
-    prepared_sequences = [prepare_sequence(path, codec_config) for path in latent_paths]
+    # 联合优化时训练阶段不预先固化 low latents，而是保留 clean latents，后续在线压缩并反传。
+    prepared_sequences = [
+        prepare_sequence(
+            path,
+            codec_config,
+            learned_tail_codec=None,
+            materialize_low_latents=False,
+        )
+        for path in latent_paths
+    ]
     dataset = LatentWindowDataset(
         sequences=prepared_sequences,
         history_sizes=history_sizes,
@@ -639,15 +673,30 @@ def command_train(args: argparse.Namespace) -> None:
         gradient_checkpointing=args.gradient_checkpointing,
     )
     transformer.train()
-    base_transformer = transformer
-    trainable_params = count_trainable_parameters(base_transformer)
+    learned_tail_codec = None
+    learned_codec_trainable_params = 0
+    if codec_config.tail_codec_type == LEARNED_TAIL_CODEC_TYPE:
+        learned_tail_codec = build_learned_tail_codec(
+            codec_config=asdict(codec_config),
+            in_channels=infer_latent_channels(prepared_sequences),
+        ).to(device)
+        learned_tail_codec.train()
+        learned_codec_trainable_params = count_trainable_parameters(learned_tail_codec)
+    # transformer 继续走 Accelerate/DeepSpeed；learned codec 保持各 rank 本地副本，手动同步梯度。
+    trainable_params = count_trainable_parameters(transformer) + learned_codec_trainable_params
 
-    # 只优化 recover transformer 中可训练的参数，不改动额外模块。
     optimizer = torch.optim.AdamW(
         [param for param in transformer.parameters() if param.requires_grad],
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
+    learned_codec_optimizer = None
+    if learned_tail_codec is not None:
+        learned_codec_optimizer = torch.optim.AdamW(
+            [param for param in learned_tail_codec.parameters() if param.requires_grad],
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
 
     accelerator = create_train_accelerator(
         weight_dtype=args.weight_dtype,
@@ -658,15 +707,17 @@ def command_train(args: argparse.Namespace) -> None:
         accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = args.batch_size
 
     transformer, optimizer, dataloader = accelerator.prepare(transformer, optimizer, dataloader)
+    synchronize_module_parameters(learned_tail_codec)
 
     output_dir = args.output_dir.resolve()
-    checkpoint_save_interval_epochs = max(1, math.ceil(args.epochs / 10))
+    checkpoint_save_interval_epochs = max(1, math.ceil(args.epochs / 10)) # 这里记录了多少个epoch保存一下权重
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
         print(
             f"[train] input_root={input_root} files={len(latent_paths)} windows={len(dataset)} "
             f"device={device} world_size={accelerator.num_processes} "
             f"effective_global_batch_size={args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps} "
+            f"tail_codec_type={codec_config.tail_codec_type} "
             f"save_every_epochs={checkpoint_save_interval_epochs} "
             f"loss_weighting_scheme={args.loss_weighting_scheme} "
             f"flow/x/noise/delta=({args.flow_loss_weight:.3f}/{args.x_loss_weight:.3f}/{args.noise_loss_weight:.3f}/{args.temporal_delta_loss_weight:.3f}) "
@@ -679,6 +730,7 @@ def command_train(args: argparse.Namespace) -> None:
         "losses": [],
         "steps": 0,
         "trainable_params": trainable_params,
+        "learned_codec_trainable_params": learned_codec_trainable_params,
         "world_size": accelerator.num_processes,
         "per_device_batch_size": args.batch_size,
         "global_batch_size": args.batch_size * accelerator.num_processes,
@@ -700,6 +752,7 @@ def command_train(args: argparse.Namespace) -> None:
         "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
         "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
         "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
+        "tail_codec_type": codec_config.tail_codec_type,
         "loss_definition": {
             "optimized_loss": (
                 "flow_loss_weight * tail_position_weighted_mse(flow_pred, noise-latent) + "
@@ -781,7 +834,10 @@ def command_train(args: argparse.Namespace) -> None:
                 with accelerator.accumulate(transformer):
                     step_output = training_step(
                         batch=batch,
+                        sequences=prepared_sequences,
+                        codec_config=codec_config,
                         transformer=transformer,
+                        learned_tail_codec=learned_tail_codec,
                         prompt_embeds=prompt_embeds,
                         device=device,
                         weight_dtype=weight_dtype,
@@ -803,8 +859,15 @@ def command_train(args: argparse.Namespace) -> None:
                     accelerator.backward(step_output.loss)
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
+                        if learned_tail_codec is not None:
+                            synchronize_module_gradients(learned_tail_codec)
+                            torch.nn.utils.clip_grad_norm_(learned_tail_codec.parameters(), args.max_grad_norm)
                     optimizer.step()
+                    if learned_codec_optimizer is not None and accelerator.sync_gradients:
+                        learned_codec_optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    if learned_codec_optimizer is not None and accelerator.sync_gradients:
+                        learned_codec_optimizer.zero_grad(set_to_none=True)
 
                 detached_metrics = step_output.detached_float_metrics()
                 if not running_metrics:
@@ -985,6 +1048,8 @@ def command_train(args: argparse.Namespace) -> None:
                 save_training_artifacts(
                     output_dir=periodic_checkpoint_dir,
                     transformer=transformer,
+                    learned_tail_codec=learned_tail_codec,
+                    training_model=None,
                     codec_config=codec_config,
                     history_sizes=history_sizes,
                     latent_window_size=latent_window_size,
@@ -1008,6 +1073,8 @@ def command_train(args: argparse.Namespace) -> None:
         save_training_artifacts(
             output_dir=output_dir,
             transformer=transformer,
+            learned_tail_codec=learned_tail_codec,
+            training_model=None,
             codec_config=codec_config,
             history_sizes=history_sizes,
             latent_window_size=latent_window_size,
@@ -1059,7 +1126,8 @@ def command_infer(args: argparse.Namespace) -> None:
     distributed_context, device = init_distributed_context(args.device)
     try:
         set_seed(args.seed)
-        checkpoint_dir = args.checkpoint_dir.resolve()
+        requested_checkpoint_dir = args.checkpoint_dir.resolve()
+        checkpoint_dir = resolve_checkpoint_dir_for_inference(requested_checkpoint_dir)
         checkpoint_config = load_recover_config(checkpoint_dir)
         # 推理阶段优先沿用 checkpoint 的关键配置，除非用户在 CLI 中显式覆盖。
         base_model_path = resolve_infer_value(
@@ -1082,6 +1150,18 @@ def command_infer(args: argparse.Namespace) -> None:
         weight_dtype = parse_weight_dtype(str(weight_dtype_name))
 
         input_root, latent_paths = discover_input_latent_paths(args.input_path)
+        prototype_sequence = prepare_sequence(
+            latent_paths[0],
+            codec_config,
+            learned_tail_codec=None,
+            materialize_low_latents=False,
+        )
+        learned_tail_codec = load_learned_tail_codec(
+            checkpoint_dir=checkpoint_dir,
+            codec_config=codec_config,
+            latent_channels=int(prototype_sequence.clean_full_latents.shape[0]),
+            device=device,
+        )
         assigned_latent_paths = latent_paths[distributed_context.rank :: distributed_context.world_size]
         output_dir = args.output_dir.resolve()
         low_dir = output_dir / "low_latents"
@@ -1094,8 +1174,11 @@ def command_infer(args: argparse.Namespace) -> None:
             metrics_dir.mkdir(parents=True, exist_ok=True)
             print(
                 f"[infer] input_root={input_root} files={len(latent_paths)} "
-                f"device={device} world_size={distributed_context.world_size}"
+                f"device={device} world_size={distributed_context.world_size} "
+                f"checkpoint_dir={checkpoint_dir}"
             )
+            if checkpoint_dir != requested_checkpoint_dir:
+                print(f"[infer] resolved checkpoint request {requested_checkpoint_dir} -> {checkpoint_dir}")
         distributed_barrier(distributed_context)
 
         transformer, scheduler, prompt_embeds = load_transformer_bundle(
@@ -1113,7 +1196,14 @@ def command_infer(args: argparse.Namespace) -> None:
                 f"input={latent_path}"
             )
 
-            sequence = prepare_sequence(latent_path, codec_config)
+            sequence = prepare_sequence(
+                latent_path,
+                codec_config,
+                learned_tail_codec=learned_tail_codec,
+                materialize_low_latents=True,
+                use_ste_quant=False,
+                move_to_cpu=True,
+            )
             recovered_full_latents = reconstruct_sequence(
                 sequence=sequence,
                 transformer=transformer,
@@ -1264,6 +1354,7 @@ def build_codec_config(args: argparse.Namespace) -> CodecConfig:
         tail_span_latents=tail_span_latents,
         anchor_quant_dtype=args.anchor_quant_dtype,
         anchor_spatial_factor=args.anchor_spatial_factor,
+        tail_codec_type=args.tail_codec_type,
     )
     validate_codec_config(asdict(codec_config))
     return codec_config
@@ -1305,7 +1396,14 @@ def discover_input_latent_paths(input_path: Path) -> Tuple[Path, List[Path]]:
     return resolved, latent_paths
 
 
-def prepare_sequence(path: Path, codec_config: CodecConfig) -> PreparedSequence:
+def prepare_sequence(
+    path: Path,
+    codec_config: CodecConfig,
+    learned_tail_codec: Optional[torch.nn.Module] = None,
+    materialize_low_latents: bool = True,
+    use_ste_quant: bool = False,
+    move_to_cpu: bool = True,
+) -> PreparedSequence:
     """把单个 latent 文件预处理成 recover 主链路需要的统一结构。
 
     这里会同时算出：
@@ -1327,14 +1425,6 @@ def prepare_sequence(path: Path, codec_config: CodecConfig) -> PreparedSequence:
     total_pixels = source_num_frames * source_width * source_height
     raw_file_bytes = path.stat().st_size
     raw_bpp = compute_bpp_from_total_pixels(raw_file_bytes, total_pixels)
-    # 先编码，再立即解码出 low_full_latents，模拟接收端只拿到低码率传输结果时的状态。
-    low_codec_payload = encode_low_latents(clean_full_latents, codec_config, chunk_lengths)
-    low_codec_payload["low_codec_bytes"] = estimate_low_codec_bytes(low_codec_payload)
-    low_codec_payload["low_bpp"] = compute_bpp_from_total_pixels(
-        int(low_codec_payload["low_codec_bytes"]),
-        total_pixels,
-    )
-    low_full_latents = decode_low_latents(low_codec_payload).float().contiguous()
     metadata = SequenceMetadata(
         source_fps=float(payload["source_fps"]),
         source_num_frames=source_num_frames,
@@ -1346,39 +1436,118 @@ def prepare_sequence(path: Path, codec_config: CodecConfig) -> PreparedSequence:
         chunk_lengths=chunk_lengths,
         chunk_frame_ranges=chunk_frame_ranges,
     )
-    return PreparedSequence(
+    sequence = PreparedSequence(
         path=path.resolve(),
         metadata=metadata,
         clean_full_latents=clean_full_latents,
-        low_codec_payload=low_codec_payload,
-        low_full_latents=low_full_latents,
     )
+    if not materialize_low_latents:
+        return sequence
+
+    low_codec_payload, low_full_latents = build_sequence_low_latents(
+        sequence=sequence,
+        codec_config=codec_config,
+        learned_tail_codec=learned_tail_codec,
+        device=None,
+        use_ste_quant=use_ste_quant,
+        move_to_cpu=move_to_cpu,
+    )
+    sequence.low_codec_payload = low_codec_payload
+    sequence.low_full_latents = low_full_latents
+    return sequence
+
+
+def infer_latent_channels(sequences: Sequence[PreparedSequence]) -> int:
+    if not sequences:
+        raise ValueError("Expected at least one sequence to infer latent channels.")
+    latent_channels = int(sequences[0].clean_full_latents.shape[0])
+    for sequence in sequences[1:]:
+        current_channels = int(sequence.clean_full_latents.shape[0])
+        if current_channels != latent_channels:
+            raise ValueError(
+                "All sequences must share the same latent channel count for a shared learned codec, "
+                f"got {latent_channels} and {current_channels}."
+            )
+    return latent_channels
+
+
+def build_sequence_low_latents(
+    sequence: PreparedSequence,
+    codec_config: CodecConfig,
+    learned_tail_codec: Optional[torch.nn.Module],
+    device: Optional[torch.device],
+    use_ste_quant: bool,
+    move_to_cpu: bool,
+) -> Tuple[Dict[str, object], torch.Tensor]:
+    clean_full_latents = sequence.clean_full_latents
+    if device is None and learned_tail_codec is not None:
+        try:
+            device = next(learned_tail_codec.parameters()).device
+        except StopIteration:
+            device = None
+    if device is not None:
+        clean_full_latents = clean_full_latents.to(device=device, dtype=torch.float32)
+    else:
+        clean_full_latents = clean_full_latents.float()
+    low_codec_payload = encode_low_latents(
+        clean_full_latents=clean_full_latents,
+        codec_config=codec_config,
+        chunk_lengths=sequence.metadata.chunk_lengths,
+        learned_tail_codec=learned_tail_codec,
+        use_ste_quant=use_ste_quant,
+        move_to_cpu=move_to_cpu,
+    )
+    low_codec_payload["low_codec_bytes"] = estimate_low_codec_bytes(low_codec_payload)
+    low_codec_payload["low_bpp"] = compute_bpp_from_total_pixels(
+        int(low_codec_payload["low_codec_bytes"]),
+        sequence.metadata.total_pixels,
+    )
+    low_full_latents = decode_low_latents(
+        codec_payload=low_codec_payload,
+        learned_tail_codec=learned_tail_codec,
+    ).float().contiguous()
+    if move_to_cpu:
+        low_full_latents = low_full_latents.cpu().contiguous()
+    return low_codec_payload, low_full_latents
 
 
 def encode_low_latents(
     clean_full_latents: torch.Tensor,
     codec_config: CodecConfig,
     chunk_lengths: Sequence[int],
+    learned_tail_codec: Optional[torch.nn.Module] = None,
+    use_ste_quant: bool = False,
+    move_to_cpu: bool = True,
 ) -> Dict[str, object]:
     """把 clean latents 编码成 `x0 + local anchor + P-tail residual` 低码率载荷。"""
     codec_payload = encode_anchor_plus_tail_latents(
         clean_full_latents=clean_full_latents,
         codec_config=asdict(codec_config),
         chunk_lengths=chunk_lengths,
+        learned_tail_codec=learned_tail_codec,
+        use_ste_quant=use_ste_quant,
+        move_to_cpu=move_to_cpu,
     )
     codec_payload["codec_config"] = asdict(codec_config)
-    codec_payload["format_version"] = LOW_LATENT_FORMAT_V2
+    codec_payload["format_version"] = (
+        DEFAULT_LOW_LATENT_FORMAT_VERSION
+        if codec_config.tail_codec_type == LEARNED_TAIL_CODEC_TYPE
+        else LOW_LATENT_FORMAT_V2
+    )
     return codec_payload
 
 
-def decode_low_latents(codec_payload: Dict[str, object]) -> torch.Tensor:
+def decode_low_latents(
+    codec_payload: Dict[str, object],
+    learned_tail_codec: Optional[torch.nn.Module] = None,
+) -> torch.Tensor:
     """从低码率载荷还原出粗恢复 latent。
 
     这个结果不是最终的 recover_latents，而是：
     - 训练时的历史条件输入
     - 推理时接收端可直接得到的低质量基线
     """
-    return decode_low_latents_payload(codec_payload)
+    return decode_low_latents_payload(codec_payload, learned_tail_codec=learned_tail_codec)
 
 
 def estimate_low_codec_bytes(codec_payload: Dict[str, object]) -> int:
@@ -1447,10 +1616,111 @@ def extract_history_window(
             history_window_size - history.shape[1],
             history.shape[2],
             history.shape[3],
+            device=history.device,
             dtype=history.dtype,
         )
         history = torch.cat([zeros, history], dim=1)
     return history.contiguous()
+
+
+def extract_section_anchor_window(
+    low_full_latents: torch.Tensor,
+    section_start: int,
+    valid_target_frames: int,
+    anchor_span_latents: int,
+) -> torch.Tensor:
+    anchor_steps = min(anchor_span_latents, valid_target_frames)
+    anchor_latents = low_full_latents[:, section_start : section_start + anchor_steps]
+    if anchor_latents.shape[1] == anchor_span_latents:
+        return anchor_latents.contiguous()
+    if anchor_latents.shape[1] == 0:
+        return torch.zeros(
+            low_full_latents.shape[0],
+            anchor_span_latents,
+            low_full_latents.shape[2],
+            low_full_latents.shape[3],
+            device=low_full_latents.device,
+            dtype=low_full_latents.dtype,
+        ).contiguous()
+    padding = anchor_latents[:, -1:].repeat(1, anchor_span_latents - anchor_latents.shape[1], 1, 1)
+    return torch.cat([anchor_latents, padding], dim=1).contiguous()
+
+
+def build_training_batch_tensors(
+    batch: Dict[str, torch.Tensor | int],
+    sequences: Sequence[PreparedSequence],
+    codec_config: CodecConfig,
+    learned_tail_codec: Optional[torch.nn.Module],
+    device: torch.device,
+    history_sizes: Sequence[int],
+    latent_window_size: int,
+    anchor_span_latents: int,
+) -> Dict[str, torch.Tensor]:
+    history_window_size = sum(int(value) for value in history_sizes)
+    seq_indices_value = batch["seq_idx"]
+    section_starts_value = batch["section_start"]
+    if torch.is_tensor(seq_indices_value):
+        seq_indices = [int(value) for value in seq_indices_value.tolist()]
+    else:
+        seq_indices = [int(seq_indices_value)]
+    if torch.is_tensor(section_starts_value):
+        section_starts = [int(value) for value in section_starts_value.tolist()]
+    else:
+        section_starts = [int(section_starts_value)]
+
+    unique_seq_indices = sorted(set(seq_indices))
+    low_latent_cache: Dict[int, torch.Tensor] = {}
+    clean_latent_cache: Dict[int, torch.Tensor] = {}
+    for seq_idx in unique_seq_indices:
+        sequence = sequences[seq_idx]
+        _codec_payload, low_full_latents = build_sequence_low_latents(
+            sequence=sequence,
+            codec_config=codec_config,
+            learned_tail_codec=learned_tail_codec,
+            device=device,
+            use_ste_quant=codec_config.tail_codec_type == LEARNED_TAIL_CODEC_TYPE,
+            move_to_cpu=False,
+        )
+        clean_latent_cache[seq_idx] = sequence.clean_full_latents.to(device=device, dtype=torch.float32).contiguous()
+        low_latent_cache[seq_idx] = low_full_latents.to(device=device, dtype=torch.float32).contiguous()
+
+    history_latents: List[torch.Tensor] = []
+    target_latents: List[torch.Tensor] = []
+    section_anchor_latents: List[torch.Tensor] = []
+    x0_latents: List[torch.Tensor] = []
+    valid_target_frames: List[int] = []
+    for seq_idx, section_start in zip(seq_indices, section_starts):
+        clean_full_latents = clean_latent_cache[seq_idx]
+        low_full_latents = low_latent_cache[seq_idx]
+        target_latent, valid_frames = extract_target_window(
+            clean_full_latents=clean_full_latents,
+            section_start=section_start,
+            latent_window_size=latent_window_size,
+        )
+        history_latent = extract_history_window(
+            low_full_latents=low_full_latents,
+            section_start=section_start,
+            history_window_size=history_window_size,
+        )
+        anchor_latent = extract_section_anchor_window(
+            low_full_latents=low_full_latents,
+            section_start=section_start,
+            valid_target_frames=valid_frames,
+            anchor_span_latents=anchor_span_latents,
+        )
+        history_latents.append(history_latent)
+        target_latents.append(target_latent)
+        section_anchor_latents.append(anchor_latent)
+        x0_latents.append(clean_full_latents[:, :1])
+        valid_target_frames.append(valid_frames)
+
+    return {
+        "history_latents": torch.stack(history_latents, dim=0).contiguous(),
+        "target_latents": torch.stack(target_latents, dim=0).contiguous(),
+        "section_anchor_latents": torch.stack(section_anchor_latents, dim=0).contiguous(),
+        "x0_latents": torch.stack(x0_latents, dim=0).contiguous(),
+        "valid_target_frames": torch.tensor(valid_target_frames, device=device, dtype=torch.long),
+    }
 
 
 def load_transformer_bundle(
@@ -1529,7 +1799,10 @@ def load_transformer_bundle(
 
 def training_step(
     batch: Dict[str, torch.Tensor | int],
+    sequences: Sequence[PreparedSequence],
+    codec_config: CodecConfig,
     transformer: torch.nn.Module,
+    learned_tail_codec: Optional[torch.nn.Module],
     prompt_embeds: torch.Tensor,
     device: torch.device,
     weight_dtype: torch.dtype,
@@ -1560,11 +1833,21 @@ def training_step(
     """
     prepare_stage1_clean_input_from_latents = import_stage1_prepare_fn()
     compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3 = import_diffusers_training_utils()
-    history_latents = batch["history_latents"].to(device=device, dtype=weight_dtype)
-    target_latents = batch["target_latents"].to(device=device, dtype=weight_dtype)
-    section_anchor_latents = batch["section_anchor_latents"].to(device=device, dtype=weight_dtype)
-    x0_latents = batch["x0_latents"].to(device=device, dtype=weight_dtype)
-    valid_target_frames = batch["valid_target_frames"].to(device=device)
+    materialized_batch = build_training_batch_tensors(
+        batch=batch,
+        sequences=sequences,
+        codec_config=codec_config,
+        learned_tail_codec=learned_tail_codec,
+        device=device,
+        history_sizes=history_sizes,
+        latent_window_size=latent_window_size,
+        anchor_span_latents=anchor_span_latents,
+    )
+    history_latents = materialized_batch["history_latents"].to(dtype=weight_dtype)
+    target_latents = materialized_batch["target_latents"].to(dtype=weight_dtype)
+    section_anchor_latents = materialized_batch["section_anchor_latents"].to(dtype=weight_dtype)
+    x0_latents = materialized_batch["x0_latents"].to(dtype=weight_dtype)
+    valid_target_frames = materialized_batch["valid_target_frames"]
 
     (
         model_input,
@@ -2081,6 +2364,7 @@ def run_stage1_denoise(
     """执行单个 section 的扩散式去噪恢复。"""
     base_transformer = unwrap_model(transformer)
     generator = torch.Generator(device=device).manual_seed(seed)
+    # 输入 hidden_states 是当前 section 的待恢复 latent，先随机初始化为高斯噪声；当前配置下 shape 近似是 [1, 16, 9, H, W]
     latents = torch.randn(latent_shape, device=device, dtype=torch.float32, generator=generator)
     if fix_anchor_during_denoise:
         latents = overwrite_anchor_latents(latents, anchor_latents.float())
@@ -2125,6 +2409,7 @@ def run_stage1_denoise(
             transformer_kwargs["is_first_denoising_step"] = step_idx == 0
 
         with get_model_cache_context(base_transformer, "cond"):
+            # DiT的前向过程
             noise_pred = transformer(
                 **transformer_kwargs,
             )[0]
@@ -2138,7 +2423,7 @@ def run_stage1_denoise(
             latents=latents,
             noise_pred=noise_pred,
         )
-
+        #  scheduler 用DiT前向的输出更新 latents，进入下一轮
         if scheduler_type == "unipc" and hasattr(scheduler, "step_unipc"):
             latents = scheduler.step_unipc(noise_pred.float(), timestep, latents, return_dict=False)[0]
         else:
@@ -2164,8 +2449,10 @@ def run_stage1_denoise(
 
 def build_low_latent_payload(sequence: PreparedSequence) -> Dict[str, object]:
     """构造 low_latents 的落盘 payload。"""
+    if sequence.low_codec_payload is None:
+        raise ValueError("sequence.low_codec_payload is missing. Please materialize low latents first.")
     return {
-        "format_version": LOW_LATENT_FORMAT_V2,
+        "format_version": sequence.low_codec_payload["format_version"],
         "input_path": str(sequence.path),
         "source_fps": sequence.metadata.source_fps,
         "source_num_frames": sequence.metadata.source_num_frames,
@@ -2174,6 +2461,7 @@ def build_low_latent_payload(sequence: PreparedSequence) -> Dict[str, object]:
         "chunk_lengths": list(sequence.metadata.chunk_lengths),
         "codec_config_v2": sequence.low_codec_payload["codec_config"],
         "codec_config": sequence.low_codec_payload["codec_config"],
+        "tail_codec_type": sequence.low_codec_payload["codec_config"].get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE),
         "global_keyframe": sequence.low_codec_payload["global_keyframe"],
         "section_ranges": [list(section_range) for section_range in sequence.low_codec_payload["section_ranges"]],
         "section_anchor_payloads": sequence.low_codec_payload["section_anchor_payloads"],
@@ -2362,6 +2650,8 @@ def compute_boundary_transition_l1(
 def save_training_artifacts(
     output_dir: Path,
     transformer: torch.nn.Module,
+    learned_tail_codec: Optional[torch.nn.Module],
+    training_model: Optional[torch.nn.Module],
     codec_config: CodecConfig,
     history_sizes: Sequence[int],
     latent_window_size: int,
@@ -2376,15 +2666,82 @@ def save_training_artifacts(
     - `recover_config.json`: 推理必须依赖的结构化配置
     - `train_metrics.json`: 训练过程指标，便于对比不同实验
     """
-    if accelerator is None or accelerator.is_main_process:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    is_main_process = accelerator is None or accelerator.is_main_process
+    staged_output_dir = output_dir
+    temp_output_dir = None
+
+    if is_main_process:
+        if is_managed_checkpoint_dir(output_dir):
+            output_dir.parent.mkdir(parents=True, exist_ok=True)
+            temp_output_dir = build_temporary_checkpoint_dir(output_dir)
+            temp_output_dir.mkdir(parents=True, exist_ok=False)
+            staged_output_dir = temp_output_dir
+        else:
+            output_dir.mkdir(parents=True, exist_ok=True)
     if accelerator is not None:
         accelerator.wait_for_everyone()
 
-    save_transformer_checkpoint(transformer, output_dir / "transformer_full.pt", accelerator=accelerator)
+    try:
+        bundled_state_dict = None
+        if training_model is not None:
+            bundled_state_dict = get_cpu_state_dict(training_model, accelerator=accelerator)
+        if bundled_state_dict is not None:
+            if is_main_process:
+                torch_save_atomic(
+                    extract_prefixed_state_dict(bundled_state_dict, "transformer"),
+                    staged_output_dir / "transformer_full.pt",
+                )
+                learned_state_dict = extract_prefixed_state_dict(bundled_state_dict, "learned_tail_codec")
+                if learned_tail_codec is not None:
+                    torch_save_atomic(learned_state_dict, staged_output_dir / LEARNED_CODEC_CHECKPOINT_NAME)
+        else:
+            save_transformer_checkpoint(transformer, staged_output_dir / "transformer_full.pt", accelerator=accelerator)
+            save_optional_module_checkpoint(
+                module=learned_tail_codec,
+                output_path=staged_output_dir / LEARNED_CODEC_CHECKPOINT_NAME,
+                accelerator=accelerator,
+            )
 
-    # recover_config 只保留推理真正需要的最小配置，避免把一次性训练细节全部耦合进去。
-    recover_config = {
+        recover_config = build_recover_config(
+            codec_config=codec_config,
+            history_sizes=history_sizes,
+            latent_window_size=latent_window_size,
+            args=args,
+            learned_tail_codec=learned_tail_codec,
+        )
+        if is_main_process:
+            write_json_atomic(staged_output_dir / "recover_config.json", recover_config)
+            write_json_atomic(staged_output_dir / "train_metrics.json", train_metrics)
+
+        if accelerator is not None:
+            accelerator.wait_for_everyone()
+
+        if is_main_process and temp_output_dir is not None:
+            publish_checkpoint_directory(temp_output_dir=temp_output_dir, output_dir=output_dir)
+            publish_latest_checkpoint_pointer(pointer_dir=output_dir.parent, checkpoint_dir=output_dir)
+        elif is_main_process:
+            publish_latest_checkpoint_pointer(pointer_dir=output_dir / "checkpoints", checkpoint_dir=output_dir)
+    except Exception:
+        if is_main_process and temp_output_dir is not None and temp_output_dir.exists():
+            shutil.rmtree(temp_output_dir, ignore_errors=True)
+        raise
+
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+
+
+def build_recover_config(
+    codec_config: CodecConfig,
+    history_sizes: Sequence[int],
+    latent_window_size: int,
+    args: argparse.Namespace,
+    learned_tail_codec: Optional[torch.nn.Module],
+) -> Dict[str, object]:
+    """构造推理所需的最小 recover 配置。"""
+    learned_codec_config = None
+    if learned_tail_codec is not None:
+        learned_codec_config = unwrap_model(learned_tail_codec).codec_hyperparams()
+    return {
         "format_version": RECOVER_CONFIG_VERSION,
         "base_model_path": args.base_model_path,
         "weight_dtype": args.weight_dtype,
@@ -2395,6 +2752,14 @@ def save_training_artifacts(
         "tail_span_latents": codec_config.tail_span_latents,
         "anchor_quant_dtype": codec_config.anchor_quant_dtype,
         "anchor_spatial_factor": codec_config.anchor_spatial_factor,
+        "tail_codec_type": codec_config.tail_codec_type,
+        "low_latent_format_version": (
+            DEFAULT_LOW_LATENT_FORMAT_VERSION
+            if codec_config.tail_codec_type == LEARNED_TAIL_CODEC_TYPE
+            else LOW_LATENT_FORMAT_V2
+        ),
+        "learned_codec_checkpoint": LEARNED_CODEC_CHECKPOINT_NAME if learned_tail_codec is not None else None,
+        "learned_codec_config": learned_codec_config,
         "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
         "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
         "codec_config": asdict(codec_config),
@@ -2411,28 +2776,152 @@ def save_training_artifacts(
             "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
         },
     }
-    if accelerator is None or accelerator.is_main_process:
-        with (output_dir / "recover_config.json").open("w", encoding="utf-8") as handle:
-            json.dump(recover_config, handle, indent=2)
-        with (output_dir / "train_metrics.json").open("w", encoding="utf-8") as handle:
-            json.dump(train_metrics, handle, indent=2)
-
-    if accelerator is not None:
-        accelerator.wait_for_everyone()
 
 
 def save_transformer_checkpoint(transformer: torch.nn.Module, output_path: Path, accelerator=None) -> None:
     """把 transformer 权重转到 CPU 后保存，减少 checkpoint 与设备环境的耦合。"""
+    save_module_checkpoint(transformer, output_path, accelerator=accelerator)
+
+
+def save_optional_module_checkpoint(
+    module: Optional[torch.nn.Module],
+    output_path: Path,
+    accelerator=None,
+) -> None:
+    if module is None:
+        return
+    save_module_checkpoint(module, output_path, accelerator=accelerator)
+
+
+def save_module_checkpoint(module: torch.nn.Module, output_path: Path, accelerator=None) -> None:
+    cpu_state_dict = get_cpu_state_dict(module, accelerator=accelerator)
+    if cpu_state_dict is None:
+        return
+    torch_save_atomic(cpu_state_dict, output_path)
+
+
+def torch_save_atomic(payload: object, output_path: Path) -> None:
+    """以原子替换方式保存大型 checkpoint 文件。"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = build_atomic_temp_path(output_path)
+    try:
+        torch.save(payload, temp_path)
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def write_json_atomic(output_path: Path, payload: object) -> None:
+    """原子写入 JSON，避免推理读到半写入配置。"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = build_atomic_temp_path(output_path)
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def write_text_atomic(output_path: Path, content: str) -> None:
+    """原子写入文本元信息文件。"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = build_atomic_temp_path(output_path)
+    try:
+        temp_path.write_text(content, encoding="utf-8")
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def publish_checkpoint_directory(temp_output_dir: Path, output_dir: Path) -> None:
+    """把 staging checkpoint 原子发布为正式 checkpoint 目录。"""
+    backup_dir = None
+    if output_dir.exists():
+        backup_dir = output_dir.parent / f".{output_dir.name}.backup_{os.getpid()}_{time.time_ns()}"
+        os.replace(output_dir, backup_dir)
+
+    try:
+        os.replace(temp_output_dir, output_dir)
+    except Exception:
+        if backup_dir is not None and backup_dir.exists() and not output_dir.exists():
+            os.replace(backup_dir, output_dir)
+        raise
+
+    if backup_dir is not None and backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def publish_latest_checkpoint_pointer(pointer_dir: Path, checkpoint_dir: Path) -> None:
+    """更新最近一次完整可推理 checkpoint 的稳定入口。"""
+    pointer_dir.mkdir(parents=True, exist_ok=True)
+    relative_target = os.path.relpath(checkpoint_dir, start=pointer_dir)
+    write_text_atomic(pointer_dir / LATEST_CHECKPOINT_POINTER_NAME, f"{relative_target}\n")
+
+    temp_link = pointer_dir / f".{LATEST_CHECKPOINT_LINK_NAME}.tmp_{os.getpid()}_{time.time_ns()}"
+    link_path = pointer_dir / LATEST_CHECKPOINT_LINK_NAME
+    try:
+        if temp_link.exists() or temp_link.is_symlink():
+            temp_link.unlink()
+        os.symlink(relative_target, temp_link)
+        os.replace(temp_link, link_path)
+    except OSError:
+        if temp_link.exists() or temp_link.is_symlink():
+            temp_link.unlink()
+
+
+def resolve_accelerator_state_dict_target(module: torch.nn.Module, accelerator) -> Optional[torch.nn.Module]:
+    """仅对真正交给 accelerator.prepare 的模块走 accelerator.get_state_dict。
+
+    当前 recover 训练里：
+    - `transformer` 会被 Accelerate / DeepSpeed 接管
+    - `learned_tail_codec` 保持各 rank 的本地副本，并手动同步梯度
+
+    因此保存 checkpoint 时需要区分这两类模块，避免把普通 `nn.Module`
+    误当成 DeepSpeedEngine 调用专属接口。
+    """
+    prepared_models = getattr(accelerator, "_models", None)
+    if not prepared_models:
+        return None
+
+    base_module = unwrap_model(module)
+    for prepared_model in prepared_models:
+        if prepared_model is module:
+            return prepared_model
+        if unwrap_model(prepared_model) is base_module:
+            return prepared_model
+    return None
+
+
+def get_cpu_state_dict(module: torch.nn.Module, accelerator=None) -> Optional[Dict[str, torch.Tensor]]:
     if accelerator is not None:
-        state_dict = accelerator.get_state_dict(transformer)
-        if not accelerator.is_main_process:
-            return
+        state_dict_target = resolve_accelerator_state_dict_target(module, accelerator)
+        if state_dict_target is not None:
+            state_dict = accelerator.get_state_dict(state_dict_target)
+            if not accelerator.is_main_process:
+                return None
+        else:
+            if not accelerator.is_main_process:
+                return None
+            state_dict = unwrap_model(module).state_dict()
     else:
-        state_dict = transformer.state_dict()
+        state_dict = unwrap_model(module).state_dict()
     cpu_state_dict = {}
     for key, value in state_dict.items():
         cpu_state_dict[key] = value.detach().cpu() if torch.is_tensor(value) else value
-    torch.save(cpu_state_dict, output_path)
+    return cpu_state_dict
+
+
+def extract_prefixed_state_dict(state_dict: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
+    prefix_token = f"{prefix}."
+    extracted: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if key.startswith(prefix_token):
+            extracted[key[len(prefix_token) :]] = value
+    return extracted
 
 
 def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
@@ -2449,10 +2938,10 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
         raise KeyError(f"Recover config {config_path} is missing keys: {missing_keys}")
 
     format_version = config["format_version"]
-    if format_version not in {"helios_recover_v2", RECOVER_CONFIG_VERSION}:
+    if format_version not in {"helios_recover_v2", "helios_recover_v3", RECOVER_CONFIG_VERSION}:
         raise ValueError(
             f"Unsupported recover config format in {config_path}: {format_version}. "
-            f"Expected helios_recover_v2 or {RECOVER_CONFIG_VERSION}."
+            f"Expected helios_recover_v2, helios_recover_v3, or {RECOVER_CONFIG_VERSION}."
         )
 
     codec_config = dict(config["codec_config"])
@@ -2465,6 +2954,10 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     )
     codec_config.setdefault("anchor_quant_dtype", config.get("anchor_quant_dtype", DEFAULT_ANCHOR_QUANT_DTYPE))
     codec_config.setdefault("anchor_spatial_factor", int(config.get("anchor_spatial_factor", DEFAULT_ANCHOR_SPATIAL_FACTOR)))
+    codec_config.setdefault("tail_codec_type", config.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
+    learned_codec_config = dict(config.get("learned_codec_config", {}))
+    if "hidden_channels" in learned_codec_config and "learned_codec_hidden_channels" not in codec_config:
+        codec_config["learned_codec_hidden_channels"] = int(learned_codec_config["hidden_channels"])
 
     config["format_version"] = RECOVER_CONFIG_VERSION
     config["codec_config"] = codec_config
@@ -2473,12 +2966,60 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["tail_span_latents"] = int(codec_config["tail_span_latents"])
     config["anchor_quant_dtype"] = codec_config["anchor_quant_dtype"]
     config["anchor_spatial_factor"] = int(codec_config["anchor_spatial_factor"])
+    config["tail_codec_type"] = str(codec_config["tail_codec_type"])
+    config["low_latent_format_version"] = config.get(
+        "low_latent_format_version",
+        DEFAULT_LOW_LATENT_FORMAT_VERSION if config["tail_codec_type"] == LEARNED_TAIL_CODEC_TYPE else LOW_LATENT_FORMAT_V2,
+    )
+    config["learned_codec_checkpoint"] = config.get("learned_codec_checkpoint")
+    config["learned_codec_config"] = learned_codec_config
     config.setdefault("fix_anchor_during_denoise", DEFAULT_FIX_ANCHOR_DURING_DENOISE)
     train_loss_config = dict(config.get("train_loss_config", {}))
     train_loss_config.setdefault("temporal_delta_loss_weight", DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
     config["temporal_delta_loss_weight"] = train_loss_config["temporal_delta_loss_weight"]
     config["train_loss_config"] = train_loss_config
     return config
+
+
+def resolve_checkpoint_dir_for_inference(checkpoint_dir: Path) -> Path:
+    """把用户传入的 checkpoint 路径解析为一套完整可推理的目录。"""
+    if (checkpoint_dir / "recover_config.json").exists():
+        return checkpoint_dir
+
+    latest_link = checkpoint_dir / LATEST_CHECKPOINT_LINK_NAME
+    if latest_link.exists():
+        latest_target = latest_link.resolve()
+        if (latest_target / "recover_config.json").exists():
+            return latest_target
+
+    latest_pointer = checkpoint_dir / LATEST_CHECKPOINT_POINTER_NAME
+    if latest_pointer.exists():
+        relative_target = latest_pointer.read_text(encoding="utf-8").strip()
+        if relative_target:
+            candidate = (checkpoint_dir / relative_target).resolve()
+            if (candidate / "recover_config.json").exists():
+                return candidate
+
+    if checkpoint_dir.exists() and checkpoint_dir.is_dir():
+        candidate_dirs = sorted(
+            path
+            for path in checkpoint_dir.iterdir()
+            if path.is_dir() and not path.name.startswith(".") and (path / "recover_config.json").exists()
+        )
+        if candidate_dirs:
+            return candidate_dirs[-1]
+        if (checkpoint_dir / "transformer_full.pt").exists():
+            raise FileNotFoundError(
+                f"Checkpoint directory {checkpoint_dir} only has weights but is missing recover_config.json. "
+                "This usually means the checkpoint was not fully published for inference."
+            )
+
+    raise FileNotFoundError(
+        f"Could not resolve an infer-ready checkpoint from {checkpoint_dir}. "
+        f"Expected either a directory containing recover_config.json, "
+        f"a `{LATEST_CHECKPOINT_LINK_NAME}` / `{LATEST_CHECKPOINT_POINTER_NAME}` pointer, "
+        "or at least one completed checkpoint subdirectory."
+    )
 
 
 def resolve_infer_value(cli_value: object, default_value: object, checkpoint_value: object) -> object:
@@ -2502,6 +3043,35 @@ def load_state_dict_file(path: Path) -> Dict[str, torch.Tensor]:
         return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
         return torch.load(path, map_location="cpu")
+
+
+def load_learned_tail_codec(
+    checkpoint_dir: Optional[Path],
+    codec_config: CodecConfig,
+    latent_channels: int,
+    device: torch.device,
+) -> Optional[torch.nn.Module]:
+    if codec_config.tail_codec_type != LEARNED_TAIL_CODEC_TYPE:
+        return None
+
+    learned_tail_codec = build_learned_tail_codec(codec_config=asdict(codec_config), in_channels=latent_channels).to(device)
+    if checkpoint_dir is None:
+        learned_tail_codec.train()
+        return learned_tail_codec
+
+    state_dict_path = checkpoint_dir / LEARNED_CODEC_CHECKPOINT_NAME
+    if not state_dict_path.exists():
+        raise FileNotFoundError(f"Missing learned codec checkpoint: {state_dict_path}")
+    state_dict = load_state_dict_file(state_dict_path)
+    incompatible = learned_tail_codec.load_state_dict(state_dict, strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"Unexpected learned codec state dict mismatch while loading {state_dict_path}: "
+            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
+    learned_tail_codec.eval()
+    learned_tail_codec.requires_grad_(False)
+    return learned_tail_codec
 
 
 def parse_weight_dtype(weight_dtype: str) -> torch.dtype:
@@ -2567,6 +3137,34 @@ def distributed_barrier(distributed_context: DistributedContext) -> None:
     if distributed_context.is_distributed and dist.is_initialized():
         dist.barrier()
 
+
+def synchronize_module_parameters(module: Optional[torch.nn.Module]) -> None:
+    """把本地小模块参数从 rank0 广播到所有 rank，保证初始化一致。"""
+    if module is None or not dist.is_initialized():
+        return
+    for parameter in module.parameters():
+        dist.broadcast(parameter.data, src=0)
+    for buffer in module.buffers():
+        dist.broadcast(buffer.data, src=0)
+
+
+def synchronize_module_gradients(module: Optional[torch.nn.Module]) -> None:
+    """手动平均本地小模块梯度，避免把它纳入 ZeRO-3 参数收集序列。"""
+    if module is None or not dist.is_initialized():
+        return
+    world_size = dist.get_world_size()
+    if world_size <= 1:
+        return
+
+    for parameter in module.parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.grad is None:
+            parameter.grad = torch.zeros_like(parameter.data)
+        dist.all_reduce(parameter.grad.data, op=dist.ReduceOp.SUM)
+        parameter.grad.data.div_(float(world_size))
+
+
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     """剥离 DDP / accelerate 外层包装，拿到真正的底层模型。"""
     unwrapped = model
@@ -2576,6 +3174,14 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
             break
         unwrapped = next_model
     return unwrapped
+
+
+def get_training_submodule(model: torch.nn.Module, name: str) -> Optional[torch.nn.Module]:
+    """从训练 bundle 或其外层包装中取出子模块。"""
+    submodule = getattr(model, name, None)
+    if submodule is not None:
+        return submodule
+    return getattr(unwrap_model(model), name, None)
 
 
 def set_seed(seed: int) -> None:

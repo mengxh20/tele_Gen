@@ -10,8 +10,9 @@ from diffusers.video_processor import VideoProcessor
 from tqdm import tqdm
 
 
-DEFAULT_INPUT_DIR = "reconstruct/latents"
-DEFAULT_OUTPUT_DIR = "reconstruct/videos"
+ROOT_DIR = "reconstruct/outputs_CNN"
+DEFAULT_INPUT_DIR = f"{ROOT_DIR}/recover_latents"
+DEFAULT_OUTPUT_DIR = f"{ROOT_DIR}/Videos"
 
 LATENT_FORMAT_V1 = "helios_vae_latent_v1"
 LATENT_FORMAT_V2 = "helios_vae_latent_v2"
@@ -20,6 +21,7 @@ ModelBundle = Tuple[AutoencoderKLWan, VideoProcessor, torch.Tensor, torch.Tensor
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Decode normalized Helios VAE latents back into videos.")
+    parser.add_argument("--root_dir",'-R', type=Path, default=Path(ROOT_DIR))
     parser.add_argument("--input_dir",'-I', type=Path, default=Path(DEFAULT_INPUT_DIR))
     parser.add_argument("--output_dir",'-O', type=Path, default=Path(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--base_model_path", type=str, default="/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base")
