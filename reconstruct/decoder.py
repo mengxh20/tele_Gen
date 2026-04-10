@@ -21,9 +21,9 @@ if str(REPO_ROOT) not in sys.path:
 from reconstruct.codec_gop import make_section_ranges
 
 
-ROOT_DIR = "reconstruct/outputs_CNN"
-DEFAULT_INPUT_DIR = f"{ROOT_DIR}/recover_latents"
-DEFAULT_OUTPUT_DIR = f"{ROOT_DIR}/Videos"
+ROOT_DIR = "reconstruct/outputs_CNN" # 只需要传一个 -R 参数
+DEFAULT_INPUT_SUBDIR = "recover_latents"
+DEFAULT_OUTPUT_SUBDIR = "Videos"
 DEFAULT_SOURCE_VIDEO_DIR = "reconstruct/videos"
 
 LATENT_FORMAT_V1 = "helios_vae_latent_v1"
@@ -53,8 +53,20 @@ class CompareExportConfig:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Decode normalized Helios VAE latents back into videos.")
     parser.add_argument("--root_dir", "-R", type=Path, default=Path(ROOT_DIR))
-    parser.add_argument("--input_dir", "-I", type=Path, default=Path(DEFAULT_INPUT_DIR))
-    parser.add_argument("--output_dir", "-O", type=Path, default=Path(DEFAULT_OUTPUT_DIR))
+    parser.add_argument(
+        "--input_dir",
+        "-I",
+        type=Path,
+        default=None,
+        help=f"Default: <root_dir>/{DEFAULT_INPUT_SUBDIR}",
+    )
+    parser.add_argument(
+        "--output_dir",
+        "-O",
+        type=Path,
+        default=None,
+        help=f"Default: <root_dir>/{DEFAULT_OUTPUT_SUBDIR}",
+    )
     parser.add_argument(
         "--base_model_path",
         type=str,
@@ -539,8 +551,8 @@ def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
     root_dir = args.root_dir.resolve()
-    input_dir = args.input_dir.resolve()
-    output_dir = args.output_dir.resolve()
+    input_dir = args.input_dir.resolve() if args.input_dir else (root_dir / DEFAULT_INPUT_SUBDIR).resolve()
+    output_dir = args.output_dir.resolve() if args.output_dir else (root_dir / DEFAULT_OUTPUT_SUBDIR).resolve()
     compare_config = build_compare_export_config(args, root_dir)
     latent_paths = discover_latent_paths(input_dir)
 

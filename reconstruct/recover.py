@@ -65,13 +65,11 @@ from reconstruct.latent_io import (
 
 
 DEFAULT_INPUT_PATH = Path("reconstruct/latents")
-DEFAULT_TRAIN_OUTPUT_DIR = Path("reconstruct/gen2recon_runs_IPframe_2")
-DEFAULT_INFER_OUTPUT_DIR = Path("reconstruct/recover_outputs")
 DEFAULT_TEMPORAL_FACTOR = 2
-DEFAULT_SPATIAL_FACTOR = 2
+DEFAULT_SPATIAL_FACTOR = 4
 DEFAULT_QUANT_DTYPE = "int8"
 DEFAULT_KEYFRAME_DTYPE = "float16"
-DEFAULT_HISTORY_SIZES = [16, 2, 1]
+DEFAULT_HISTORY_SIZES = [5, 2, 1]
 DEFAULT_LATENT_WINDOW_SIZE = 9
 DEFAULT_SECTION_SPAN_LATENTS = DEFAULT_LATENT_WINDOW_SIZE
 DEFAULT_ANCHOR_SPAN_LATENTS = 1
@@ -291,12 +289,17 @@ def parse_args() -> argparse.Namespace:
 def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     """注册训练阶段使用的参数。"""
     parser.add_argument("--input_path", type=Path, default=DEFAULT_INPUT_PATH)
-    parser.add_argument("--output_dir", type=Path, default=DEFAULT_TRAIN_OUTPUT_DIR)
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        required=True,
+        help="Training output directory. Please pass from launch script.",
+    )
     parser.add_argument("--base_model_path", type=str, default=DEFAULT_BASE_MODEL_PATH)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=DEFAULT_LEARNING_RATE)
@@ -356,7 +359,12 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
     """注册推理阶段使用的参数。"""
     parser.add_argument("--input_path", type=Path, default=DEFAULT_INPUT_PATH)
     parser.add_argument("--checkpoint_dir", type=Path, required=True)
-    parser.add_argument("--output_dir", type=Path, default=DEFAULT_INFER_OUTPUT_DIR)
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        required=True,
+        help="Inference output directory. Please pass from launch script.",
+    )
     parser.add_argument("--base_model_path", type=str, default=DEFAULT_BASE_MODEL_PATH)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -1489,6 +1497,8 @@ def build_sequence_low_latents(
         clean_full_latents = clean_full_latents.to(device=device, dtype=torch.float32)
     else:
         clean_full_latents = clean_full_latents.float()
+
+    # 压缩到低码率模式，模拟真实传输时候的码率
     low_codec_payload = encode_low_latents(
         clean_full_latents=clean_full_latents,
         codec_config=codec_config,
@@ -1502,6 +1512,7 @@ def build_sequence_low_latents(
         int(low_codec_payload["low_codec_bytes"]),
         sequence.metadata.total_pixels,
     )
+    # 讲latents恢复到原尺寸
     low_full_latents = decode_low_latents(
         codec_payload=low_codec_payload,
         learned_tail_codec=learned_tail_codec,
@@ -1849,6 +1860,7 @@ def training_step(
     x0_latents = materialized_batch["x0_latents"].to(dtype=weight_dtype)
     valid_target_frames = materialized_batch["valid_target_frames"]
 
+    # 这段代码讲short,mid,long三档历史和target一起拼成 transformer 输入，后续 transformer 内部会区分处理。
     (
         model_input,
         indices_hidden_states,

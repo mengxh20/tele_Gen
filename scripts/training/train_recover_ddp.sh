@@ -14,6 +14,7 @@ export MACHINE_RANK="${MACHINE_RANK:-${NODE_RANK}}"
 export NUM_PROCESSES_PER_MACHINE="${NUM_PROCESSES_PER_MACHINE:-${NPROC_PER_NODE}}"
 export ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE:-scripts/accelerate_configs/multi_node_example_zero3.yaml}"
 export NUM_PROCESSES="$((NUM_MACHINES * NUM_PROCESSES_PER_MACHINE))"
+# export TRAIN_OUTPUT_DIR="${TRAIN_OUTPUT_DIR:-reconstruct/gen2recon_runs_CNN_2}"
 
 accelerate launch \
     --config_file "${ACCELERATE_CONFIG_FILE}" \
@@ -22,5 +23,6 @@ accelerate launch \
     --num_processes "${NUM_PROCESSES}" \
     --main_process_ip "${MASTER_ADDR}" \
     --main_process_port "${MASTER_PORT}" \
-    reconstruct/recover.py train --output_dir "reconstruct/gen2recon_runs_CNN" \
+    reconstruct/recover.py train \
+    --output_dir "reconstruct/gen2recon_runs_CNN_2" \
     "$@"

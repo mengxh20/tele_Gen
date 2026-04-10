@@ -9,6 +9,8 @@ export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export MASTER_PORT="${MASTER_PORT:-29531}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.9}"
 
+
+SAVEDIR="reconstruct/gen2recon_runs_CNN_2"
 torchrun \
     --nproc_per_node "${NPROC_PER_NODE}" \
     --nnodes "${NNODES}" \
@@ -16,7 +18,6 @@ torchrun \
     --master_addr "${MASTER_ADDR}" \
     --master_port "${MASTER_PORT}" \
     reconstruct/recover.py infer \
-    --checkpoint_dir reconstruct/gen2recon_runs_CNN/checkpoints/epoch_0300_step_00005100 \
-    --input_path reconstruct/latents \
-    --output_dir reconstruct/outputs_CNN_0300 \
+    --checkpoint_dir "${SAVEDIR}/checkpoints" \
+    --output_dir "${SAVEDIR}/recover_outputs" \
     "$@"
