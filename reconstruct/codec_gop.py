@@ -1,5 +1,5 @@
 import math
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +35,15 @@ def _maybe_to_cpu(tensor: torch.Tensor, move_to_cpu: bool) -> torch.Tensor:
     if move_to_cpu:
         return tensor.cpu().contiguous()
     return tensor.contiguous()
+
+
+def _module_device(module) -> Optional[torch.device]:
+    if module is None:
+        return None
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return None
 
 
 def validate_codec_config(codec_config) -> None:
@@ -360,6 +369,8 @@ def encode_anchor_plus_tail_latents(
 
 def decode_anchor_plus_tail_latents(codec_payload: Dict[str, object], learned_tail_codec=None) -> torch.Tensor:
     global_keyframe = codec_payload["global_keyframe"].float()
+    target_device = _module_device(learned_tail_codec) or global_keyframe.device
+    global_keyframe = global_keyframe.to(device=target_device, dtype=torch.float32)
     section_ranges = [tuple(int(value) for value in section_range) for section_range in codec_payload["section_ranges"]]
     section_anchor_payloads = codec_payload["section_anchor_payloads"]
     section_tail_payloads = codec_payload["section_tail_payloads"]
@@ -378,12 +389,11 @@ def decode_anchor_plus_tail_latents(codec_payload: Dict[str, object], learned_ta
             decoded_anchor,
             learned_tail_codec=learned_tail_codec,
         )
-        if decoded_anchor.device != decoded_tail.device:
-            decoded_anchor = decoded_anchor.to(device=decoded_tail.device, dtype=torch.float32)
+        decoded_anchor = decoded_anchor.to(device=target_device, dtype=torch.float32)
+        decoded_tail = decoded_tail.to(device=target_device, dtype=torch.float32)
         sections.append(torch.cat([decoded_anchor, decoded_tail], dim=1))
 
     remainder = torch.cat(sections, dim=1)
-    global_keyframe = global_keyframe.to(device=remainder.device, dtype=torch.float32)
     return torch.cat([global_keyframe, remainder.float()], dim=1).contiguous()
 
 

@@ -10,7 +10,7 @@ export MASTER_PORT="${MASTER_PORT:-29531}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.9}"
 
 
-SAVEDIR="reconstruct/gen2recon_runs_CNN_2"
+SAVEDIR="reconstruct/gen2recon_runs_CNN_3"
 torchrun \
     --nproc_per_node "${NPROC_PER_NODE}" \
     --nnodes "${NNODES}" \

@@ -51,3 +51,4 @@ reconstruct/*video*
 reconstruct/gen2recon_runs*
 reconstruct/output*
 paper/
+train_data_mp4.txt
