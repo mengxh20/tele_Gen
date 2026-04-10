@@ -187,11 +187,18 @@ def encode_section_tail_residual(
         )
     original_shape = [int(value) for value in section_tail_latents.shape]
     if section_tail_latents.shape[1] == 0:
+        empty_quantized = torch.empty(0, dtype=torch.int8, device=section_tail_latents.device)
+        empty_scales = torch.empty(0, dtype=torch.float32, device=section_tail_latents.device)
         return {
             "tail_codec_type": _tail_codec_type(codec_config),
-            "quantized": _maybe_to_cpu(torch.empty(0, dtype=torch.int8), move_to_cpu),
-            "scales": _maybe_to_cpu(torch.empty(0, dtype=torch.float32), move_to_cpu),
-            "reduced_shape": [int(section_tail_latents.shape[0]), 0, int(section_tail_latents.shape[2]), int(section_tail_latents.shape[3])],
+            "quantized": _maybe_to_cpu(empty_quantized, move_to_cpu),
+            "scales": _maybe_to_cpu(empty_scales, move_to_cpu),
+            "reduced_shape": [
+                int(section_tail_latents.shape[0]),
+                0,
+                int(section_tail_latents.shape[2]),
+                int(section_tail_latents.shape[3]),
+            ],
             "original_shape": original_shape,
         }
 
@@ -238,7 +245,11 @@ def decode_section_tail_residual(
 ) -> torch.Tensor:
     original_shape = tuple(int(value) for value in tail_payload["original_shape"])
     if original_shape[1] == 0:
-        return torch.empty(original_shape, dtype=torch.float32)
+        return torch.empty(
+            original_shape,
+            dtype=torch.float32,
+            device=decoded_anchor_latents.device,
+        )
 
     tail_codec_type = str(tail_payload.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
     if tail_codec_type == LEARNED_TAIL_CODEC_TYPE:
