@@ -376,6 +376,12 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         help="Weight dtype used when loading the trained recovery transformer.",
     )
     parser.add_argument("--num_inference_steps", type=int, default=DEFAULT_NUM_INFERENCE_STEPS)
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Only run inference on the first N latent files before distributed sharding.",
+    )
 
 
 def main() -> None:
@@ -1158,6 +1164,11 @@ def command_infer(args: argparse.Namespace) -> None:
         weight_dtype = parse_weight_dtype(str(weight_dtype_name))
 
         input_root, latent_paths = discover_input_latent_paths(args.input_path)
+        total_input_files = len(latent_paths)
+        if args.max_samples is not None:
+            if args.max_samples <= 0:
+                raise ValueError(f"--max_samples must be a positive integer, got {args.max_samples}.")
+            latent_paths = latent_paths[: args.max_samples]
         prototype_sequence = prepare_sequence(
             latent_paths[0],
             codec_config,
@@ -1181,7 +1192,7 @@ def command_infer(args: argparse.Namespace) -> None:
             recover_dir.mkdir(parents=True, exist_ok=True)
             metrics_dir.mkdir(parents=True, exist_ok=True)
             print(
-                f"[infer] input_root={input_root} files={len(latent_paths)} "
+                f"[infer] input_root={input_root} files={len(latent_paths)}/{total_input_files} "
                 f"device={device} world_size={distributed_context.world_size} "
                 f"checkpoint_dir={checkpoint_dir}"
             )
