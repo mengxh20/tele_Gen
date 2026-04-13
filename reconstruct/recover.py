@@ -163,8 +163,8 @@ class PreparedSequence:
 class DistributedContext:
     """推理阶段的分布式上下文。
 
-    这里主要服务 `infer` 命令：把不同 section 的恢复任务分摊到多个 rank，
-    最后只在主进程汇总重建结果并落盘。
+    这里主要服务 `infer` 命令：把不同输入 latent 文件分摊到多个 rank，
+    每个 rank 独立完成各自样本的低码率解码、恢复与落盘。
     """
 
     is_distributed: bool

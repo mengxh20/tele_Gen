@@ -1,8 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
-export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+# Inference uses torchrun multi-process sample sharding:
+# each rank handles a subset of input latent files instead of splitting one sample across GPUs.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 export NNODES="${NNODES:-1}"
 export NODE_RANK="${NODE_RANK:-0}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
