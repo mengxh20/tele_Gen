@@ -10,10 +10,10 @@ export NODE_RANK="${NODE_RANK:-0}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export MASTER_PORT="${MASTER_PORT:-29531}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.9}"
-export MAX_SAMPLES="${MAX_SAMPLES:-4}" # 推理4个样本看看就够了
+export MAX_SAMPLES="${MAX_SAMPLES:-2}" # 推理4个样本看看就够了
 
 
-SAVEDIR="reconstruct/gen2recon_runs_CNN_3"
+SAVEDIR="reconstruct/gen2recon_runs_stage1"
 INFER_ARGS=(
     reconstruct/recover.py infer
     --checkpoint_dir "${SAVEDIR}/checkpoints"
@@ -35,5 +35,11 @@ torchrun \
     "${INFER_ARGS[@]}"
 
 
-# 推理完之后自动进行解码恢复视频
-python reconstruct/decoder.py -R ${SAVEDIR}/recover_outputs
+# # 推理完之后自动进行解码恢复视频
+# python reconstruct/decoder.py -R ${SAVEDIR}/recover_outputs
+
+# 推理完之后自动走接收端链路：
+# low_latents -> recover network -> recover_latents -> video
+python reconstruct/real_decoder.py \
+    -R "${SAVEDIR}/recover_outputs" \
+    --checkpoint_dir "${SAVEDIR}/checkpoints"

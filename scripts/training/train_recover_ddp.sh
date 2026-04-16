@@ -23,5 +23,5 @@ accelerate launch \
     --main_process_ip "${MASTER_ADDR}" \
     --main_process_port "${MASTER_PORT}" \
     reconstruct/recover.py train \
-    --output_dir "reconstruct/gen2recon_runs_CNN_3" \
+    --output_dir "reconstruct/gen2recon_runs_stage1" \
     "$@"

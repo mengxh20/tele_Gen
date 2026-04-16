@@ -1,0 +1,93 @@
+当前section的low_tail理论上应该也是恢复当前section很重要的条件啊，tail本身不就是靠tail的low_latents控制的吗？这个low_latents就是从原本的tail latents提取出来的，浓缩了tail的信息，为什么没有当作条件呢？
+
+
+
+是的，你这个判断在压缩恢复业务上是成立的。
+
+当前 section 的 low_tail 理论上很重要，但当前实现没有把它直接当作当前 section 的条件。
+这不是因为它没信息，而是因为现在这套 recover 代码把任务定义成了：
+
+x0 + 之前 section 的 low history + 当前 section 的 low anchor
+-> 从噪声恢复当前 section
+而不是：
+
+x0 + 之前 history + 当前 section 的 low section
+-> 把当前 low section 精修成 clean section
+代码里现在实际怎么做
+
+low_full_latents 先由 codec 解出来，里面确实包含当前 section 的 low_anchor + low_tail。recover.py (line 1466)
+
+但到了 recover 阶段：
+
+history_latents 只取 section_start 之前的 low_full_latents。recover.py (line 2304) recover.py (line 1626)
+当前 section 单独只取了 section_anchor_latents。recover.py (line 2311)
+当前 section 的 low_tail 没有被拿出来喂给模型。
+恢复时传给 Helios 条件拼装函数的也是：
+
+history_latents
+x0_latents
+target_latents=dummy_target
+而不是“当前 section 的 low tail”。recover.py (line 2322)
+
+随后真正 denoise 是从随机噪声开始的。recover.py (line 2391)
+
+为什么会这样
+
+代码没有写明设计理由，下面是我根据实现做的判断。
+
+最主要原因不是“low_tail 没价值”，而是这套实现优先复用了 Helios stage1 的输入契约，尽量少改 helios/。
+
+prepare_stage1_clean_input_from_latents() 这个接口本身只有：
+
+history_latents
+target_latents
+x0_latents
+没有“当前 low target window”这一路单独条件分支。utils_helios_base.py (line 609)
+
+而训练时，target_latents 取的是 clean target window，不是当前 section 的 low target。recover.py (line 1717)
+训练里模型学的是“把带噪的 clean target 去噪回来”，不是“把当前 low tail 精修回来”。recover.py (line 1884) recover.py (line 1899)
+
+所以从任务定义上看，当前实现更像：
+
+history-guided generation
+不是
+current-low-tail-guided refinement
+
+这带来的直接后果
+
+对压缩恢复主线来说，这其实是一个信息利用上的缺口。
+
+举个最短例子，当前 section 是：
+
+[A4_low, T5_low, T6_low]
+当前代码恢复这一段时：
+
+用 A4_low
+用前面 section 的 history
+不直接用 T5_low, T6_low
+所以 T5_low, T6_low 里的信息没有在“当前 section”立即利用，而是只会在更后面的 section 里，作为 history 间接发挥作用。
+
+从业务角度讲，这意味着：
+
+当前传输来的 low_tail 信息没有被当前恢复步骤充分消费
+recover 网络更多依赖历史和先验去“猜”当前 tail
+这更像生成式补全，不是严格的 low-tail 条件恢复
+所以你的直觉对不对
+
+对。
+如果目标是“最大化利用传输过来的 low-rate 信息来恢复当前 tail”，那当前 section 的 low_tail 理论上应该参与当前 section 恢复。
+
+也就是说，现实现不是因为这条信息不重要，而是因为模型接口和训练定义目前没有把它接进去。
+
+如果以后要改，常见有 3 条路
+
+把当前 section 的 low_tail 作为 denoise 初始化。
+现在是纯噪声开局；可以改成 anchor 固定、tail 用 current low tail 初始化。改动相对小，但有 train/infer mismatch 风险。
+
+把任务改成 residual refinement。
+直接输入当前 low section，模型学 clean - low 的修正量。这条最贴近压缩恢复主线。
+
+给 transformer 增加一条“current low target”条件分支。
+信息利用最充分，但需要改 helios 输入接口，改动最大。
+
+按你这个项目目标，我会认为 2 比现在更合理，1 是最小改动试验版。

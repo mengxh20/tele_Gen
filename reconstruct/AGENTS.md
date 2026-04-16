@@ -9,6 +9,7 @@
 - `encoder.py`：负责把视频编码为 Helios VAE latents，作为后续压缩与恢复链路的输入准备
 - `recover.py`：压缩与恢复主入口，同时承担训练与推理
 - `decoder.py`：把 latent 解码回视频，主要用于可视化、验证和验收，不是压缩恢复主线入口
+- `real_decoder.py`：接收端解码入口，优先读取 `low_latents`，再在内部调用 recover 网络恢复为 `recover_latents` 后解码成视频
 - `latent_io.py`：承接 latent 载荷读写、格式校验、shape 与分块元信息处理等通用能力
 
 ## 稳定业务链路
@@ -33,6 +34,7 @@
   - `recover_latents/`
   - `metrics/`
 - 若需要导出视频，应视为验证或展示环节，而不是替代上述主产物
+- 当需要更贴近真实接收端链路时，优先使用 `real_decoder.py` 走 `low_latents -> recover -> video` 路线
 
 ## 与 Helios 的关系
 - 本目录优先复用 Helios 已有能力，而不是重写其底层逻辑
