@@ -98,6 +98,7 @@ LEARNED_CODEC_CHECKPOINT_NAME = "learned_codec.pt"
 LATEST_CHECKPOINT_LINK_NAME = "latest"
 LATEST_CHECKPOINT_POINTER_NAME = "latest_checkpoint.txt"
 EPS = 1e-8
+REQUIRED_BASE_MODEL_SUBDIRS = ("tokenizer", "text_encoder", "transformer", "scheduler")
 
 
 @dataclass
@@ -313,8 +314,14 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--spatial_factor", type=int, default=DEFAULT_SPATIAL_FACTOR)
     parser.add_argument("--quant_dtype", type=str, default=DEFAULT_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--keyframe_dtype", type=str, default=DEFAULT_KEYFRAME_DTYPE, choices=["float16", "float32"])
-    parser.add_argument("--section_span_latents", type=int, default=None)
-    parser.add_argument("--anchor_span_latents", type=int, default=DEFAULT_ANCHOR_SPAN_LATENTS)
+    parser.add_argument("--section_span_latents", "--section", dest="section_span_latents", type=int, default=None)
+    parser.add_argument(
+        "--anchor_span_latents",
+        "--anchor",
+        dest="anchor_span_latents",
+        type=int,
+        default=DEFAULT_ANCHOR_SPAN_LATENTS,
+    )
     parser.add_argument("--tail_span_latents", type=int, default=None)
     parser.add_argument("--anchor_quant_dtype", type=str, default=DEFAULT_ANCHOR_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--anchor_spatial_factor", type=int, default=DEFAULT_ANCHOR_SPATIAL_FACTOR)
@@ -326,6 +333,14 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--history_sizes", type=int, nargs="+", default=DEFAULT_HISTORY_SIZES)
     parser.add_argument("--latent_window_size", type=int, default=DEFAULT_LATENT_WINDOW_SIZE)
+    parser.add_argument(
+        "--num_inference_steps",
+        "--steps",
+        dest="num_inference_steps",
+        type=int,
+        default=DEFAULT_NUM_INFERENCE_STEPS,
+        help="Default denoising steps saved into the checkpoint config and run name.",
+    )
     parser.add_argument(
         "--loss_weighting_scheme",
         type=str,
@@ -375,7 +390,13 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         choices=["bf16", "fp16", "fp32"],
         help="Weight dtype used when loading the trained recovery transformer.",
     )
-    parser.add_argument("--num_inference_steps", type=int, default=DEFAULT_NUM_INFERENCE_STEPS)
+    parser.add_argument(
+        "--num_inference_steps",
+        "--steps",
+        dest="num_inference_steps",
+        type=int,
+        default=DEFAULT_NUM_INFERENCE_STEPS,
+    )
     parser.add_argument(
         "--max_samples",
         type=int,
@@ -505,6 +526,113 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError(f"aux_loss_warmup_steps must be >= 0, got {args.aux_loss_warmup_steps}.")
     if args.aux_loss_ramp_steps < 0:
         raise ValueError(f"aux_loss_ramp_steps must be >= 0, got {args.aux_loss_ramp_steps}.")
+    if args.num_inference_steps <= 0:
+        raise ValueError(f"num_inference_steps must be > 0, got {args.num_inference_steps}.")
+
+
+def build_codec_run_tag(section_span_latents: int, anchor_span_latents: int, num_inference_steps: int) -> str:
+    """生成带 codec / 恢复步数的稳定 run 标识。"""
+    return (
+        f"section{int(section_span_latents)}"
+        f"_anchor{int(anchor_span_latents)}"
+        f"_steps{int(num_inference_steps)}"
+    )
+
+
+def resolve_train_output_dir(args: argparse.Namespace, codec_config: CodecConfig) -> Path:
+    """把 section / anchor / steps 自动拼到训练输出目录名里，便于区分权重。"""
+    base_output_dir = Path(args.output_dir)
+    run_tag = build_codec_run_tag(
+        section_span_latents=codec_config.section_span_latents,
+        anchor_span_latents=codec_config.anchor_span_latents,
+        num_inference_steps=args.num_inference_steps,
+    )
+    if base_output_dir.name.endswith(run_tag):
+        return base_output_dir
+    return base_output_dir.parent / f"{base_output_dir.name}_{run_tag}"
+
+
+def read_model_path_from_payload(latent_path: Path) -> Optional[str]:
+    """尽量从 latent payload 中复用编码阶段记录的模型路径。"""
+    try:
+        payload = load_payload(latent_path)
+    except Exception:
+        return None
+    model_path = payload.get("model_path")
+    if model_path is None:
+        return None
+    model_path = str(model_path).strip()
+    return model_path or None
+
+
+def resolve_local_base_model_path(
+    requested_path: Optional[str],
+    *,
+    checkpoint_path: Optional[str] = None,
+    latent_paths: Optional[Sequence[Path]] = None,
+) -> str:
+    """解析并校验 recover 主链路使用的本地 Helios base model 目录。"""
+    candidate_values: List[str] = []
+    seen_values = set()
+
+    def add_candidate(value: Optional[str]) -> None:
+        if value is None:
+            return
+        normalized = str(value).strip()
+        if not normalized or normalized in seen_values:
+            return
+        seen_values.add(normalized)
+        candidate_values.append(normalized)
+
+    add_candidate(requested_path)
+    add_candidate(os.environ.get("HELIOS_BASE_MODEL_PATH"))
+    add_candidate(checkpoint_path)
+
+    if latent_paths is not None:
+        payload_model_paths = set()
+        for latent_path in latent_paths[:8]:
+            payload_model_path = read_model_path_from_payload(latent_path)
+            if payload_model_path is not None:
+                payload_model_paths.add(payload_model_path)
+        if len(payload_model_paths) > 1:
+            raise ValueError(
+                "Latent payloads contain inconsistent model_path metadata: "
+                f"{sorted(payload_model_paths)}. Please pass --base_model_path explicitly."
+            )
+        if payload_model_paths:
+            add_candidate(next(iter(payload_model_paths)))
+
+    if not candidate_values:
+        raise FileNotFoundError(
+            "Unable to resolve a local Helios base model path. "
+            "Please pass --base_model_path <local_dir> or export HELIOS_BASE_MODEL_PATH."
+        )
+
+    missing_details: List[str] = []
+    for candidate in candidate_values:
+        candidate_path = Path(candidate).expanduser()
+        if not candidate_path.exists():
+            missing_details.append(f"{candidate} (not found)")
+            continue
+        if not candidate_path.is_dir():
+            missing_details.append(f"{candidate_path.resolve()} (not a directory)")
+            continue
+        missing_subdirs = [
+            subdir for subdir in REQUIRED_BASE_MODEL_SUBDIRS if not (candidate_path / subdir).exists()
+        ]
+        if missing_subdirs:
+            missing_details.append(
+                f"{candidate_path.resolve()} (missing subdirs: {', '.join(missing_subdirs)})"
+            )
+            continue
+        return str(candidate_path.resolve())
+
+    raise FileNotFoundError(
+        "Unable to find a usable local Helios base model directory. Checked: "
+        f"{'; '.join(missing_details)}. "
+        "Please pass --base_model_path to the directory that contains tokenizer/, text_encoder/, "
+        "transformer/, and scheduler/."
+    )
 
 
 def create_train_accelerator(weight_dtype: str, gradient_accumulation_steps: int):
@@ -651,6 +779,10 @@ def command_train(args: argparse.Namespace) -> None:
     latent_window_size = codec_config.section_span_latents
     history_sizes = normalize_history_sizes(args.history_sizes)
     input_root, latent_paths = discover_input_latent_paths(args.input_path)
+    args.base_model_path = resolve_local_base_model_path(
+        args.base_model_path,
+        latent_paths=latent_paths,
+    )
     # 联合优化时训练阶段不预先固化 low latents，而是保留 clean latents，后续在线压缩并反传。
     prepared_sequences = [
         prepare_sequence(
@@ -723,7 +855,8 @@ def command_train(args: argparse.Namespace) -> None:
     transformer, optimizer, dataloader = accelerator.prepare(transformer, optimizer, dataloader)
     synchronize_module_parameters(learned_tail_codec)
 
-    output_dir = args.output_dir.resolve()
+    output_dir = resolve_train_output_dir(args, codec_config).resolve()
+    args.output_dir = output_dir
     checkpoint_save_interval_epochs = max(1, math.ceil(args.epochs / 10)) # 这里记录了多少个epoch保存一下权重
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -759,6 +892,7 @@ def command_train(args: argparse.Namespace) -> None:
         "logit_std": args.logit_std,
         "mode_scale": args.mode_scale,
         "loss_ema_decay": args.loss_ema_decay,
+        "num_inference_steps": args.num_inference_steps,
         "flow_loss_weight": args.flow_loss_weight,
         "x_loss_weight": args.x_loss_weight,
         "noise_loss_weight": args.noise_loss_weight,
@@ -1149,11 +1283,26 @@ def command_infer(args: argparse.Namespace) -> None:
             default_value=DEFAULT_BASE_MODEL_PATH,
             checkpoint_value=checkpoint_config.get("base_model_path"),
         )
+        base_model_path = resolve_local_base_model_path(
+            str(base_model_path),
+            checkpoint_path=checkpoint_config.get("base_model_path"),
+            latent_paths=latent_paths if "latent_paths" in locals() else None,
+        )
+        args.base_model_path = base_model_path
         weight_dtype_name = resolve_infer_value(
             cli_value=args.weight_dtype,
             default_value=DEFAULT_WEIGHT_DTYPE,
             checkpoint_value=checkpoint_config.get("weight_dtype"),
         )
+        args.num_inference_steps = int(
+            resolve_infer_value(
+                cli_value=args.num_inference_steps,
+                default_value=DEFAULT_NUM_INFERENCE_STEPS,
+                checkpoint_value=checkpoint_config.get("num_inference_steps"),
+            )
+        )
+        if args.num_inference_steps <= 0:
+            raise ValueError(f"--num_inference_steps must be > 0, got {args.num_inference_steps}.")
         codec_config = CodecConfig(**checkpoint_config["codec_config"])
         history_sizes = normalize_history_sizes(checkpoint_config["history_sizes"])
         latent_window_size = int(checkpoint_config.get("section_span_latents", checkpoint_config["latent_window_size"]))
@@ -1208,13 +1357,18 @@ def command_infer(args: argparse.Namespace) -> None:
             gradient_checkpointing=False,
         )
         transformer.eval()
+        per_video_latency_seconds: List[float] = []
 
         for sample_idx, latent_path in enumerate(assigned_latent_paths, start=1):
+            sample_start_time = time.perf_counter()
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
             print(
                 f"[infer][rank={distributed_context.rank}] ({sample_idx}/{len(assigned_latent_paths)}) "
                 f"input={latent_path}"
             )
 
+            stage_prepare_start = time.perf_counter()
             sequence = prepare_sequence(
                 latent_path,
                 codec_config,
@@ -1223,6 +1377,9 @@ def command_infer(args: argparse.Namespace) -> None:
                 use_ste_quant=False,
                 move_to_cpu=True,
             )
+            stage_prepare_seconds = time.perf_counter() - stage_prepare_start
+
+            stage_reconstruct_start = time.perf_counter()
             recovered_full_latents = reconstruct_sequence(
                 sequence=sequence,
                 transformer=transformer,
@@ -1238,6 +1395,9 @@ def command_infer(args: argparse.Namespace) -> None:
                 fix_anchor_during_denoise=fix_anchor_during_denoise,
                 distributed_context=distributed_context,
             )
+            stage_reconstruct_seconds = time.perf_counter() - stage_reconstruct_start
+
+            stage_postprocess_start = time.perf_counter()
             low_latent_path, recover_latent_path, metrics_path = resolve_output_paths(
                 input_path=latent_path,
                 input_root=input_root,
@@ -1310,6 +1470,22 @@ def command_infer(args: argparse.Namespace) -> None:
                 prediction=recovered_full_latents,
                 target=sequence.clean_full_latents,
             )
+            sample_total_seconds = time.perf_counter() - sample_start_time
+            stage_postprocess_seconds = time.perf_counter() - stage_postprocess_start
+            gpu_peak_memory = None
+            if device.type == "cuda":
+                gpu_peak_memory = {
+                    "max_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                    "max_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+                }
+            source_duration_seconds = (
+                float(sequence.metadata.source_num_frames) / float(sequence.metadata.source_fps)
+                if sequence.metadata.source_fps > 0
+                else 0.0
+            )
+            realtime_factor = (
+                sample_total_seconds / source_duration_seconds if source_duration_seconds > 0.0 else None
+            )
             metrics_payload = {
                 "input_path": str(sequence.path),
                 "low_latent_path": str(low_latent_path),
@@ -1333,20 +1509,48 @@ def command_infer(args: argparse.Namespace) -> None:
                 "codec_config": asdict(codec_config),
                 "checkpoint_dir": str(checkpoint_dir),
                 "num_inference_steps": args.num_inference_steps,
+                "latency_seconds": {
+                    "total": sample_total_seconds,
+                    "prepare_low_latents": stage_prepare_seconds,
+                    "reconstruct": stage_reconstruct_seconds,
+                    "postprocess_io_and_metrics": stage_postprocess_seconds,
+                },
+                "gpu_peak_memory": gpu_peak_memory,
+                "source_duration_seconds": source_duration_seconds,
+                "realtime_factor": realtime_factor,
             }
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
             with metrics_path.open("w", encoding="utf-8") as handle:
                 json.dump(metrics_payload, handle, indent=2)
 
+            per_video_latency_seconds.append(sample_total_seconds)
+            realtime_factor_text = "n/a" if realtime_factor is None else f"{realtime_factor:.3f}x"
+            gpu_peak_mem_text = "n/a"
+            if gpu_peak_memory is not None:
+                alloc_gib = gpu_peak_memory["max_memory_allocated_bytes"] / (1024 ** 3)
+                reserve_gib = gpu_peak_memory["max_memory_reserved_bytes"] / (1024 ** 3)
+                gpu_peak_mem_text = f"alloc={alloc_gib:.3f}GiB reserved={reserve_gib:.3f}GiB"
+
             print(
                 f"[infer][rank={distributed_context.rank}] saved low={low_latent_path} recover={recover_latent_path} "
                 f"low_bpp={sequence.low_codec_payload['low_bpp']:.6f} "
-                f"direct_low_l1={direct_low_metrics['l1']:.6f} restored_l1={restored_metrics['l1']:.6f}"
+                f"direct_low_l1={direct_low_metrics['l1']:.6f} restored_l1={restored_metrics['l1']:.6f} "
+                f"latency={sample_total_seconds:.3f}s (prepare={stage_prepare_seconds:.3f}s "
+                f"reconstruct={stage_reconstruct_seconds:.3f}s post={stage_postprocess_seconds:.3f}s) "
+                f"rtf={realtime_factor_text} gpu_peak={gpu_peak_mem_text}"
             )
 
             if device.type == "cuda":
                 # 逐样本清 cache，减轻长序列推理时的显存峰值压力。
                 torch.cuda.empty_cache()
+
+        if per_video_latency_seconds:
+            avg_latency_seconds = sum(per_video_latency_seconds) / len(per_video_latency_seconds)
+            print(
+                f"[infer][rank={distributed_context.rank}] latency summary: "
+                f"videos={len(per_video_latency_seconds)} avg={avg_latency_seconds:.3f}s "
+                f"min={min(per_video_latency_seconds):.3f}s max={max(per_video_latency_seconds):.3f}s"
+            )
         distributed_barrier(distributed_context)
     finally:
         cleanup_distributed_context(distributed_context)
@@ -1770,11 +1974,16 @@ def load_transformer_bundle(
         zero3_disabled = accelerator.state.deepspeed_plugin.zero3_init_context_manager(enable=False)
 
     with zero3_disabled:
-        tokenizer = AutoTokenizer.from_pretrained(base_model_path, subfolder="tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model_path,
+            subfolder="tokenizer",
+            local_files_only=True,
+        )
         text_encoder = UMT5EncoderModel.from_pretrained(
             base_model_path,
             subfolder="text_encoder",
             torch_dtype=weight_dtype,
+            local_files_only=True,
         ).to(device)
         with torch.inference_mode():
             prompt_embeds, _ = encode_prompt(
@@ -1792,9 +2001,14 @@ def load_transformer_bundle(
             base_model_path,
             subfolder="transformer",
             torch_dtype=weight_dtype,
+            local_files_only=True,
         )
     transformer.to(device)
-    scheduler = HeliosScheduler.from_pretrained(base_model_path, subfolder="scheduler")
+    scheduler = HeliosScheduler.from_pretrained(
+        base_model_path,
+        subfolder="scheduler",
+        local_files_only=True,
+    )
 
     if checkpoint_dir is None:
         # 训练模式：从 base transformer 初始化，后续参数参与优化。
@@ -2777,6 +2991,7 @@ def build_recover_config(
         "anchor_quant_dtype": codec_config.anchor_quant_dtype,
         "anchor_spatial_factor": codec_config.anchor_spatial_factor,
         "tail_codec_type": codec_config.tail_codec_type,
+        "num_inference_steps": args.num_inference_steps,
         "low_latent_format_version": (
             DEFAULT_LOW_LATENT_FORMAT_VERSION
             if codec_config.tail_codec_type == LEARNED_TAIL_CODEC_TYPE
@@ -2991,6 +3206,7 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["anchor_quant_dtype"] = codec_config["anchor_quant_dtype"]
     config["anchor_spatial_factor"] = int(codec_config["anchor_spatial_factor"])
     config["tail_codec_type"] = str(codec_config["tail_codec_type"])
+    config["num_inference_steps"] = int(config.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS))
     config["low_latent_format_version"] = config.get(
         "low_latent_format_version",
         DEFAULT_LOW_LATENT_FORMAT_VERSION if config["tail_codec_type"] == LEARNED_TAIL_CODEC_TYPE else LOW_LATENT_FORMAT_V2,

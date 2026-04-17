@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 from reconstruct.codec_gop import make_section_ranges
 
 
-ROOT_DIR = "reconstruct/outputs_CNN" # 只需要传一个 -R 参数
+ROOT_DIR = "reconstruct/gen2recon_runs_CNN_3/recover_outputs" # 只需要传一个 -R 参数
 DEFAULT_INPUT_SUBDIR = "recover_latents"
 DEFAULT_OUTPUT_SUBDIR = "Videos"
 DEFAULT_SOURCE_VIDEO_DIR = "reconstruct/videos"
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--base_model_path",
         type=str,
-        default="/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base",
+        default="/data/gemini/gemini-sharedata/platform/public/luojx/team/mengxh/MODELS/Helios-Base",
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--source_video_dir", type=Path, default=Path(DEFAULT_SOURCE_VIDEO_DIR))

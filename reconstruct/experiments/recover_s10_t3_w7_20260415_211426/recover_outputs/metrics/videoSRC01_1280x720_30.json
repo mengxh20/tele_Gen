@@ -1,0 +1,139 @@
+{
+  "input_path": "/data/heli/code/tele_Gen/reconstruct/latents/videoSRC01_1280x720_30.pt",
+  "low_latent_path": "/data/heli/code/tele_Gen/reconstruct/experiments/recover_s10_t3_w7_20260415_211426/recover_outputs/low_latents/videoSRC01_1280x720_30.pt",
+  "recover_latent_path": "/data/heli/code/tele_Gen/reconstruct/experiments/recover_s10_t3_w7_20260415_211426/recover_outputs/recover_latents/videoSRC01_1280x720_30.pt",
+  "raw_file_bytes": 9586781,
+  "raw_bpp": 0.5547905671296296,
+  "low_codec_bytes": 499772,
+  "low_bpp": 0.02892199074074074,
+  "direct_low_metrics": {
+    "mse": 0.059800565242767334,
+    "l1": 0.15112115442752838,
+    "psnr": 12.23294638360117
+  },
+  "restored_metrics": {
+    "mse": 0.012275498360395432,
+    "l1": 0.03702298179268837,
+    "psnr": 19.109605135803097
+  },
+  "low_tail_position_metrics": {
+    "position_0": {
+      "mse": 0.033021584153175354,
+      "l1": 0.12976759672164917,
+      "psnr": 14.81201964531264,
+      "count": 6
+    },
+    "position_1": {
+      "mse": 0.040802162140607834,
+      "l1": 0.14172962307929993,
+      "psnr": 13.893167162343985,
+      "count": 6
+    },
+    "position_2": {
+      "mse": 0.06135521084070206,
+      "l1": 0.1763453185558319,
+      "psnr": 12.121484763626171,
+      "count": 5
+    },
+    "position_3": {
+      "mse": 0.07544852048158646,
+      "l1": 0.19410476088523865,
+      "psnr": 11.223492146021513,
+      "count": 5
+    },
+    "position_4": {
+      "mse": 0.1468706578016281,
+      "l1": 0.26367732882499695,
+      "psnr": 8.330649304444126,
+      "count": 5
+    },
+    "position_5": {
+      "mse": 0.09415271133184433,
+      "l1": 0.21381428837776184,
+      "psnr": 10.261671228876414,
+      "count": 5
+    }
+  },
+  "recover_tail_position_metrics": {
+    "position_0": {
+      "mse": 0.0006863373564556241,
+      "l1": 0.020798098295927048,
+      "psnr": 31.634560347129757,
+      "count": 6
+    },
+    "position_1": {
+      "mse": 0.0008463446283712983,
+      "l1": 0.022975116968154907,
+      "psnr": 30.72447626471622,
+      "count": 6
+    },
+    "position_2": {
+      "mse": 0.0011440442176535726,
+      "l1": 0.025780443102121353,
+      "psnr": 29.415533934889588,
+      "count": 5
+    },
+    "position_3": {
+      "mse": 0.0012258015340194106,
+      "l1": 0.025984693318605423,
+      "psnr": 29.115762965608237,
+      "count": 5
+    },
+    "position_4": {
+      "mse": 0.07304731011390686,
+      "l1": 0.11614222079515457,
+      "psnr": 11.363957123934952,
+      "count": 5
+    },
+    "position_5": {
+      "mse": 0.01846116967499256,
+      "l1": 0.063205786049366,
+      "psnr": 17.33740550874004,
+      "count": 5
+    }
+  },
+  "tail_only_metrics": {
+    "mse": 0.014955866150557995,
+    "l1": 0.04431890696287155,
+    "psnr": 18.25188139890642
+  },
+  "anchor_reconstruction_metrics": {
+    "mse": 2.612466960272286e-05,
+    "l1": 0.004281884990632534,
+    "psnr": 45.8278298592863
+  },
+  "temporal_delta_l1": 0.045311253517866135,
+  "low_boundary_transition_l1": 0.21386521458625793,
+  "recover_boundary_transition_l1": 0.06353129260241985,
+  "section_boundary_delta_l1": 0.06353129260241985,
+  "boundary_transition_l1": 0.06353129260241985,
+  "max_temporal_backtrack_latents": 14,
+  "mean_temporal_backtrack_latents": 0.3589743673801422,
+  "codec_config": {
+    "temporal_factor": 3,
+    "spatial_factor": 10,
+    "quant_dtype": "int8",
+    "keyframe_dtype": "float16",
+    "section_span_latents": 7,
+    "anchor_span_latents": 1,
+    "tail_span_latents": 6,
+    "anchor_quant_dtype": "int8",
+    "anchor_spatial_factor": 1,
+    "tail_codec_type": "learned_cnn_v1",
+    "learned_codec_hidden_channels": null
+  },
+  "checkpoint_dir": "/data/heli/code/tele_Gen/reconstruct/experiments/recover_s10_t3_w7_20260415_211426",
+  "num_inference_steps": 24,
+  "latency_seconds": {
+    "total": 127.33341651200317,
+    "prepare_low_latents": 0.9124489000532776,
+    "reconstruct": 126.2812244349625,
+    "postprocess_io_and_metrics": 0.136265535838902
+  },
+  "gpu_peak_memory": {
+    "max_memory_allocated_bytes": 31807834112,
+    "max_memory_reserved_bytes": 32788971520
+  },
+  "source_duration_seconds": 5.0,
+  "realtime_factor": 25.466683302400632
+}

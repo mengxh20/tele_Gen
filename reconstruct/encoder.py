@@ -11,7 +11,7 @@ from PIL import Image
 from tqdm import tqdm
 
 
-DEFAULT_BASE_MODEL_PATH = "/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base"
+DEFAULT_BASE_MODEL_PATH = "/data/gemini/gemini-sharedata/platform/public/luojx/team/mengxh/MODELS/Helios-Base"
 DEFAULT_INPUT_DIR = "example/toy_data/videos"
 DEFAULT_OUTPUT_DIR = "reconstruct/latents"
 DEFAULT_HEIGHT = 384

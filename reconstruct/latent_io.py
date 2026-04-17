@@ -1,4 +1,5 @@
 import io
+import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -8,7 +9,10 @@ from diffusers.models import AutoencoderKLWan
 from diffusers.video_processor import VideoProcessor
 
 
-DEFAULT_BASE_MODEL_PATH = "/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base"
+DEFAULT_BASE_MODEL_PATH = os.environ.get(
+    "HELIOS_BASE_MODEL_PATH",
+    "/data/gemini/gemini-sharedata/platform/public/luojx/team/mengxh/MODELS/Helios-Base",
+).strip()
 LATENT_FORMAT_V1 = "helios_vae_latent_v1"
 LATENT_FORMAT_V2 = "helios_vae_latent_v2"
 LOW_LATENT_FORMAT_V1 = "helios_low_latent_v1"
