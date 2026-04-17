@@ -297,7 +297,7 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--base_model_path", type=str, default=DEFAULT_BASE_MODEL_PATH)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--max_steps", type=int, default=None)
@@ -552,7 +552,7 @@ def init_offline_wandb_run(
 
     os.environ.setdefault("WANDB_MODE", "offline")
     return wandb.init(
-        project="helios-recover",
+        project="tele-recover-gpu16",
         job_type="train",
         name=output_dir.name,
         mode="offline",
@@ -724,7 +724,7 @@ def command_train(args: argparse.Namespace) -> None:
     synchronize_module_parameters(learned_tail_codec)
 
     output_dir = args.output_dir.resolve()
-    checkpoint_save_interval_epochs = max(1, math.ceil(args.epochs / 10)) # 这里记录了多少个epoch保存一下权重
+    checkpoint_save_interval_epochs = max(1, math.ceil(args.epochs / 5)) # 这里记录了多少个epoch保存一下权重
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
         print(
