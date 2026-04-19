@@ -93,7 +93,9 @@ DEFAULT_AUX_LOSS_RAMP_STEPS = 1000
 DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT = 0.1
 DEFAULT_FIX_ANCHOR_DURING_DENOISE = True
 DEFAULT_LOW_LATENT_FORMAT_VERSION = LOW_LATENT_FORMAT_V3
-RECOVER_CONFIG_VERSION = "helios_recover_v4"
+RECOVER_CONFIG_VERSION = "helios_recover_v5"
+CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X = "full_window_1x"
+CURRENT_LOW_TARGET_INIT_PATCH_SHORT = "patch_short"
 LEARNED_CODEC_CHECKPOINT_NAME = "learned_codec.pt"
 LATEST_CHECKPOINT_LINK_NAME = "latest"
 LATEST_CHECKPOINT_POINTER_NAME = "latest_checkpoint.txt"
@@ -724,7 +726,7 @@ def command_train(args: argparse.Namespace) -> None:
     synchronize_module_parameters(learned_tail_codec)
 
     output_dir = args.output_dir.resolve()
-    checkpoint_save_interval_epochs = max(1, math.ceil(args.epochs / 10)) # 这里记录了多少个epoch保存一下权重
+    checkpoint_save_interval_epochs = max(1, math.ceil(args.epochs / 5)) # 这里记录了多少个epoch保存一下权重
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
         print(
@@ -1596,6 +1598,23 @@ def estimate_low_codec_bytes(codec_payload: Dict[str, object]) -> int:
     return int(total_bytes)
 
 
+def _extract_padded_latent_window(
+    full_latents: torch.Tensor,
+    section_start: int,
+    latent_window_size: int,
+    window_name: str,
+) -> Tuple[torch.Tensor, int]:
+    """截取一个 latent 窗口，并在末尾不足时重复最后一帧补齐。"""
+    window = full_latents[:, section_start : section_start + latent_window_size]
+    valid_frames = window.shape[1]
+    if valid_frames == 0:
+        raise ValueError(f"{window_name} at section_start={section_start} produced an empty window.")
+    if valid_frames < latent_window_size:
+        padding = window[:, -1:].repeat(1, latent_window_size - valid_frames, 1, 1)
+        window = torch.cat([window, padding], dim=1)
+    return window.contiguous(), valid_frames
+
+
 def extract_target_window(
     clean_full_latents: torch.Tensor,
     section_start: int,
@@ -1606,14 +1625,26 @@ def extract_target_window(
     如果最后一个窗口长度不足 `latent_window_size`，则用最后一帧重复补齐；
     同时返回 `valid_target_frames`，后续通过 mask 避免 padding 帧影响 loss。
     """
-    target = clean_full_latents[:, section_start : section_start + latent_window_size]
-    valid_target_frames = target.shape[1]
-    if valid_target_frames == 0:
-        raise ValueError(f"Section start {section_start} produced an empty target window.")
-    if valid_target_frames < latent_window_size:
-        padding = target[:, -1:].repeat(1, latent_window_size - valid_target_frames, 1, 1)
-        target = torch.cat([target, padding], dim=1)
-    return target.contiguous(), valid_target_frames
+    return _extract_padded_latent_window(
+        full_latents=clean_full_latents,
+        section_start=section_start,
+        latent_window_size=latent_window_size,
+        window_name="clean target window",
+    )
+
+
+def extract_current_low_target_window(
+    low_full_latents: torch.Tensor,
+    section_start: int,
+    latent_window_size: int,
+) -> Tuple[torch.Tensor, int]:
+    """从 low latents 中截取当前 section 的完整 low window（anchor+tail）。"""
+    return _extract_padded_latent_window(
+        full_latents=low_full_latents,
+        section_start=section_start,
+        latent_window_size=latent_window_size,
+        window_name="current low target window",
+    )
 
 
 def extract_history_window(
@@ -1708,6 +1739,7 @@ def build_training_batch_tensors(
 
     history_latents: List[torch.Tensor] = []
     target_latents: List[torch.Tensor] = []
+    current_low_target_latents: List[torch.Tensor] = []
     section_anchor_latents: List[torch.Tensor] = []
     x0_latents: List[torch.Tensor] = []
     valid_target_frames: List[int] = []
@@ -1719,6 +1751,16 @@ def build_training_batch_tensors(
             section_start=section_start,
             latent_window_size=latent_window_size,
         )
+        current_low_target_latent, low_valid_frames = extract_current_low_target_window(
+            low_full_latents=low_full_latents,
+            section_start=section_start,
+            latent_window_size=latent_window_size,
+        )
+        if low_valid_frames != valid_frames:
+            raise RuntimeError(
+                f"Current low target valid frames mismatch for seq_idx={seq_idx}, section_start={section_start}: "
+                f"clean={valid_frames}, low={low_valid_frames}"
+            )
         history_latent = extract_history_window(
             low_full_latents=low_full_latents,
             section_start=section_start,
@@ -1732,6 +1774,7 @@ def build_training_batch_tensors(
         )
         history_latents.append(history_latent)
         target_latents.append(target_latent)
+        current_low_target_latents.append(current_low_target_latent)
         section_anchor_latents.append(anchor_latent)
         x0_latents.append(clean_full_latents[:, :1])
         valid_target_frames.append(valid_frames)
@@ -1739,10 +1782,56 @@ def build_training_batch_tensors(
     return {
         "history_latents": torch.stack(history_latents, dim=0).contiguous(),
         "target_latents": torch.stack(target_latents, dim=0).contiguous(),
+        "current_low_target_latents": torch.stack(current_low_target_latents, dim=0).contiguous(),
         "section_anchor_latents": torch.stack(section_anchor_latents, dim=0).contiguous(),
         "x0_latents": torch.stack(x0_latents, dim=0).contiguous(),
         "valid_target_frames": torch.tensor(valid_target_frames, device=device, dtype=torch.long),
     }
+
+
+def initialize_current_low_target_branch_from_short(transformer: torch.nn.Module) -> None:
+    patch_current = getattr(transformer, "patch_current_low_target", None)
+    patch_short = getattr(transformer, "patch_short", None)
+    if patch_current is None:
+        raise RuntimeError(
+            "Recover transformer is missing patch_current_low_target. "
+            "Please ensure the current repo version is used for base model loading."
+        )
+    if patch_short is None:
+        raise RuntimeError(
+            "Recover transformer is missing patch_short, so patch_current_low_target cannot be initialized."
+        )
+    if patch_short.weight.is_meta:
+        raise RuntimeError(
+            "Recover transformer patch_short is still a meta tensor after base-model loading, "
+            "so patch_current_low_target cannot be initialized from it."
+        )
+    if patch_current.weight.is_meta:
+        patch_current.weight = torch.nn.Parameter(
+            torch.empty_like(
+                patch_short.weight,
+                device=patch_short.weight.device,
+                dtype=patch_short.weight.dtype,
+            ),
+            requires_grad=patch_short.weight.requires_grad,
+        )
+    if patch_current.bias is not None and patch_current.bias.is_meta:
+        if patch_short.bias is None:
+            raise RuntimeError(
+                "Recover transformer patch_current_low_target has a bias parameter, but patch_short.bias is missing."
+            )
+        patch_current.bias = torch.nn.Parameter(
+            torch.empty_like(
+                patch_short.bias,
+                device=patch_short.bias.device,
+                dtype=patch_short.bias.dtype,
+            ),
+            requires_grad=patch_short.bias.requires_grad,
+        )
+    with torch.no_grad():
+        patch_current.weight.copy_(patch_short.weight)
+        if patch_current.bias is not None and patch_short.bias is not None:
+            patch_current.bias.copy_(patch_short.bias)
 
 
 def load_transformer_bundle(
@@ -1792,7 +1881,9 @@ def load_transformer_bundle(
             base_model_path,
             subfolder="transformer",
             torch_dtype=weight_dtype,
+            use_current_low_target_branch=True,
         )
+        initialize_current_low_target_branch_from_short(transformer)
     transformer.to(device)
     scheduler = HeliosScheduler.from_pretrained(base_model_path, subfolder="scheduler")
 
@@ -1867,6 +1958,7 @@ def training_step(
     )
     history_latents = materialized_batch["history_latents"].to(dtype=weight_dtype)
     target_latents = materialized_batch["target_latents"].to(dtype=weight_dtype)
+    current_low_target_latents = materialized_batch["current_low_target_latents"].to(dtype=weight_dtype)
     section_anchor_latents = materialized_batch["section_anchor_latents"].to(dtype=weight_dtype)
     x0_latents = materialized_batch["x0_latents"].to(dtype=weight_dtype)
     valid_target_frames = materialized_batch["valid_target_frames"]
@@ -1925,6 +2017,7 @@ def training_step(
             latents_history_short=latents_history_short,
             latents_history_mid=latents_history_mid,
             latents_history_long=latents_history_long,
+            latents_current_low_target=current_low_target_latents,
             return_dict=False,
         )[0]
 
@@ -2273,6 +2366,7 @@ def reconstruct_sequence(
     这里按 section 分段恢复，每个 section 只依赖：
     - 首帧 `x0`
     - 低码率历史窗口
+    - 当前 section 的完整 low window（anchor+tail）
 
     这与训练时的数据组织保持一致，也更贴近真实压缩恢复链路中的分段重建过程。
     """
@@ -2309,6 +2403,16 @@ def reconstruct_sequence(
         valid_target_frames = min(latent_window_size, clean_full.shape[1] - section_start)
         anchor_steps = min(anchor_span_latents, valid_target_frames)
         section_anchor_latents = low_full[:, section_start : section_start + anchor_steps].unsqueeze(0)
+        current_low_target_latents, low_valid_frames = extract_current_low_target_window(
+            low_full_latents=low_full,
+            section_start=section_start,
+            latent_window_size=latent_window_size,
+        )
+        if low_valid_frames != valid_target_frames:
+            raise RuntimeError(
+                f"Current low target valid frames mismatch at section_start={section_start}: "
+                f"clean={valid_target_frames}, low={low_valid_frames}"
+            )
 
         (
             _,
@@ -2352,6 +2456,7 @@ def reconstruct_sequence(
             num_inference_steps=num_inference_steps,
             seed=seed + section_start,
             anchor_latents=section_anchor_latents.to(device=device, dtype=weight_dtype),
+            current_low_target_latents=current_low_target_latents.unsqueeze(0).to(device=device, dtype=weight_dtype),
             fix_anchor_during_denoise=fix_anchor_during_denoise,
         )
         valid_section = section_latents[0, :, :valid_target_frames].contiguous()
@@ -2382,9 +2487,14 @@ def run_stage1_denoise(
     num_inference_steps: int,
     seed: int,
     anchor_latents: torch.Tensor,
+    current_low_target_latents: torch.Tensor,
     fix_anchor_during_denoise: bool,
 ) -> torch.Tensor:
-    """执行单个 section 的扩散式去噪恢复。"""
+    """执行单个 section 的扩散式去噪恢复。
+
+    当前 section 的完整 low window 会作为额外条件分支输入 transformer，
+    但扩散主体仍保持“从噪声开始恢复 clean target”的流程，不直接把 low tail 当作目标或初始化结果。
+    """
     base_transformer = unwrap_model(transformer)
     generator = torch.Generator(device=device).manual_seed(seed)
     # 输入 hidden_states 是当前 section 的待恢复 latent，先随机初始化为高斯噪声；当前配置下 shape 近似是 [1, 16, 9, H, W]
@@ -2426,6 +2536,7 @@ def run_stage1_denoise(
             "latents_history_short": latents_history_short.to(weight_dtype),
             "latents_history_mid": latents_history_mid.to(weight_dtype),
             "latents_history_long": latents_history_long.to(weight_dtype),
+            "latents_current_low_target": current_low_target_latents.to(weight_dtype),
             "return_dict": False,
         }
         if supports_first_step_flag:
@@ -2784,6 +2895,9 @@ def build_recover_config(
         ),
         "learned_codec_checkpoint": LEARNED_CODEC_CHECKPOINT_NAME if learned_tail_codec is not None else None,
         "learned_codec_config": learned_codec_config,
+        "use_current_low_target_branch": True,
+        "current_low_target_mode": CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X,
+        "current_low_target_init": CURRENT_LOW_TARGET_INIT_PATCH_SHORT,
         "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
         "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
         "codec_config": asdict(codec_config),
@@ -2956,16 +3070,40 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     with config_path.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
 
-    required_keys = {"format_version", "history_sizes", "latent_window_size", "codec_config"}
+    required_keys = {
+        "format_version",
+        "history_sizes",
+        "latent_window_size",
+        "codec_config",
+        "use_current_low_target_branch",
+        "current_low_target_mode",
+        "current_low_target_init",
+    }
     missing_keys = sorted(required_keys - config.keys())
     if missing_keys:
         raise KeyError(f"Recover config {config_path} is missing keys: {missing_keys}")
 
     format_version = config["format_version"]
-    if format_version not in {"helios_recover_v2", "helios_recover_v3", RECOVER_CONFIG_VERSION}:
+    if format_version != RECOVER_CONFIG_VERSION:
         raise ValueError(
             f"Unsupported recover config format in {config_path}: {format_version}. "
-            f"Expected helios_recover_v2, helios_recover_v3, or {RECOVER_CONFIG_VERSION}."
+            f"This repo version only supports {RECOVER_CONFIG_VERSION}, because recover inference now requires "
+            "the current low target condition branch."
+        )
+    if not bool(config["use_current_low_target_branch"]):
+        raise ValueError(
+            f"Recover config {config_path} has use_current_low_target_branch={config['use_current_low_target_branch']}, "
+            "but the current repo requires this branch to be enabled."
+        )
+    if str(config["current_low_target_mode"]) != CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X:
+        raise ValueError(
+            f"Recover config {config_path} has unsupported current_low_target_mode={config['current_low_target_mode']}. "
+            f"Expected {CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X}."
+        )
+    if str(config["current_low_target_init"]) != CURRENT_LOW_TARGET_INIT_PATCH_SHORT:
+        raise ValueError(
+            f"Recover config {config_path} has unsupported current_low_target_init={config['current_low_target_init']}. "
+            f"Expected {CURRENT_LOW_TARGET_INIT_PATCH_SHORT}."
         )
 
     codec_config = dict(config["codec_config"])
@@ -2997,6 +3135,9 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     )
     config["learned_codec_checkpoint"] = config.get("learned_codec_checkpoint")
     config["learned_codec_config"] = learned_codec_config
+    config["use_current_low_target_branch"] = True
+    config["current_low_target_mode"] = CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X
+    config["current_low_target_init"] = CURRENT_LOW_TARGET_INIT_PATCH_SHORT
     config.setdefault("fix_anchor_during_denoise", DEFAULT_FIX_ANCHOR_DURING_DENOISE)
     train_loss_config = dict(config.get("train_loss_config", {}))
     train_loss_config.setdefault("temporal_delta_loss_weight", DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)

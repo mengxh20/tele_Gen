@@ -13,7 +13,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export MAX_SAMPLES="${MAX_SAMPLES:-2}" # 推理4个样本看看就够了
 
 
-SAVEDIR="reconstruct/gen2recon_runs_stage1"
+SAVEDIR="reconstruct/gen2recon_runs_condition"
 INFER_ARGS=(
     reconstruct/recover.py infer
     --checkpoint_dir "${SAVEDIR}/checkpoints"

@@ -542,6 +542,7 @@ class HeliosTransformer3DModel(
     _supports_gradient_checkpointing = True
     _skip_layerwise_casting_patterns = [
         "patch_embedding",
+        "patch_current_low_target",
         "patch_short",
         "patch_mid",
         "patch_long",
@@ -591,6 +592,7 @@ class HeliosTransformer3DModel(
         guidance_cross_attn: bool = True,
         zero_history_timestep: bool = True,
         has_multi_term_memory_patch: bool = True,
+        use_current_low_target_branch: bool = False,
         is_amplify_history: bool = False,
         history_scale_mode: str = "per_head",  # [scalar, per_head]
     ) -> None:
@@ -602,6 +604,10 @@ class HeliosTransformer3DModel(
         # 1. Patch & position embedding
         self.rope = HeliosRotaryPosEmbed(rope_dim=rope_dim, theta=rope_theta)
         self.patch_embedding = nn.Conv3d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)
+        if use_current_low_target_branch:
+            self.patch_current_low_target = nn.Conv3d(
+                in_channels, inner_dim, kernel_size=patch_size, stride=patch_size
+            )
 
         # 2. Initial Multi Term Memory Patch
         self.zero_history_timestep = zero_history_timestep
@@ -668,6 +674,7 @@ class HeliosTransformer3DModel(
         latents_history_short=None,
         latents_history_mid=None,
         latents_history_long=None,
+        latents_current_low_target: torch.Tensor | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
@@ -692,7 +699,35 @@ class HeliosTransformer3DModel(
         rotary_emb = rotary_emb.flatten(2).transpose(1, 2)
         original_context_length = hidden_states.shape[1]
 
-        # 3. Process short history latents
+        if self.config.use_current_low_target_branch:
+            if latents_current_low_target is None:
+                raise ValueError(
+                    "latents_current_low_target must be provided when use_current_low_target_branch=True."
+                )
+        elif latents_current_low_target is not None:
+            raise ValueError(
+                "latents_current_low_target was provided, but use_current_low_target_branch=False in the model config."
+            )
+
+        # 3. Process current low target latents at native scale.
+        if latents_current_low_target is not None:
+            latents_current_low_target = latents_current_low_target.to(hidden_states)
+            latents_current_low_target = self.patch_current_low_target(latents_current_low_target)
+            _, _, _, current_height, current_width = latents_current_low_target.shape
+            latents_current_low_target = latents_current_low_target.flatten(2).transpose(1, 2)
+
+            rotary_emb_current_low_target = self.rope(
+                frame_indices=indices_hidden_states,
+                height=current_height,
+                width=current_width,
+                device=latents_current_low_target.device,
+            )
+            rotary_emb_current_low_target = rotary_emb_current_low_target.flatten(2).transpose(1, 2)
+
+            hidden_states = torch.cat([latents_current_low_target, hidden_states], dim=1)
+            rotary_emb = torch.cat([rotary_emb_current_low_target, rotary_emb], dim=1)
+
+        # 4. Process short history latents
         if latents_history_short is not None and indices_latents_history_short is not None:
             latents_history_short = latents_history_short.to(hidden_states)
             latents_history_short = self.patch_short(latents_history_short)
@@ -710,7 +745,7 @@ class HeliosTransformer3DModel(
             hidden_states = torch.cat([latents_history_short, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_short, rotary_emb], dim=1)
 
-        # 4. Process mid history latents
+        # 5. Process mid history latents
         if latents_history_mid is not None and indices_latents_history_mid is not None:
             latents_history_mid = latents_history_mid.to(hidden_states)
             latents_history_mid = pad_for_3d_conv(latents_history_mid, (2, 4, 4))
@@ -730,7 +765,7 @@ class HeliosTransformer3DModel(
             hidden_states = torch.cat([latents_history_mid, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_mid, rotary_emb], dim=1)
 
-        # 5. Process long history latents
+        # 6. Process long history latents
         if latents_history_long is not None and indices_latents_history_long is not None:
             latents_history_long = latents_history_long.to(hidden_states)
             latents_history_long = pad_for_3d_conv(latents_history_long, (4, 8, 8))
@@ -750,18 +785,18 @@ class HeliosTransformer3DModel(
             hidden_states = torch.cat([latents_history_long, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_long, rotary_emb], dim=1)
 
-        history_context_length = hidden_states.shape[1] - original_context_length
+        conditioning_context_length = hidden_states.shape[1] - original_context_length
 
         if indices_hidden_states is not None and self.zero_history_timestep:
             timestep_t0 = torch.zeros((1), dtype=timestep.dtype, device=timestep.device)
             temb_t0, timestep_proj_t0, _ = self.condition_embedder(
                 timestep_t0, encoder_hidden_states, is_return_encoder_hidden_states=False
             )
-            temb_t0 = temb_t0.unsqueeze(1).expand(batch_size, history_context_length, -1)
+            temb_t0 = temb_t0.unsqueeze(1).expand(batch_size, conditioning_context_length, -1)
             timestep_proj_t0 = (
                 timestep_proj_t0.unflatten(-1, (6, -1))
                 .view(1, 6, 1, -1)
-                .expand(batch_size, -1, history_context_length, -1)
+                .expand(batch_size, -1, conditioning_context_length, -1)
             )
 
         temb, timestep_proj, encoder_hidden_states = self.condition_embedder(timestep, encoder_hidden_states)
