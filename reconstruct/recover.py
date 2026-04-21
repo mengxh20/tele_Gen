@@ -64,7 +64,7 @@ from reconstruct.latent_io import (
 )
 
 
-DEFAULT_INPUT_PATH = Path("reconstruct/latents")
+DEFAULT_INPUT_PATH = Path("train_dataset/tele_Gen")
 DEFAULT_TEMPORAL_FACTOR = 2
 DEFAULT_SPATIAL_FACTOR = 4
 DEFAULT_QUANT_DTYPE = "int8"
