@@ -9,6 +9,14 @@ from reconstruct.learned_codec import LEARNED_TAIL_CODEC_TYPE
 
 EPS = 1e-8
 TRILINEAR_TAIL_CODEC_TYPE = "trilinear"
+PREDICT_ONLY_SECTION_MODE = "predict_only"
+SINGLE_REFRESH_SECTION_MODE = "single_refresh"
+DUAL_REFRESH_SECTION_MODE = "dual_refresh"
+DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS = 2
+DEFAULT_SINGLE_REFRESH_GAIN_THRESHOLD = 0.12
+DEFAULT_DUAL_REFRESH_GAIN_THRESHOLD = 0.18
+DEFAULT_BOUNDARY_JUMP_THRESHOLD = 0.18
+DEFAULT_CUT_DETECTION_THRESHOLD = 0.35
 
 
 def _get_config_value(codec_config, key: str):
@@ -17,12 +25,22 @@ def _get_config_value(codec_config, key: str):
     return getattr(codec_config, key)
 
 
+def _get_optional_config_value(codec_config, key: str, default):
+    if isinstance(codec_config, dict):
+        return codec_config.get(key, default)
+    return getattr(codec_config, key, default)
+
+
 def _as_int(codec_config, key: str) -> int:
     return int(_get_config_value(codec_config, key))
 
 
 def _as_str(codec_config, key: str) -> str:
     return str(_get_config_value(codec_config, key))
+
+
+def _as_float(codec_config, key: str, default: float) -> float:
+    return float(_get_optional_config_value(codec_config, key, default))
 
 
 def _tail_codec_type(codec_config) -> str:
@@ -182,6 +200,238 @@ def decode_refresh_anchor(anchor_payload: Dict[str, object]) -> torch.Tensor:
     return restored_anchor.float().contiguous()
 
 
+def _section_anchor_span(section_length: int, codec_config) -> int:
+    return min(_as_int(codec_config, "anchor_span_latents"), section_length)
+
+
+def _build_section_error_weights(section_length: int, device: torch.device) -> torch.Tensor:
+    if section_length <= 0:
+        raise ValueError(f"section_length must be > 0, got {section_length}.")
+    if section_length == 1:
+        return torch.ones(1, 1, 1, 1, device=device, dtype=torch.float32)
+    weights = torch.linspace(1.0, 2.0, steps=section_length, device=device, dtype=torch.float32)
+    weights[0] += 1.0
+    weights[-1] += 1.0
+    return weights.view(1, section_length, 1, 1)
+
+
+def _predict_section_from_history(
+    history_latents: torch.Tensor,
+    section_shape: Tuple[int, int, int, int],
+) -> torch.Tensor:
+    channel_count, section_length, height, width = section_shape
+    if section_length <= 0:
+        raise ValueError(f"section_length must be > 0, got {section_length}.")
+
+    if history_latents.ndim != 4:
+        raise ValueError(
+            f"Expected history_latents with shape [C, T, H, W], got {tuple(history_latents.shape)}."
+        )
+    if history_latents.shape[0] != channel_count:
+        raise ValueError(
+            f"History channel count {history_latents.shape[0]} does not match section channel count {channel_count}."
+        )
+
+    device = history_latents.device
+    if history_latents.shape[1] == 0:
+        return torch.zeros(section_shape, device=device, dtype=torch.float32)
+
+    last_frame = history_latents[:, -1:].float()
+    if history_latents.shape[1] >= 2:
+        delta = (history_latents[:, -1:] - history_latents[:, -2:-1]).float()
+    else:
+        delta = torch.zeros_like(last_frame, dtype=torch.float32)
+
+    steps = torch.arange(1, section_length + 1, device=device, dtype=torch.float32).view(1, section_length, 1, 1)
+    predicted = last_frame.expand(-1, section_length, -1, -1) + steps * delta.expand(-1, section_length, -1, -1)
+    if predicted.shape[2] != height or predicted.shape[3] != width:
+        predicted = trilinear_resize(predicted.unsqueeze(0), (section_length, height, width)).squeeze(0)
+    return predicted.float().contiguous()
+
+
+def _overlay_anchor_blocks(
+    section_prediction: torch.Tensor,
+    anchor_blocks: Sequence[Tuple[int, torch.Tensor]],
+) -> torch.Tensor:
+    updated = section_prediction.clone()
+    for block_start, block_latents in anchor_blocks:
+        if block_latents.ndim != 4:
+            raise ValueError(
+                f"Expected anchor block with shape [C, T, H, W], got {tuple(block_latents.shape)}."
+            )
+        block_length = int(block_latents.shape[1])
+        if block_length <= 0:
+            continue
+        updated[:, block_start : block_start + block_length] = block_latents.to(
+            device=updated.device,
+            dtype=updated.dtype,
+        )
+    return updated.contiguous()
+
+
+def _interpolate_between_anchor_blocks(
+    section_prediction: torch.Tensor,
+    anchor_blocks: Sequence[Tuple[int, torch.Tensor]],
+) -> torch.Tensor:
+    if len(anchor_blocks) < 2:
+        return section_prediction
+
+    updated = section_prediction.clone()
+    sorted_blocks = sorted(anchor_blocks, key=lambda item: int(item[0]))
+    for (left_start, left_block), (right_start, right_block) in zip(sorted_blocks[:-1], sorted_blocks[1:]):
+        left_end = int(left_start) + int(left_block.shape[1]) - 1
+        right_begin = int(right_start)
+        gap = right_begin - left_end - 1
+        if gap <= 0:
+            continue
+        left_frame = left_block[:, -1:].to(device=updated.device, dtype=updated.dtype)
+        right_frame = right_block[:, :1].to(device=updated.device, dtype=updated.dtype)
+        for offset in range(1, gap + 1):
+            alpha = float(offset) / float(gap + 1)
+            interpolated = (1.0 - alpha) * left_frame + alpha * right_frame
+            updated[:, left_end + offset : left_end + offset + 1] = interpolated
+    return updated.contiguous()
+
+
+def _build_proxy_section_from_history(
+    history_latents: torch.Tensor,
+    section_shape: Tuple[int, int, int, int],
+    anchor_blocks: Sequence[Tuple[int, torch.Tensor]],
+) -> torch.Tensor:
+    prediction = _predict_section_from_history(history_latents, section_shape)
+    prediction = _overlay_anchor_blocks(prediction, anchor_blocks)
+    prediction = _interpolate_between_anchor_blocks(prediction, anchor_blocks)
+    prediction = _overlay_anchor_blocks(prediction, anchor_blocks)
+    return prediction.contiguous()
+
+
+def _compute_proxy_error(prediction: torch.Tensor, target: torch.Tensor) -> float:
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Prediction shape {tuple(prediction.shape)} does not match target shape {tuple(target.shape)}."
+        )
+    weights = _build_section_error_weights(prediction.shape[1], prediction.device)
+    sq_error = (prediction.float() - target.float()).pow(2)
+    return float((sq_error * weights).mean().item())
+
+
+def _compute_boundary_jump_l1(history_latents: torch.Tensor, section_latents: torch.Tensor) -> float:
+    if history_latents.shape[1] == 0 or section_latents.shape[1] == 0:
+        return 0.0
+    return float((section_latents[:, :1].float() - history_latents[:, -1:].float()).abs().mean().item())
+
+
+def _estimate_refresh_anchor_bytes(anchor_payload: Dict[str, object]) -> int:
+    total_bytes = 0
+    for tensor_key in ("quantized", "scales"):
+        value = anchor_payload.get(tensor_key)
+        if isinstance(value, torch.Tensor):
+            total_bytes += value.numel() * value.element_size()
+    for shape_key in ("reduced_shape", "original_shape"):
+        total_bytes += len(anchor_payload.get(shape_key, [])) * 4
+    return int(total_bytes)
+
+
+def _select_section_mode(
+    section_latents: torch.Tensor,
+    history_latents: torch.Tensor,
+    codec_config,
+    sections_since_refresh: int,
+) -> Dict[str, object]:
+    section_length = int(section_latents.shape[1])
+    anchor_span = _section_anchor_span(section_length, codec_config)
+    head_block = (0, section_latents[:, :anchor_span].contiguous())
+    tail_start = max(0, section_length - anchor_span)
+    tail_block = (tail_start, section_latents[:, tail_start:].contiguous())
+    dual_blocks = [head_block]
+    if tail_start >= anchor_span and tail_start < section_length:
+        dual_blocks.append(tail_block)
+
+    none_prediction = _build_proxy_section_from_history(
+        history_latents,
+        tuple(int(value) for value in section_latents.shape),
+        [],
+    )
+    single_prediction = _build_proxy_section_from_history(
+        history_latents,
+        tuple(int(value) for value in section_latents.shape),
+        [head_block],
+    )
+    dual_prediction = _build_proxy_section_from_history(
+        history_latents,
+        tuple(int(value) for value in section_latents.shape),
+        dual_blocks,
+    )
+
+    error_none = _compute_proxy_error(none_prediction, section_latents)
+    error_single = _compute_proxy_error(single_prediction, section_latents)
+    error_dual = _compute_proxy_error(dual_prediction, section_latents)
+    gain_single = max(0.0, error_none - error_single)
+    gain_dual = max(0.0, error_single - error_dual)
+    gain_ratio_single = gain_single / max(error_none, EPS)
+    gain_ratio_dual = gain_dual / max(error_single, EPS)
+    boundary_jump_l1 = _compute_boundary_jump_l1(history_latents, section_latents)
+
+    max_gap = max(
+        0,
+        int(
+            _get_optional_config_value(
+                codec_config,
+                "max_predict_only_gap_sections",
+                DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS,
+            )
+        ),
+    )
+    single_gain_threshold = _as_float(
+        codec_config,
+        "single_refresh_gain_threshold",
+        DEFAULT_SINGLE_REFRESH_GAIN_THRESHOLD,
+    )
+    dual_gain_threshold = _as_float(
+        codec_config,
+        "dual_refresh_gain_threshold",
+        DEFAULT_DUAL_REFRESH_GAIN_THRESHOLD,
+    )
+    boundary_jump_threshold = _as_float(
+        codec_config,
+        "boundary_jump_threshold",
+        DEFAULT_BOUNDARY_JUMP_THRESHOLD,
+    )
+    cut_detection_threshold = _as_float(
+        codec_config,
+        "cut_detection_threshold",
+        DEFAULT_CUT_DETECTION_THRESHOLD,
+    )
+
+    force_single = sections_since_refresh >= max_gap or boundary_jump_l1 >= boundary_jump_threshold
+    prefer_dual = boundary_jump_l1 >= cut_detection_threshold and len(dual_blocks) > 1
+
+    if not force_single and gain_ratio_single < single_gain_threshold:
+        mode = PREDICT_ONLY_SECTION_MODE
+        chosen_blocks: List[Tuple[int, torch.Tensor]] = []
+    elif prefer_dual or (len(dual_blocks) > 1 and gain_ratio_dual >= dual_gain_threshold):
+        mode = DUAL_REFRESH_SECTION_MODE
+        chosen_blocks = dual_blocks
+    else:
+        mode = SINGLE_REFRESH_SECTION_MODE
+        chosen_blocks = [head_block]
+
+    return {
+        "mode": mode,
+        "anchor_blocks": chosen_blocks,
+        "heuristic_scores": {
+            "error_none": float(error_none),
+            "error_single": float(error_single),
+            "error_dual": float(error_dual),
+            "gain_single": float(gain_single),
+            "gain_dual": float(gain_dual),
+            "gain_ratio_single": float(gain_ratio_single),
+            "gain_ratio_dual": float(gain_ratio_dual),
+            "boundary_jump_l1": float(boundary_jump_l1),
+        },
+    }
+
+
 def encode_section_tail_residual(
     section_tail_latents: torch.Tensor,
     decoded_anchor_latents: torch.Tensor,
@@ -284,6 +534,24 @@ def estimate_anchor_plus_tail_codec_bytes(codec_payload: Dict[str, object]) -> i
         if isinstance(value, torch.Tensor):
             total_bytes += value.numel() * value.element_size()
 
+    if codec_payload.get("section_payloads"):
+        metadata_values: List[int] = [len(codec_payload.get("chunk_lengths", []))]
+        metadata_values.extend(int(value) for value in codec_payload.get("chunk_lengths", []))
+        for start, end in codec_payload.get("section_ranges", []):
+            metadata_values.extend([int(start), int(end)])
+        total_bytes += len(metadata_values) * 4
+
+        for section_payload in codec_payload.get("section_payloads", []):
+            total_bytes += 4  # mode id
+            heuristic_scores = section_payload.get("heuristic_scores", {})
+            total_bytes += len(heuristic_scores) * 4
+            for anchor_block in section_payload.get("anchor_blocks", []):
+                total_bytes += 8  # start + length
+                anchor_payload = anchor_block.get("payload")
+                if isinstance(anchor_payload, dict):
+                    total_bytes += _estimate_refresh_anchor_bytes(anchor_payload)
+        return int(total_bytes)
+
     for payload_key in ("section_anchor_payloads", "section_tail_payloads"):
         for payload in codec_payload.get(payload_key, []):
             for tensor_key in ("quantized", "scales"):
@@ -336,34 +604,55 @@ def encode_anchor_plus_tail_latents(
         start_index=1,
     )
 
-    section_anchor_payloads: List[Dict[str, object]] = []
-    section_tail_payloads: List[Dict[str, object]] = []
+    decoded_history = global_keyframe.float()
+    sections_since_refresh = 0
+    section_payloads: List[Dict[str, object]] = []
     for section_start, section_end in section_ranges:
         section_latents = clean_full_latents[:, section_start:section_end]
-        anchor_span = min(_as_int(codec_config, "anchor_span_latents"), section_latents.shape[1])
-        section_anchor = section_latents[:, :anchor_span].contiguous()
-        section_tail = section_latents[:, anchor_span:].contiguous()
-
-        anchor_payload = encode_refresh_anchor(section_anchor, codec_config, move_to_cpu=move_to_cpu)
-        decoded_anchor = decode_refresh_anchor(anchor_payload)
-        tail_payload = encode_section_tail_residual(
-            section_tail,
-            decoded_anchor,
-            codec_config,
-            learned_tail_codec=learned_tail_codec,
-            use_ste_quant=use_ste_quant,
-            move_to_cpu=move_to_cpu,
+        selection = _select_section_mode(
+            section_latents=section_latents,
+            history_latents=decoded_history,
+            codec_config=codec_config,
+            sections_since_refresh=sections_since_refresh,
         )
-        section_anchor_payloads.append(anchor_payload)
-        section_tail_payloads.append(tail_payload)
+
+        encoded_anchor_blocks: List[Dict[str, object]] = []
+        decoded_anchor_blocks: List[Tuple[int, torch.Tensor]] = []
+        for block_start, anchor_latents in selection["anchor_blocks"]:
+            anchor_payload = encode_refresh_anchor(anchor_latents, codec_config, move_to_cpu=move_to_cpu)
+            decoded_anchor = decode_refresh_anchor(anchor_payload)
+            encoded_anchor_blocks.append(
+                {
+                    "start": int(block_start),
+                    "length": int(anchor_latents.shape[1]),
+                    "payload": anchor_payload,
+                    "bytes": _estimate_refresh_anchor_bytes(anchor_payload),
+                }
+            )
+            decoded_anchor_blocks.append((int(block_start), decoded_anchor))
+
+        decoded_section = _build_proxy_section_from_history(
+            history_latents=decoded_history,
+            section_shape=tuple(int(value) for value in section_latents.shape),
+            anchor_blocks=decoded_anchor_blocks,
+        )
+        decoded_history = torch.cat([decoded_history, decoded_section.float()], dim=1).contiguous()
+        sections_since_refresh = 0 if encoded_anchor_blocks else sections_since_refresh + 1
+
+        section_payloads.append(
+            {
+                "mode": str(selection["mode"]),
+                "anchor_blocks": encoded_anchor_blocks,
+                "heuristic_scores": dict(selection["heuristic_scores"]),
+            }
+        )
 
     return {
         "chunk_lengths": [int(length) for length in chunk_lengths],
         "codec_config": dict(codec_config) if isinstance(codec_config, dict) else None,
         "global_keyframe": _maybe_to_cpu(global_keyframe, move_to_cpu),
         "section_ranges": [(int(start), int(end)) for start, end in section_ranges],
-        "section_anchor_payloads": section_anchor_payloads,
-        "section_tail_payloads": section_tail_payloads,
+        "section_payloads": section_payloads,
     }
 
 
@@ -372,12 +661,32 @@ def decode_anchor_plus_tail_latents(codec_payload: Dict[str, object], learned_ta
     target_device = _module_device(learned_tail_codec) or global_keyframe.device
     global_keyframe = global_keyframe.to(device=target_device, dtype=torch.float32)
     section_ranges = [tuple(int(value) for value in section_range) for section_range in codec_payload["section_ranges"]]
-    section_anchor_payloads = codec_payload["section_anchor_payloads"]
-    section_tail_payloads = codec_payload["section_tail_payloads"]
 
     if not section_ranges:
         return global_keyframe.float().contiguous()
 
+    if codec_payload.get("section_payloads"):
+        decoded_history = global_keyframe.float().contiguous()
+        channel_count = int(global_keyframe.shape[0])
+        height = int(global_keyframe.shape[2])
+        width = int(global_keyframe.shape[3])
+        for (section_start, section_end), section_payload in zip(section_ranges, codec_payload["section_payloads"]):
+            section_length = int(section_end) - int(section_start)
+            decoded_anchor_blocks: List[Tuple[int, torch.Tensor]] = []
+            for anchor_block in section_payload.get("anchor_blocks", []):
+                anchor_payload = anchor_block["payload"]
+                decoded_anchor = decode_refresh_anchor(anchor_payload).to(device=target_device, dtype=torch.float32)
+                decoded_anchor_blocks.append((int(anchor_block["start"]), decoded_anchor))
+            decoded_section = _build_proxy_section_from_history(
+                history_latents=decoded_history,
+                section_shape=(channel_count, section_length, height, width),
+                anchor_blocks=decoded_anchor_blocks,
+            ).to(device=target_device, dtype=torch.float32)
+            decoded_history = torch.cat([decoded_history, decoded_section], dim=1).contiguous()
+        return decoded_history.float().contiguous()
+
+    section_anchor_payloads = codec_payload["section_anchor_payloads"]
+    section_tail_payloads = codec_payload["section_tail_payloads"]
     sections: List[torch.Tensor] = []
     for (section_start, section_end), anchor_payload, tail_payload in zip(
         section_ranges, section_anchor_payloads, section_tail_payloads
@@ -416,6 +725,8 @@ def decode_legacy_low_latents(codec_payload: Dict[str, object]) -> torch.Tensor:
 
 
 def decode_low_latents_payload(codec_payload: Dict[str, object], learned_tail_codec=None) -> torch.Tensor:
+    if codec_payload.get("section_payloads"):
+        return decode_anchor_plus_tail_latents(codec_payload, learned_tail_codec=learned_tail_codec)
     if "section_anchor_payloads" in codec_payload and "section_tail_payloads" in codec_payload:
         return decode_anchor_plus_tail_latents(codec_payload, learned_tail_codec=learned_tail_codec)
     if "quantized_remainder" in codec_payload and "keyframe" in codec_payload:

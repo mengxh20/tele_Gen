@@ -39,6 +39,11 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, UMT5EncoderModel
 
 from reconstruct.codec_gop import (
+    DEFAULT_BOUNDARY_JUMP_THRESHOLD,
+    DEFAULT_CUT_DETECTION_THRESHOLD,
+    DEFAULT_DUAL_REFRESH_GAIN_THRESHOLD,
+    DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS,
+    DEFAULT_SINGLE_REFRESH_GAIN_THRESHOLD,
     TRILINEAR_TAIL_CODEC_TYPE,
     decode_low_latents_payload,
     encode_anchor_plus_tail_latents,
@@ -52,6 +57,7 @@ from reconstruct.latent_io import (
     LATENT_FORMAT_V2,
     LOW_LATENT_FORMAT_V2,
     LOW_LATENT_FORMAT_V3,
+    LOW_LATENT_FORMAT_V4,
     build_chunk_frame_ranges,
     compute_bpp_from_total_pixels,
     flatten_latent_chunks,
@@ -76,7 +82,12 @@ DEFAULT_ANCHOR_SPAN_LATENTS = 1
 DEFAULT_TAIL_SPAN_LATENTS = DEFAULT_SECTION_SPAN_LATENTS - DEFAULT_ANCHOR_SPAN_LATENTS
 DEFAULT_ANCHOR_QUANT_DTYPE = "int8"
 DEFAULT_ANCHOR_SPATIAL_FACTOR = 1
-DEFAULT_TAIL_CODEC_TYPE = LEARNED_TAIL_CODEC_TYPE
+DEFAULT_TAIL_CODEC_TYPE = TRILINEAR_TAIL_CODEC_TYPE
+DEFAULT_MAX_PREDICT_ONLY_GAP = DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS
+DEFAULT_SINGLE_REFRESH_GAIN = DEFAULT_SINGLE_REFRESH_GAIN_THRESHOLD
+DEFAULT_DUAL_REFRESH_GAIN = DEFAULT_DUAL_REFRESH_GAIN_THRESHOLD
+DEFAULT_BOUNDARY_JUMP = DEFAULT_BOUNDARY_JUMP_THRESHOLD
+DEFAULT_CUT_DETECTION = DEFAULT_CUT_DETECTION_THRESHOLD
 DEFAULT_NUM_INFERENCE_STEPS = 30
 DEFAULT_WEIGHT_DTYPE = "bf16"
 DEFAULT_LEARNING_RATE = 1e-5
@@ -92,7 +103,7 @@ DEFAULT_AUX_LOSS_WARMUP_STEPS = 500
 DEFAULT_AUX_LOSS_RAMP_STEPS = 1000
 DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT = 0.1
 DEFAULT_FIX_ANCHOR_DURING_DENOISE = True
-DEFAULT_LOW_LATENT_FORMAT_VERSION = LOW_LATENT_FORMAT_V3
+DEFAULT_LOW_LATENT_FORMAT_VERSION = LOW_LATENT_FORMAT_V4
 RECOVER_CONFIG_VERSION = "helios_recover_v4"
 LEARNED_CODEC_CHECKPOINT_NAME = "learned_codec.pt"
 LATEST_CHECKPOINT_LINK_NAME = "latest"
@@ -105,10 +116,14 @@ REQUIRED_BASE_MODEL_SUBDIRS = ("tokenizer", "text_encoder", "transformer", "sche
 class CodecConfig:
     """低码率 latent 编码配置。
 
-    Recover V2 的 codec 不再把首帧后的 remainder 视为单一流，而是拆成：
+    当前版本的 codec 以“稀疏 refresh”为核心：
     - `global_keyframe(x0)`：全局唯一高精度锚点
-    - `local refresh anchor`：每个 section 的局部刷新锚点
-    - `P-tail residual`：相对 local anchor 的尾部残差表示
+    - `predict-only`：当前 section 不发送额外信息，纯靠先验和历史外推
+    - `single-refresh`：当前 section 只发送一个头部 refresh anchor
+    - `dual-refresh`：当前 section 发送头尾两个 refresh anchor
+
+    section 的模式由启发式分数决定，低码率 `low_full_latents` 则按 section 顺序代理解码，
+    供 recover 阶段作为历史条件和硬约束使用。
     """
 
     temporal_factor: int = DEFAULT_TEMPORAL_FACTOR
@@ -122,6 +137,11 @@ class CodecConfig:
     anchor_spatial_factor: int = DEFAULT_ANCHOR_SPATIAL_FACTOR
     tail_codec_type: str = DEFAULT_TAIL_CODEC_TYPE
     learned_codec_hidden_channels: Optional[int] = None
+    max_predict_only_gap_sections: int = DEFAULT_MAX_PREDICT_ONLY_GAP
+    single_refresh_gain_threshold: float = DEFAULT_SINGLE_REFRESH_GAIN
+    dual_refresh_gain_threshold: float = DEFAULT_DUAL_REFRESH_GAIN
+    boundary_jump_threshold: float = DEFAULT_BOUNDARY_JUMP
+    cut_detection_threshold: float = DEFAULT_CUT_DETECTION
 
 
 @dataclass
@@ -325,6 +345,11 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tail_span_latents", type=int, default=None)
     parser.add_argument("--anchor_quant_dtype", type=str, default=DEFAULT_ANCHOR_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--anchor_spatial_factor", type=int, default=DEFAULT_ANCHOR_SPATIAL_FACTOR)
+    parser.add_argument("--max_predict_only_gap_sections", type=int, default=DEFAULT_MAX_PREDICT_ONLY_GAP)
+    parser.add_argument("--single_refresh_gain_threshold", type=float, default=DEFAULT_SINGLE_REFRESH_GAIN)
+    parser.add_argument("--dual_refresh_gain_threshold", type=float, default=DEFAULT_DUAL_REFRESH_GAIN)
+    parser.add_argument("--boundary_jump_threshold", type=float, default=DEFAULT_BOUNDARY_JUMP)
+    parser.add_argument("--cut_detection_threshold", type=float, default=DEFAULT_CUT_DETECTION)
     parser.add_argument(
         "--tail_codec_type",
         type=str,
@@ -1578,6 +1603,11 @@ def build_codec_config(args: argparse.Namespace) -> CodecConfig:
         anchor_quant_dtype=args.anchor_quant_dtype,
         anchor_spatial_factor=args.anchor_spatial_factor,
         tail_codec_type=args.tail_codec_type,
+        max_predict_only_gap_sections=args.max_predict_only_gap_sections,
+        single_refresh_gain_threshold=args.single_refresh_gain_threshold,
+        dual_refresh_gain_threshold=args.dual_refresh_gain_threshold,
+        boundary_jump_threshold=args.boundary_jump_threshold,
+        cut_detection_threshold=args.cut_detection_threshold,
     )
     validate_codec_config(asdict(codec_config))
     return codec_config
@@ -1745,7 +1775,7 @@ def encode_low_latents(
     use_ste_quant: bool = False,
     move_to_cpu: bool = True,
 ) -> Dict[str, object]:
-    """把 clean latents 编码成 `x0 + local anchor + P-tail residual` 低码率载荷。"""
+    """把 clean latents 编码成 `x0 + sparse refresh events` 低码率载荷。"""
     codec_payload = encode_anchor_plus_tail_latents(
         clean_full_latents=clean_full_latents,
         codec_config=asdict(codec_config),
@@ -1755,11 +1785,7 @@ def encode_low_latents(
         move_to_cpu=move_to_cpu,
     )
     codec_payload["codec_config"] = asdict(codec_config)
-    codec_payload["format_version"] = (
-        DEFAULT_LOW_LATENT_FORMAT_VERSION
-        if codec_config.tail_codec_type == LEARNED_TAIL_CODEC_TYPE
-        else LOW_LATENT_FORMAT_V2
-    )
+    codec_payload["format_version"] = DEFAULT_LOW_LATENT_FORMAT_VERSION
     return codec_payload
 
 
@@ -1782,6 +1808,8 @@ def estimate_low_codec_bytes(codec_payload: Dict[str, object]) -> int:
     这里统计的是 tensor 数据本身加最小必要 shape 元数据，
     用来近似衡量这条低码率链路的传输成本。
     """
+    if "section_payloads" in codec_payload:
+        return estimate_anchor_plus_tail_codec_bytes(codec_payload)
     if "section_anchor_payloads" in codec_payload and "section_tail_payloads" in codec_payload:
         return estimate_anchor_plus_tail_codec_bytes(codec_payload)
 
@@ -1821,20 +1849,20 @@ def extract_target_window(
 
 
 def extract_history_window(
-    low_full_latents: torch.Tensor,
+    source_full_latents: torch.Tensor,
     section_start: int,
     history_window_size: int,
 ) -> torch.Tensor:
-    """从 low latents 中截取历史窗口。
+    """从当前可用的 full latents 中截取历史窗口。
 
     注意这里故意只取 `low_full_latents[:, 1:]`：
     - 首帧已单独作为 `x0_latents` 输入
     - 历史窗口只负责提供后续低码率上下文
     """
-    low_remainder = low_full_latents[:, 1:]
+    source_remainder = source_full_latents[:, 1:]
     remainder_start = max(0, (section_start - 1) - history_window_size)
     remainder_end = max(0, section_start - 1)
-    history = low_remainder[:, remainder_start:remainder_end]
+    history = source_remainder[:, remainder_start:remainder_end]
     if history.shape[1] < history_window_size:
         # 序列开头历史不足时左侧补零，保持输入 shape 稳定。
         zeros = torch.zeros(
@@ -1849,27 +1877,102 @@ def extract_history_window(
     return history.contiguous()
 
 
-def extract_section_anchor_window(
+def build_section_payload_lookup(codec_payload: Dict[str, object]) -> Dict[int, Dict[str, object]]:
+    if "section_payloads" not in codec_payload or not codec_payload.get("section_payloads"):
+        return {}
+    lookup: Dict[int, Dict[str, object]] = {}
+    for (section_start, _section_end), section_payload in zip(
+        codec_payload.get("section_ranges", []),
+        codec_payload.get("section_payloads", []),
+    ):
+        lookup[int(section_start)] = section_payload
+    return lookup
+
+
+def build_section_anchor_canvas_and_mask(
     low_full_latents: torch.Tensor,
+    section_payload: Optional[Dict[str, object]],
     section_start: int,
     valid_target_frames: int,
+    latent_window_size: int,
     anchor_span_latents: int,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    anchor_canvas = torch.zeros(
+        low_full_latents.shape[0],
+        latent_window_size,
+        low_full_latents.shape[2],
+        low_full_latents.shape[3],
+        device=low_full_latents.device,
+        dtype=low_full_latents.dtype,
+    )
+    anchor_mask = torch.zeros(
+        1,
+        latent_window_size,
+        1,
+        1,
+        device=low_full_latents.device,
+        dtype=low_full_latents.dtype,
+    )
+
+    if section_payload is not None:
+        for anchor_block in section_payload.get("anchor_blocks", []):
+            block_start = int(anchor_block.get("start", 0))
+            block_length = int(anchor_block.get("length", 0))
+            if block_length <= 0 or block_start >= valid_target_frames:
+                continue
+            block_end = min(valid_target_frames, block_start + block_length)
+            source_start = section_start + block_start
+            source_end = section_start + block_end
+            anchor_values = low_full_latents[:, source_start:source_end]
+            if anchor_values.shape[1] == 0:
+                continue
+            anchor_canvas[:, block_start:block_end] = anchor_values[:, : block_end - block_start]
+            anchor_mask[:, block_start:block_end] = 1
+        return anchor_canvas.contiguous(), anchor_mask.contiguous()
+
     anchor_steps = min(anchor_span_latents, valid_target_frames)
-    anchor_latents = low_full_latents[:, section_start : section_start + anchor_steps]
-    if anchor_latents.shape[1] == anchor_span_latents:
-        return anchor_latents.contiguous()
-    if anchor_latents.shape[1] == 0:
-        return torch.zeros(
-            low_full_latents.shape[0],
-            anchor_span_latents,
-            low_full_latents.shape[2],
-            low_full_latents.shape[3],
-            device=low_full_latents.device,
-            dtype=low_full_latents.dtype,
-        ).contiguous()
-    padding = anchor_latents[:, -1:].repeat(1, anchor_span_latents - anchor_latents.shape[1], 1, 1)
-    return torch.cat([anchor_latents, padding], dim=1).contiguous()
+    if anchor_steps <= 0:
+        return anchor_canvas.contiguous(), anchor_mask.contiguous()
+    anchor_values = low_full_latents[:, section_start : section_start + anchor_steps]
+    anchor_canvas[:, :anchor_steps] = anchor_values
+    anchor_mask[:, :anchor_steps] = 1
+    return anchor_canvas.contiguous(), anchor_mask.contiguous()
+
+
+def build_anchor_distance_weights(
+    anchor_masks: torch.Tensor,
+    valid_target_frames: torch.Tensor,
+    latent_window_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    batch_size = valid_target_frames.shape[0]
+    weights = torch.zeros(batch_size, 1, latent_window_size, 1, 1, device=device, dtype=dtype)
+    for idx, valid_frames in enumerate(valid_target_frames.tolist()):
+        valid = int(valid_frames)
+        if valid <= 0:
+            continue
+        anchor_positions = torch.nonzero(anchor_masks[idx, 0, :valid, 0, 0] > 0.5, as_tuple=False).flatten()
+        if anchor_positions.numel() == 0:
+            if valid == 1:
+                weights[idx, 0, 0, 0, 0] = 1.0
+            else:
+                positions = torch.arange(valid, device=device, dtype=dtype)
+                weights[idx, 0, :valid, 0, 0] = 1.0 + positions / float(valid - 1)
+            continue
+
+        anchor_positions = anchor_positions.to(device=device, dtype=dtype)
+        positions = torch.arange(valid, device=device, dtype=dtype)
+        distances = torch.abs(positions.view(-1, 1) - anchor_positions.view(1, -1)).min(dim=1).values
+        non_anchor_mask = distances > 0
+        if not bool(non_anchor_mask.any().item()):
+            continue
+        max_distance = float(distances[non_anchor_mask].max().item())
+        if max_distance <= 0.0:
+            max_distance = 1.0
+        weights[idx, 0, :valid, 0, 0] = 1.0 + distances / max_distance
+        weights[idx, 0, anchor_positions.to(dtype=torch.long), 0, 0] = 0.0
+    return weights.contiguous()
 
 
 def build_training_batch_tensors(
@@ -1897,9 +2000,10 @@ def build_training_batch_tensors(
     unique_seq_indices = sorted(set(seq_indices))
     low_latent_cache: Dict[int, torch.Tensor] = {}
     clean_latent_cache: Dict[int, torch.Tensor] = {}
+    section_payload_cache: Dict[int, Dict[int, Dict[str, object]]] = {}
     for seq_idx in unique_seq_indices:
         sequence = sequences[seq_idx]
-        _codec_payload, low_full_latents = build_sequence_low_latents(
+        codec_payload, low_full_latents = build_sequence_low_latents(
             sequence=sequence,
             codec_config=codec_config,
             learned_tail_codec=learned_tail_codec,
@@ -1909,41 +2013,48 @@ def build_training_batch_tensors(
         )
         clean_latent_cache[seq_idx] = sequence.clean_full_latents.to(device=device, dtype=torch.float32).contiguous()
         low_latent_cache[seq_idx] = low_full_latents.to(device=device, dtype=torch.float32).contiguous()
+        section_payload_cache[seq_idx] = build_section_payload_lookup(codec_payload)
 
     history_latents: List[torch.Tensor] = []
     target_latents: List[torch.Tensor] = []
-    section_anchor_latents: List[torch.Tensor] = []
+    anchor_canvases: List[torch.Tensor] = []
+    anchor_masks: List[torch.Tensor] = []
     x0_latents: List[torch.Tensor] = []
     valid_target_frames: List[int] = []
     for seq_idx, section_start in zip(seq_indices, section_starts):
         clean_full_latents = clean_latent_cache[seq_idx]
         low_full_latents = low_latent_cache[seq_idx]
+        section_payload = section_payload_cache[seq_idx].get(section_start)
         target_latent, valid_frames = extract_target_window(
             clean_full_latents=clean_full_latents,
             section_start=section_start,
             latent_window_size=latent_window_size,
         )
         history_latent = extract_history_window(
-            low_full_latents=low_full_latents,
+            source_full_latents=low_full_latents,
             section_start=section_start,
             history_window_size=history_window_size,
         )
-        anchor_latent = extract_section_anchor_window(
+        anchor_canvas, anchor_mask = build_section_anchor_canvas_and_mask(
             low_full_latents=low_full_latents,
+            section_payload=section_payload,
             section_start=section_start,
             valid_target_frames=valid_frames,
+            latent_window_size=latent_window_size,
             anchor_span_latents=anchor_span_latents,
         )
         history_latents.append(history_latent)
         target_latents.append(target_latent)
-        section_anchor_latents.append(anchor_latent)
+        anchor_canvases.append(anchor_canvas)
+        anchor_masks.append(anchor_mask)
         x0_latents.append(clean_full_latents[:, :1])
         valid_target_frames.append(valid_frames)
 
     return {
         "history_latents": torch.stack(history_latents, dim=0).contiguous(),
         "target_latents": torch.stack(target_latents, dim=0).contiguous(),
-        "section_anchor_latents": torch.stack(section_anchor_latents, dim=0).contiguous(),
+        "section_anchor_canvas": torch.stack(anchor_canvases, dim=0).contiguous(),
+        "section_anchor_mask": torch.stack(anchor_masks, dim=0).contiguous(),
         "x0_latents": torch.stack(x0_latents, dim=0).contiguous(),
         "valid_target_frames": torch.tensor(valid_target_frames, device=device, dtype=torch.long),
     }
@@ -2081,7 +2192,8 @@ def training_step(
     )
     history_latents = materialized_batch["history_latents"].to(dtype=weight_dtype)
     target_latents = materialized_batch["target_latents"].to(dtype=weight_dtype)
-    section_anchor_latents = materialized_batch["section_anchor_latents"].to(dtype=weight_dtype)
+    section_anchor_canvas = materialized_batch["section_anchor_canvas"].to(dtype=weight_dtype)
+    section_anchor_mask = materialized_batch["section_anchor_mask"].to(dtype=weight_dtype)
     x0_latents = materialized_batch["x0_latents"].to(dtype=weight_dtype)
     valid_target_frames = materialized_batch["valid_target_frames"]
 
@@ -2122,7 +2234,11 @@ def training_step(
     sigma_view = sigma.to(dtype=weight_dtype).view(-1, 1, 1, 1, 1)
     noisy_model_input = (1.0 - sigma_view) * model_input + sigma_view * noise
     flow_target = noise - model_input
-    noisy_model_input = overwrite_anchor_latents(noisy_model_input, section_anchor_latents)
+    noisy_model_input = overwrite_anchor_latents(
+        noisy_model_input,
+        section_anchor_canvas,
+        section_anchor_mask,
+    )
     timesteps = sigma * 1000.0
 
     base_transformer = unwrap_model(transformer)
@@ -2143,16 +2259,19 @@ def training_step(
         )[0]
 
     # 序列尾部可能被 padding，因此 loss 只统计真实存在的 target 帧。
-    mask = build_valid_mask(
+    valid_mask = build_valid_mask(
         valid_target_frames=valid_target_frames,
         latent_window_size=latent_window_size,
         device=device,
         dtype=torch.float32,
-        valid_start=anchor_span_latents,
+        valid_start=0,
     )
-    tail_position_weights = build_tail_position_weights(
+    anchor_mask_float = section_anchor_mask.to(device=device, dtype=torch.float32)
+    mask = valid_mask * (1.0 - anchor_mask_float)
+    tail_position_weights = build_anchor_distance_weights(
+        anchor_masks=anchor_mask_float,
+        valid_target_frames=valid_target_frames,
         latent_window_size=latent_window_size,
-        anchor_span_latents=anchor_span_latents,
         device=device,
         dtype=torch.float32,
     )
@@ -2165,8 +2284,16 @@ def training_step(
     flow_pred = flow_pred.float()
     x_pred = xt - sigma_view_float * flow_pred
     noise_pred = xt + (1.0 - sigma_view_float) * flow_pred
-    x_pred_for_temporal = overwrite_anchor_latents(x_pred.clone(), section_anchor_latents.float())
-    x_target_for_temporal = overwrite_anchor_latents(x_target.clone(), section_anchor_latents.float())
+    x_pred_for_temporal = overwrite_anchor_latents(
+        x_pred.clone(),
+        section_anchor_canvas.float(),
+        anchor_mask_float,
+    )
+    x_target_for_temporal = overwrite_anchor_latents(
+        x_target.clone(),
+        section_anchor_canvas.float(),
+        anchor_mask_float,
+    )
 
     flow_sq_error = (flow_pred - flow_target).pow(2)
     weighting = compute_loss_weighting_for_sd3(weighting_scheme=loss_weighting_scheme, sigmas=sigma)
@@ -2231,33 +2358,22 @@ def normalized_masked_mse(prediction: torch.Tensor, target: torch.Tensor, mask: 
     return numerator / denominator
 
 
-def build_tail_position_weights(
-    latent_window_size: int,
-    anchor_span_latents: int,
-    device: torch.device,
-    dtype: torch.dtype,
+def overwrite_anchor_latents(
+    latents: torch.Tensor,
+    anchor_canvas: torch.Tensor,
+    anchor_mask: torch.Tensor,
 ) -> torch.Tensor:
-    weights = torch.zeros(1, 1, latent_window_size, 1, 1, device=device, dtype=dtype)
-    tail_frames = max(0, latent_window_size - anchor_span_latents)
-    if tail_frames <= 0:
-        return weights
-
-    if tail_frames == 1:
-        weights[:, :, anchor_span_latents:, :, :] = 1.0
-        return weights
-
-    tail_positions = torch.arange(tail_frames, device=device, dtype=dtype)
-    tail_weights = 1.0 + tail_positions / float(tail_frames - 1)
-    weights[:, :, anchor_span_latents:, 0, 0] = tail_weights
-    return weights
-
-
-def overwrite_anchor_latents(latents: torch.Tensor, anchor_latents: torch.Tensor) -> torch.Tensor:
-    anchor_steps = int(anchor_latents.shape[2])
-    if anchor_steps <= 0:
+    if latents.shape != anchor_canvas.shape:
+        raise ValueError(
+            f"Latent shape {tuple(latents.shape)} does not match anchor canvas shape {tuple(anchor_canvas.shape)}."
+        )
+    if anchor_mask.ndim != 5:
+        raise ValueError(f"Expected anchor_mask with shape [B, 1, T, 1, 1], got {tuple(anchor_mask.shape)}.")
+    if float(anchor_mask.sum().item()) <= 0.0:
         return latents
-    latents[:, :, :anchor_steps] = anchor_latents.to(device=latents.device, dtype=latents.dtype)
-    return latents
+    expanded_mask = anchor_mask.to(device=latents.device, dtype=latents.dtype).expand_as(latents)
+    anchor_canvas = anchor_canvas.to(device=latents.device, dtype=latents.dtype)
+    return (latents * (1.0 - expanded_mask) + anchor_canvas * expanded_mask).contiguous()
 
 
 def compute_aux_loss_scale(
@@ -2494,11 +2610,15 @@ def reconstruct_sequence(
     low_full = sequence.low_full_latents
     if clean_full.shape[1] == 1:
         return clean_full.clone().cpu().contiguous()
+    if low_full is None or sequence.low_codec_payload is None:
+        raise ValueError("sequence.low_full_latents / low_codec_payload are missing. Please materialize low latents first.")
 
     prepare_stage1_clean_input_from_latents = import_stage1_prepare_fn()
     history_sizes = list(history_sizes)
     section_starts = list(range(1, clean_full.shape[1], latent_window_size))
     recovered_sections: List[torch.Tensor] = []
+    recovered_prefix = clean_full[:, :1].float().cpu().contiguous()
+    section_payload_lookup = build_section_payload_lookup(sequence.low_codec_payload)
     dummy_target = torch.zeros(
         1,
         clean_full.shape[0],
@@ -2516,13 +2636,20 @@ def reconstruct_sequence(
         disable=distributed_context.is_distributed and not distributed_context.is_main_process,
     ):
         history_latents = extract_history_window(
-            low_full_latents=low_full,
-            section_start=section_start,
+            source_full_latents=recovered_prefix,
+            section_start=int(recovered_prefix.shape[1]),
             history_window_size=sum(history_sizes),
         ).unsqueeze(0)
         valid_target_frames = min(latent_window_size, clean_full.shape[1] - section_start)
-        anchor_steps = min(anchor_span_latents, valid_target_frames)
-        section_anchor_latents = low_full[:, section_start : section_start + anchor_steps].unsqueeze(0)
+        section_payload = section_payload_lookup.get(section_start)
+        section_anchor_canvas, section_anchor_mask = build_section_anchor_canvas_and_mask(
+            low_full_latents=low_full,
+            section_payload=section_payload,
+            section_start=section_start,
+            valid_target_frames=valid_target_frames,
+            latent_window_size=latent_window_size,
+            anchor_span_latents=anchor_span_latents,
+        )
 
         (
             _,
@@ -2565,11 +2692,13 @@ def reconstruct_sequence(
             latents_history_long=latents_history_long,
             num_inference_steps=num_inference_steps,
             seed=seed + section_start,
-            anchor_latents=section_anchor_latents.to(device=device, dtype=weight_dtype),
+            anchor_canvas=section_anchor_canvas.unsqueeze(0).to(device=device, dtype=weight_dtype),
+            anchor_mask=section_anchor_mask.unsqueeze(0).to(device=device, dtype=weight_dtype),
             fix_anchor_during_denoise=fix_anchor_during_denoise,
         )
         valid_section = section_latents[0, :, :valid_target_frames].contiguous()
         recovered_sections.append(valid_section)
+        recovered_prefix = torch.cat([recovered_prefix, valid_section.cpu()], dim=1).contiguous()
 
     recovered_remainder = torch.cat(recovered_sections, dim=1)
     recovered_remainder = recovered_remainder[:, : clean_full.shape[1] - 1]
@@ -2595,7 +2724,8 @@ def run_stage1_denoise(
     latents_history_long: torch.Tensor,
     num_inference_steps: int,
     seed: int,
-    anchor_latents: torch.Tensor,
+    anchor_canvas: torch.Tensor,
+    anchor_mask: torch.Tensor,
     fix_anchor_during_denoise: bool,
 ) -> torch.Tensor:
     """执行单个 section 的扩散式去噪恢复。"""
@@ -2604,7 +2734,7 @@ def run_stage1_denoise(
     # 输入 hidden_states 是当前 section 的待恢复 latent，先随机初始化为高斯噪声；当前配置下 shape 近似是 [1, 16, 9, H, W]
     latents = torch.randn(latent_shape, device=device, dtype=torch.float32, generator=generator)
     if fix_anchor_during_denoise:
-        latents = overwrite_anchor_latents(latents, anchor_latents.float())
+        latents = overwrite_anchor_latents(latents, anchor_canvas.float(), anchor_mask.float())
     prepare_stage1_inference_scheduler(
         scheduler=scheduler,
         latents=latents,
@@ -2616,7 +2746,7 @@ def run_stage1_denoise(
 
     for step_idx, timestep in enumerate(scheduler.timesteps):
         if fix_anchor_during_denoise:
-            latents = overwrite_anchor_latents(latents, anchor_latents.float())
+            latents = overwrite_anchor_latents(latents, anchor_canvas.float(), anchor_mask.float())
         current_sigma = get_scheduler_sigma_for_step(scheduler, step_idx)
         ensure_finite_recover_state(
             stage="pre_model",
@@ -2666,7 +2796,7 @@ def run_stage1_denoise(
         else:
             latents = scheduler.step(noise_pred.float(), timestep, latents, return_dict=False)[0]
         if fix_anchor_during_denoise:
-            latents = overwrite_anchor_latents(latents, anchor_latents.float())
+            latents = overwrite_anchor_latents(latents, anchor_canvas.float(), anchor_mask.float())
         ensure_finite_recover_state(
             stage="post_step",
             input_path=input_path,
@@ -2701,8 +2831,9 @@ def build_low_latent_payload(sequence: PreparedSequence) -> Dict[str, object]:
         "tail_codec_type": sequence.low_codec_payload["codec_config"].get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE),
         "global_keyframe": sequence.low_codec_payload["global_keyframe"],
         "section_ranges": [list(section_range) for section_range in sequence.low_codec_payload["section_ranges"]],
-        "section_anchor_payloads": sequence.low_codec_payload["section_anchor_payloads"],
-        "section_tail_payloads": sequence.low_codec_payload["section_tail_payloads"],
+        "section_payloads": sequence.low_codec_payload.get("section_payloads"),
+        "section_anchor_payloads": sequence.low_codec_payload.get("section_anchor_payloads"),
+        "section_tail_payloads": sequence.low_codec_payload.get("section_tail_payloads"),
         "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
         "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
     }
@@ -2992,11 +3123,7 @@ def build_recover_config(
         "anchor_spatial_factor": codec_config.anchor_spatial_factor,
         "tail_codec_type": codec_config.tail_codec_type,
         "num_inference_steps": args.num_inference_steps,
-        "low_latent_format_version": (
-            DEFAULT_LOW_LATENT_FORMAT_VERSION
-            if codec_config.tail_codec_type == LEARNED_TAIL_CODEC_TYPE
-            else LOW_LATENT_FORMAT_V2
-        ),
+        "low_latent_format_version": DEFAULT_LOW_LATENT_FORMAT_VERSION,
         "learned_codec_checkpoint": LEARNED_CODEC_CHECKPOINT_NAME if learned_tail_codec is not None else None,
         "learned_codec_config": learned_codec_config,
         "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
@@ -3194,7 +3321,7 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     codec_config.setdefault("anchor_quant_dtype", config.get("anchor_quant_dtype", DEFAULT_ANCHOR_QUANT_DTYPE))
     codec_config.setdefault("anchor_spatial_factor", int(config.get("anchor_spatial_factor", DEFAULT_ANCHOR_SPATIAL_FACTOR)))
     codec_config.setdefault("tail_codec_type", config.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
-    learned_codec_config = dict(config.get("learned_codec_config", {}))
+    learned_codec_config = dict(config.get("learned_codec_config") or {})
     if "hidden_channels" in learned_codec_config and "learned_codec_hidden_channels" not in codec_config:
         codec_config["learned_codec_hidden_channels"] = int(learned_codec_config["hidden_channels"])
 
@@ -3209,12 +3336,12 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["num_inference_steps"] = int(config.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS))
     config["low_latent_format_version"] = config.get(
         "low_latent_format_version",
-        DEFAULT_LOW_LATENT_FORMAT_VERSION if config["tail_codec_type"] == LEARNED_TAIL_CODEC_TYPE else LOW_LATENT_FORMAT_V2,
+        DEFAULT_LOW_LATENT_FORMAT_VERSION,
     )
     config["learned_codec_checkpoint"] = config.get("learned_codec_checkpoint")
     config["learned_codec_config"] = learned_codec_config
     config.setdefault("fix_anchor_during_denoise", DEFAULT_FIX_ANCHOR_DURING_DENOISE)
-    train_loss_config = dict(config.get("train_loss_config", {}))
+    train_loss_config = dict(config.get("train_loss_config") or {})
     train_loss_config.setdefault("temporal_delta_loss_weight", DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
     config["temporal_delta_loss_weight"] = train_loss_config["temporal_delta_loss_weight"]
     config["train_loss_config"] = train_loss_config
