@@ -554,7 +554,7 @@ def init_offline_wandb_run(
 
     os.environ.setdefault("WANDB_MODE", "offline")
     return wandb.init(
-        project="helios-recover",
+        project="gpu16-E2E",
         job_type="train",
         name=output_dir.name,
         mode="offline",
