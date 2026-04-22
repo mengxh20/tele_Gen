@@ -46,12 +46,14 @@ from reconstruct.codec_gop import (
     make_section_ranges,
     validate_codec_config,
 )
+from reconstruct.external_entropy import write_external_entropy_payload
 from reconstruct.learned_codec import LEARNED_TAIL_CODEC_TYPE, build_learned_tail_codec
 from reconstruct.latent_io import (
     DEFAULT_BASE_MODEL_PATH,
     LATENT_FORMAT_V2,
     LOW_LATENT_FORMAT_V2,
     LOW_LATENT_FORMAT_V3,
+    LOW_LATENT_FORMAT_V4,
     build_chunk_frame_ranges,
     compute_bpp_from_total_pixels,
     flatten_latent_chunks,
@@ -91,9 +93,13 @@ DEFAULT_NOISE_LOSS_WEIGHT = 0.25
 DEFAULT_AUX_LOSS_WARMUP_STEPS = 500
 DEFAULT_AUX_LOSS_RAMP_STEPS = 1000
 DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT = 0.1
+DEFAULT_RATE_LOSS_WEIGHT = 1.0
+DEFAULT_RATE_LOSS_WARMUP_STEPS = 0
+DEFAULT_RATE_LOSS_RAMP_STEPS = 1000
+DEFAULT_ENTROPY_AUX_LEARNING_RATE = 1e-3
 DEFAULT_FIX_ANCHOR_DURING_DENOISE = True
-DEFAULT_LOW_LATENT_FORMAT_VERSION = LOW_LATENT_FORMAT_V3
-RECOVER_CONFIG_VERSION = "helios_recover_v5"
+DEFAULT_LOW_LATENT_FORMAT_VERSION = LOW_LATENT_FORMAT_V4
+RECOVER_CONFIG_VERSION = "helios_recover_v6_entropy"
 CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X = "full_window_1x"
 CURRENT_LOW_TARGET_INIT_PATCH_SHORT = "patch_short"
 LEARNED_CODEC_CHECKPOINT_NAME = "learned_codec.pt"
@@ -123,6 +129,7 @@ class CodecConfig:
     anchor_spatial_factor: int = DEFAULT_ANCHOR_SPATIAL_FACTOR
     tail_codec_type: str = DEFAULT_TAIL_CODEC_TYPE
     learned_codec_hidden_channels: Optional[int] = None
+    learned_codec_hyper_channels: Optional[int] = None
 
 
 @dataclass
@@ -190,6 +197,10 @@ class TrainingStepOutput:
     noise_loss: torch.Tensor
     temporal_delta_loss: torch.Tensor
     aux_scale: torch.Tensor
+    rate_loss: torch.Tensor
+    rate_bpp: torch.Tensor
+    rate_scale: torch.Tensor
+    codec_aux_loss: torch.Tensor
     sigma_mean: torch.Tensor
     flow_target_rms: torch.Tensor
     flow_pred_rms: torch.Tensor
@@ -208,6 +219,10 @@ class TrainingStepOutput:
             "noise_loss": self.noise_loss.detach().float(),
             "temporal_delta_loss": self.temporal_delta_loss.detach().float(),
             "aux_scale": self.aux_scale.detach().float(),
+            "rate_loss": self.rate_loss.detach().float(),
+            "rate_bpp": self.rate_bpp.detach().float(),
+            "rate_scale": self.rate_scale.detach().float(),
+            "codec_aux_loss": self.codec_aux_loss.detach().float(),
             "sigma_mean": self.sigma_mean.detach().float(),
             "flow_target_rms": self.flow_target_rms.detach().float(),
             "flow_pred_rms": self.flow_pred_rms.detach().float(),
@@ -320,6 +335,8 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tail_span_latents", type=int, default=None)
     parser.add_argument("--anchor_quant_dtype", type=str, default=DEFAULT_ANCHOR_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--anchor_spatial_factor", type=int, default=DEFAULT_ANCHOR_SPATIAL_FACTOR)
+    parser.add_argument("--learned_codec_hidden_channels", type=int, default=None)
+    parser.add_argument("--learned_codec_hyper_channels", type=int, default=None)
     parser.add_argument(
         "--tail_codec_type",
         type=str,
@@ -348,6 +365,10 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--x_loss_weight", type=float, default=DEFAULT_X_LOSS_WEIGHT)
     parser.add_argument("--noise_loss_weight", type=float, default=DEFAULT_NOISE_LOSS_WEIGHT)
     parser.add_argument("--temporal_delta_loss_weight", type=float, default=DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
+    parser.add_argument("--rate_loss_weight", type=float, default=DEFAULT_RATE_LOSS_WEIGHT)
+    parser.add_argument("--rate_loss_warmup_steps", type=int, default=DEFAULT_RATE_LOSS_WARMUP_STEPS)
+    parser.add_argument("--rate_loss_ramp_steps", type=int, default=DEFAULT_RATE_LOSS_RAMP_STEPS)
+    parser.add_argument("--entropy_aux_learning_rate", type=float, default=DEFAULT_ENTROPY_AUX_LEARNING_RATE)
     parser.add_argument("--aux_loss_warmup_steps", type=int, default=DEFAULT_AUX_LOSS_WARMUP_STEPS)
     parser.add_argument("--aux_loss_ramp_steps", type=int, default=DEFAULT_AUX_LOSS_RAMP_STEPS)
     parser.add_argument(
@@ -707,12 +728,20 @@ def command_train(args: argparse.Namespace) -> None:
         weight_decay=args.weight_decay,
     )
     learned_codec_optimizer = None
+    learned_codec_aux_optimizer = None
     if learned_tail_codec is not None:
+        codec_main_parameters = learned_tail_codec.codec_main_parameters()
+        codec_aux_parameters = learned_tail_codec.codec_aux_parameters()
         learned_codec_optimizer = torch.optim.AdamW(
-            [param for param in learned_tail_codec.parameters() if param.requires_grad],
+            codec_main_parameters,
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
         )
+        if codec_aux_parameters:
+            learned_codec_aux_optimizer = torch.optim.Adam(
+                codec_aux_parameters,
+                lr=args.entropy_aux_learning_rate,
+            )
 
     accelerator = create_train_accelerator(
         weight_dtype=args.weight_dtype,
@@ -737,6 +766,8 @@ def command_train(args: argparse.Namespace) -> None:
             f"save_every_epochs={checkpoint_save_interval_epochs} "
             f"loss_weighting_scheme={args.loss_weighting_scheme} "
             f"flow/x/noise/delta=({args.flow_loss_weight:.3f}/{args.x_loss_weight:.3f}/{args.noise_loss_weight:.3f}/{args.temporal_delta_loss_weight:.3f}) "
+            f"rate_weight={args.rate_loss_weight:.3f} "
+            f"rate_warmup={args.rate_loss_warmup_steps} rate_ramp={args.rate_loss_ramp_steps} "
             f"aux_warmup={args.aux_loss_warmup_steps} aux_ramp={args.aux_loss_ramp_steps}"
         )
     accelerator.wait_for_everyone()
@@ -765,6 +796,10 @@ def command_train(args: argparse.Namespace) -> None:
         "x_loss_weight": args.x_loss_weight,
         "noise_loss_weight": args.noise_loss_weight,
         "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
+        "rate_loss_weight": args.rate_loss_weight,
+        "rate_loss_warmup_steps": args.rate_loss_warmup_steps,
+        "rate_loss_ramp_steps": args.rate_loss_ramp_steps,
+        "entropy_aux_learning_rate": args.entropy_aux_learning_rate,
         "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
         "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
         "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
@@ -774,7 +809,8 @@ def command_train(args: argparse.Namespace) -> None:
                 "flow_loss_weight * tail_position_weighted_mse(flow_pred, noise-latent) + "
                 "aux_scale * (x_loss_weight * tail_position_weighted_normalized_mse(x_pred, latent) + "
                 "noise_loss_weight * tail_position_weighted_normalized_mse(noise_pred, noise) + "
-                "temporal_delta_loss_weight * tail_position_weighted_l1(delta(x_pred), delta(latent)))"
+                "temporal_delta_loss_weight * tail_position_weighted_l1(delta(x_pred), delta(latent))) + "
+                "rate_scale * rate_loss_weight * entropy_tail_bpp"
             ),
             "raw_loss": "masked_mse(flow_pred, noise-latent)",
             "x_prediction": "x_pred = x_t - sigma * flow_pred",
@@ -787,6 +823,10 @@ def command_train(args: argparse.Namespace) -> None:
         "noise_losses": [],
         "temporal_delta_losses": [],
         "aux_scales": [],
+        "rate_losses": [],
+        "rate_bpp": [],
+        "rate_scales": [],
+        "codec_aux_losses": [],
         "sigma_means": [],
         "flow_target_rms": [],
         "flow_pred_rms": [],
@@ -832,6 +872,10 @@ def command_train(args: argparse.Namespace) -> None:
                 "noise_loss": 0.0,
                 "temporal_delta_loss": 0.0,
                 "aux_scale": 0.0,
+                "rate_loss": 0.0,
+                "rate_bpp": 0.0,
+                "rate_scale": 0.0,
+                "codec_aux_loss": 0.0,
                 "sigma_mean": 0.0,
                 "flow_target_rms": 0.0,
                 "flow_pred_rms": 0.0,
@@ -868,6 +912,9 @@ def command_train(args: argparse.Namespace) -> None:
                         x_loss_weight=args.x_loss_weight,
                         noise_loss_weight=args.noise_loss_weight,
                         temporal_delta_loss_weight=args.temporal_delta_loss_weight,
+                        rate_loss_weight=args.rate_loss_weight,
+                        rate_loss_warmup_steps=args.rate_loss_warmup_steps,
+                        rate_loss_ramp_steps=args.rate_loss_ramp_steps,
                         aux_loss_warmup_steps=args.aux_loss_warmup_steps,
                         aux_loss_ramp_steps=args.aux_loss_ramp_steps,
                         global_step=global_step,
@@ -884,6 +931,12 @@ def command_train(args: argparse.Namespace) -> None:
                     optimizer.zero_grad(set_to_none=True)
                     if learned_codec_optimizer is not None and accelerator.sync_gradients:
                         learned_codec_optimizer.zero_grad(set_to_none=True)
+                    if learned_codec_aux_optimizer is not None and accelerator.sync_gradients:
+                        learned_codec_aux_optimizer.zero_grad(set_to_none=True)
+                        step_output.codec_aux_loss.backward()
+                        synchronize_module_gradients(learned_tail_codec)
+                        learned_codec_aux_optimizer.step()
+                        learned_codec_aux_optimizer.zero_grad(set_to_none=True)
 
                 detached_metrics = step_output.detached_float_metrics()
                 if not running_metrics:
@@ -916,6 +969,10 @@ def command_train(args: argparse.Namespace) -> None:
                     noise_loss_value = scalar_metrics["noise_loss"]
                     temporal_delta_loss_value = scalar_metrics["temporal_delta_loss"]
                     aux_scale_value = scalar_metrics["aux_scale"]
+                    rate_loss_value = scalar_metrics["rate_loss"]
+                    rate_bpp_value = scalar_metrics["rate_bpp"]
+                    rate_scale_value = scalar_metrics["rate_scale"]
+                    codec_aux_loss_value = scalar_metrics["codec_aux_loss"]
                     sigma_mean_value = scalar_metrics["sigma_mean"]
                     flow_target_rms_value = scalar_metrics["flow_target_rms"]
                     flow_pred_rms_value = scalar_metrics["flow_pred_rms"]
@@ -937,6 +994,10 @@ def command_train(args: argparse.Namespace) -> None:
                     train_metrics["noise_losses"].append(noise_loss_value)
                     train_metrics["temporal_delta_losses"].append(temporal_delta_loss_value)
                     train_metrics["aux_scales"].append(aux_scale_value)
+                    train_metrics["rate_losses"].append(rate_loss_value)
+                    train_metrics["rate_bpp"].append(rate_bpp_value)
+                    train_metrics["rate_scales"].append(rate_scale_value)
+                    train_metrics["codec_aux_losses"].append(codec_aux_loss_value)
                     train_metrics["sigma_means"].append(sigma_mean_value)
                     train_metrics["flow_target_rms"].append(flow_target_rms_value)
                     train_metrics["flow_pred_rms"].append(flow_pred_rms_value)
@@ -952,6 +1013,10 @@ def command_train(args: argparse.Namespace) -> None:
                     epoch_metric_sums["noise_loss"] += noise_loss_value
                     epoch_metric_sums["temporal_delta_loss"] += temporal_delta_loss_value
                     epoch_metric_sums["aux_scale"] += aux_scale_value
+                    epoch_metric_sums["rate_loss"] += rate_loss_value
+                    epoch_metric_sums["rate_bpp"] += rate_bpp_value
+                    epoch_metric_sums["rate_scale"] += rate_scale_value
+                    epoch_metric_sums["codec_aux_loss"] += codec_aux_loss_value
                     epoch_metric_sums["sigma_mean"] += sigma_mean_value
                     epoch_metric_sums["flow_target_rms"] += flow_target_rms_value
                     epoch_metric_sums["flow_pred_rms"] += flow_pred_rms_value
@@ -969,6 +1034,7 @@ def command_train(args: argparse.Namespace) -> None:
                             x=f"{x_loss_value:.6f}",
                             noise=f"{noise_loss_value:.6f}",
                             delta=f"{temporal_delta_loss_value:.6f}",
+                            rate=f"{rate_bpp_value:.6f}",
                             sigma=f"{sigma_mean_value:.3f}",
                         )
                     if progress is not None:
@@ -983,6 +1049,10 @@ def command_train(args: argparse.Namespace) -> None:
                                 "train/noise_loss": noise_loss_value,
                                 "train/temporal_delta_loss": temporal_delta_loss_value,
                                 "train/aux_scale": aux_scale_value,
+                                "train/rate_loss": rate_loss_value,
+                                "train/rate_bpp": rate_bpp_value,
+                                "train/rate_scale": rate_scale_value,
+                                "train/codec_aux_loss": codec_aux_loss_value,
                                 "train/loss_ema": loss_ema_value,
                                 "train/sigma_mean": sigma_mean_value,
                                 "train/flow_target_rms": flow_target_rms_value,
@@ -1013,6 +1083,10 @@ def command_train(args: argparse.Namespace) -> None:
                     "noise_loss_mean": epoch_metric_sums["noise_loss"] / epoch_logged_steps,
                     "temporal_delta_loss_mean": epoch_metric_sums["temporal_delta_loss"] / epoch_logged_steps,
                     "aux_scale_mean": epoch_metric_sums["aux_scale"] / epoch_logged_steps,
+                    "rate_loss_mean": epoch_metric_sums["rate_loss"] / epoch_logged_steps,
+                    "rate_bpp_mean": epoch_metric_sums["rate_bpp"] / epoch_logged_steps,
+                    "rate_scale_mean": epoch_metric_sums["rate_scale"] / epoch_logged_steps,
+                    "codec_aux_loss_mean": epoch_metric_sums["codec_aux_loss"] / epoch_logged_steps,
                     "loss_ema_last": loss_ema_value,
                     "sigma_mean": epoch_metric_sums["sigma_mean"] / epoch_logged_steps,
                     "flow_target_rms_mean": epoch_metric_sums["flow_target_rms"] / epoch_logged_steps,
@@ -1033,6 +1107,10 @@ def command_train(args: argparse.Namespace) -> None:
                             "epoch/noise_loss_mean": epoch_summary["noise_loss_mean"],
                             "epoch/temporal_delta_loss_mean": epoch_summary["temporal_delta_loss_mean"],
                             "epoch/aux_scale_mean": epoch_summary["aux_scale_mean"],
+                            "epoch/rate_loss_mean": epoch_summary["rate_loss_mean"],
+                            "epoch/rate_bpp_mean": epoch_summary["rate_bpp_mean"],
+                            "epoch/rate_scale_mean": epoch_summary["rate_scale_mean"],
+                            "epoch/codec_aux_loss_mean": epoch_summary["codec_aux_loss_mean"],
                             "epoch/loss_ema_last": epoch_summary["loss_ema_last"],
                             "epoch/sigma_mean": epoch_summary["sigma_mean"],
                             "epoch/flow_target_rms_mean": epoch_summary["flow_target_rms_mean"],
@@ -1107,6 +1185,9 @@ def command_train(args: argparse.Namespace) -> None:
                 wandb_run.summary["train/last_x_loss"] = train_metrics["x_losses"][-1]
                 wandb_run.summary["train/last_noise_loss"] = train_metrics["noise_losses"][-1]
                 wandb_run.summary["train/last_temporal_delta_loss"] = train_metrics["temporal_delta_losses"][-1]
+                wandb_run.summary["train/last_rate_bpp"] = train_metrics["rate_bpp"][-1]
+                wandb_run.summary["train/last_rate_loss"] = train_metrics["rate_losses"][-1]
+                wandb_run.summary["train/last_codec_aux_loss"] = train_metrics["codec_aux_losses"][-1]
                 wandb_run.summary["train/last_loss_ema"] = train_metrics["losses_ema"][-1]
                 wandb_run.summary["train/trainable_params"] = train_metrics["trainable_params"]
             print(
@@ -1117,6 +1198,8 @@ def command_train(args: argparse.Namespace) -> None:
                 f"last_x_loss={train_metrics['x_losses'][-1]:.6f} "
                 f"last_noise_loss={train_metrics['noise_losses'][-1]:.6f} "
                 f"last_temporal_delta_loss={train_metrics['temporal_delta_losses'][-1]:.6f} "
+                f"last_rate_bpp={train_metrics['rate_bpp'][-1]:.6f} "
+                f"last_codec_aux_loss={train_metrics['codec_aux_losses'][-1]:.6f} "
                 f"last_raw_loss={train_metrics['raw_losses'][-1]:.6f} "
                 f"trainable_params={train_metrics['trainable_params']}"
             )
@@ -1188,11 +1271,15 @@ def command_infer(args: argparse.Namespace) -> None:
         low_dir = output_dir / "low_latents"
         recover_dir = output_dir / "recover_latents"
         metrics_dir = output_dir / "metrics"
+        enc_dir = output_dir / "enc_latents"
+        entropy_metrics_dir = output_dir / "entropy_metrics"
 
         if distributed_context.is_main_process:
             low_dir.mkdir(parents=True, exist_ok=True)
             recover_dir.mkdir(parents=True, exist_ok=True)
             metrics_dir.mkdir(parents=True, exist_ok=True)
+            enc_dir.mkdir(parents=True, exist_ok=True)
+            entropy_metrics_dir.mkdir(parents=True, exist_ok=True)
             print(
                 f"[infer] input_root={input_root} files={len(latent_paths)}/{total_input_files} "
                 f"device={device} world_size={distributed_context.world_size} "
@@ -1247,8 +1334,19 @@ def command_infer(args: argparse.Namespace) -> None:
                 recover_dir=recover_dir,
                 metrics_dir=metrics_dir,
             )
+            enc_latent_path, entropy_metrics_path = resolve_entropy_output_paths(
+                input_path=latent_path,
+                input_root=input_root,
+                enc_dir=enc_dir,
+                entropy_metrics_dir=entropy_metrics_dir,
+            )
             low_payload = build_low_latent_payload(sequence)
             torch.save(low_payload, low_latent_path)
+            entropy_summary = write_external_entropy_payload(
+                low_payload,
+                enc_latent_path,
+                relative_path=str(latent_path.relative_to(input_root)),
+            )
             ensure_finite_recover_state(
                 stage="final_output",
                 input_path=sequence.path,
@@ -1340,9 +1438,38 @@ def command_infer(args: argparse.Namespace) -> None:
             with metrics_path.open("w", encoding="utf-8") as handle:
                 json.dump(metrics_payload, handle, indent=2)
 
+            source_low_codec_bytes = int(sequence.low_codec_payload["low_codec_bytes"])
+            source_low_bpp = float(sequence.low_codec_payload["low_bpp"])
+            entropy_codec_bytes = int(entropy_summary["entropy_codec_bytes"])
+            entropy_bpp = compute_bpp_from_total_pixels(
+                entropy_codec_bytes,
+                sequence.metadata.total_pixels,
+            )
+            entropy_metrics_payload = {
+                "input_low_latent_path": str(low_latent_path),
+                "enc_latent_path": str(enc_latent_path),
+                "source_low_codec_bytes": source_low_codec_bytes,
+                "source_low_bpp": source_low_bpp,
+                "entropy_codec_bytes": entropy_codec_bytes,
+                "entropy_bpp": float(entropy_bpp),
+                "bpp_saving": float(source_low_bpp - entropy_bpp),
+                "compression_ratio": (
+                    float(source_low_codec_bytes) / float(entropy_codec_bytes)
+                    if entropy_codec_bytes > 0
+                    else float("inf")
+                ),
+                "entropy_codec": str(entropy_summary["entropy_codec"]),
+                "field_strategy": str(entropy_summary["field_strategy"]),
+                "block_lengths": entropy_summary["block_lengths"],
+            }
+            entropy_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            with entropy_metrics_path.open("w", encoding="utf-8") as handle:
+                json.dump(entropy_metrics_payload, handle, indent=2)
+
             print(
                 f"[infer][rank={distributed_context.rank}] saved low={low_latent_path} recover={recover_latent_path} "
                 f"low_bpp={sequence.low_codec_payload['low_bpp']:.6f} "
+                f"entropy_bpp={entropy_bpp:.6f} "
                 f"direct_low_l1={direct_low_metrics['l1']:.6f} restored_l1={restored_metrics['l1']:.6f}"
             )
 
@@ -1376,6 +1503,8 @@ def build_codec_config(args: argparse.Namespace) -> CodecConfig:
         anchor_quant_dtype=args.anchor_quant_dtype,
         anchor_spatial_factor=args.anchor_spatial_factor,
         tail_codec_type=args.tail_codec_type,
+        learned_codec_hidden_channels=getattr(args, "learned_codec_hidden_channels", None),
+        learned_codec_hyper_channels=getattr(args, "learned_codec_hyper_channels", None),
     )
     validate_codec_config(asdict(codec_config))
     return codec_config
@@ -1521,6 +1650,22 @@ def build_sequence_low_latents(
         move_to_cpu=move_to_cpu,
     )
     low_codec_payload["low_codec_bytes"] = estimate_low_codec_bytes(low_codec_payload)
+    if low_codec_payload.get("rate_bits") is not None:
+        rate_bits = low_codec_payload["rate_bits"]
+        if torch.is_tensor(rate_bits):
+            low_codec_payload["low_bpp_loss"] = rate_bits.float() / float(sequence.metadata.total_pixels)
+        else:
+            low_codec_payload["low_bpp_loss"] = torch.tensor(
+                float(rate_bits) / float(sequence.metadata.total_pixels),
+                device=clean_full_latents.device,
+                dtype=torch.float32,
+            )
+    else:
+        low_codec_payload["low_bpp_loss"] = torch.tensor(
+            float(low_codec_payload["low_codec_bytes"]) * 8.0 / float(sequence.metadata.total_pixels),
+            device=clean_full_latents.device,
+            dtype=torch.float32,
+        )
     low_codec_payload["low_bpp"] = compute_bpp_from_total_pixels(
         int(low_codec_payload["low_codec_bytes"]),
         sequence.metadata.total_pixels,
@@ -1724,9 +1869,10 @@ def build_training_batch_tensors(
     unique_seq_indices = sorted(set(seq_indices))
     low_latent_cache: Dict[int, torch.Tensor] = {}
     clean_latent_cache: Dict[int, torch.Tensor] = {}
+    codec_rate_bpp_cache: Dict[int, torch.Tensor] = {}
     for seq_idx in unique_seq_indices:
         sequence = sequences[seq_idx]
-        _codec_payload, low_full_latents = build_sequence_low_latents(
+        codec_payload, low_full_latents = build_sequence_low_latents(
             sequence=sequence,
             codec_config=codec_config,
             learned_tail_codec=learned_tail_codec,
@@ -1736,6 +1882,7 @@ def build_training_batch_tensors(
         )
         clean_latent_cache[seq_idx] = sequence.clean_full_latents.to(device=device, dtype=torch.float32).contiguous()
         low_latent_cache[seq_idx] = low_full_latents.to(device=device, dtype=torch.float32).contiguous()
+        codec_rate_bpp_cache[seq_idx] = codec_payload["low_bpp_loss"].to(device=device, dtype=torch.float32)
 
     history_latents: List[torch.Tensor] = []
     target_latents: List[torch.Tensor] = []
@@ -1743,6 +1890,7 @@ def build_training_batch_tensors(
     section_anchor_latents: List[torch.Tensor] = []
     x0_latents: List[torch.Tensor] = []
     valid_target_frames: List[int] = []
+    codec_rate_bpp: List[torch.Tensor] = []
     for seq_idx, section_start in zip(seq_indices, section_starts):
         clean_full_latents = clean_latent_cache[seq_idx]
         low_full_latents = low_latent_cache[seq_idx]
@@ -1778,6 +1926,7 @@ def build_training_batch_tensors(
         section_anchor_latents.append(anchor_latent)
         x0_latents.append(clean_full_latents[:, :1])
         valid_target_frames.append(valid_frames)
+        codec_rate_bpp.append(codec_rate_bpp_cache[seq_idx])
 
     return {
         "history_latents": torch.stack(history_latents, dim=0).contiguous(),
@@ -1786,6 +1935,7 @@ def build_training_batch_tensors(
         "section_anchor_latents": torch.stack(section_anchor_latents, dim=0).contiguous(),
         "x0_latents": torch.stack(x0_latents, dim=0).contiguous(),
         "valid_target_frames": torch.tensor(valid_target_frames, device=device, dtype=torch.long),
+        "codec_rate_bpp": torch.stack(codec_rate_bpp, dim=0).contiguous(),
     }
 
 
@@ -1930,6 +2080,9 @@ def training_step(
     x_loss_weight: float,
     noise_loss_weight: float,
     temporal_delta_loss_weight: float,
+    rate_loss_weight: float,
+    rate_loss_warmup_steps: int,
+    rate_loss_ramp_steps: int,
     aux_loss_warmup_steps: int,
     aux_loss_ramp_steps: int,
     global_step: int,
@@ -1962,6 +2115,7 @@ def training_step(
     section_anchor_latents = materialized_batch["section_anchor_latents"].to(dtype=weight_dtype)
     x0_latents = materialized_batch["x0_latents"].to(dtype=weight_dtype)
     valid_target_frames = materialized_batch["valid_target_frames"]
+    codec_rate_bpp = materialized_batch["codec_rate_bpp"].to(device=device, dtype=torch.float32)
 
     # 这段代码讲short,mid,long三档历史和target一起拼成 transformer 输入，后续 transformer 内部会区分处理。
     (
@@ -2059,6 +2213,12 @@ def training_step(
         ramp_steps=aux_loss_ramp_steps,
         device=device,
     )
+    rate_scale = compute_aux_loss_scale(
+        global_step=global_step,
+        warmup_steps=rate_loss_warmup_steps,
+        ramp_steps=rate_loss_ramp_steps,
+        device=device,
+    )
     raw_loss = masked_mean(flow_sq_error, mask)
     flow_loss = masked_mean(flow_sq_error * weighting, weighted_mask)
     x_loss = normalized_masked_mse(x_pred, x_target, weighted_mask)
@@ -2070,6 +2230,13 @@ def training_step(
         device=device,
         position_weights=tail_position_weights,
     )
+    rate_bpp_value = codec_rate_bpp.mean()
+    rate_loss = rate_bpp_value if learned_tail_codec is not None else torch.zeros((), device=device, dtype=torch.float32)
+    codec_aux_loss = (
+        learned_tail_codec.aux_loss().float()
+        if learned_tail_codec is not None and hasattr(learned_tail_codec, "aux_loss")
+        else torch.zeros((), device=device, dtype=torch.float32)
+    )
     loss = (
         flow_loss_weight * flow_loss
         + aux_scale
@@ -2078,6 +2245,7 @@ def training_step(
             + noise_loss_weight * noise_loss
             + temporal_delta_loss_weight * temporal_delta_loss
         )
+        + rate_scale * rate_loss_weight * rate_loss
     )
     return TrainingStepOutput(
         loss=loss,
@@ -2087,6 +2255,10 @@ def training_step(
         noise_loss=noise_loss,
         temporal_delta_loss=temporal_delta_loss,
         aux_scale=aux_scale,
+        rate_loss=rate_loss,
+        rate_bpp=rate_bpp_value,
+        rate_scale=rate_scale,
+        codec_aux_loss=codec_aux_loss,
         sigma_mean=sigma.mean(),
         flow_target_rms=masked_mean(flow_target.pow(2), mask).sqrt(),
         flow_pred_rms=masked_mean(flow_pred.pow(2), mask).sqrt(),
@@ -2654,6 +2826,21 @@ def resolve_output_paths(
     return low_latent_path, recover_latent_path, metrics_path
 
 
+def resolve_entropy_output_paths(
+    input_path: Path,
+    input_root: Path,
+    enc_dir: Path,
+    entropy_metrics_dir: Path,
+) -> Tuple[Path, Path]:
+    """为外层熵编产物生成 `.bin` 与 `entropy_metrics` 路径。"""
+    relative_path = input_path.relative_to(input_root)
+    enc_latent_path = (enc_dir / relative_path).with_suffix(".bin")
+    entropy_metrics_path = (entropy_metrics_dir / relative_path).with_suffix(".json")
+    enc_latent_path.parent.mkdir(parents=True, exist_ok=True)
+    entropy_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    return enc_latent_path, entropy_metrics_path
+
+
 def compute_tensor_metrics(prediction: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
     """计算 latent 级别的基础误差指标。"""
     diff = (prediction.float() - target.float()).flatten()
@@ -2910,6 +3097,10 @@ def build_recover_config(
             "x_loss_weight": args.x_loss_weight,
             "noise_loss_weight": args.noise_loss_weight,
             "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
+            "rate_loss_weight": args.rate_loss_weight,
+            "rate_loss_warmup_steps": args.rate_loss_warmup_steps,
+            "rate_loss_ramp_steps": args.rate_loss_ramp_steps,
+            "entropy_aux_learning_rate": args.entropy_aux_learning_rate,
             "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
             "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
         },
@@ -3120,6 +3311,8 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     learned_codec_config = dict(config.get("learned_codec_config", {}))
     if "hidden_channels" in learned_codec_config and "learned_codec_hidden_channels" not in codec_config:
         codec_config["learned_codec_hidden_channels"] = int(learned_codec_config["hidden_channels"])
+    if "hyper_channels" in learned_codec_config and "learned_codec_hyper_channels" not in codec_config:
+        codec_config["learned_codec_hyper_channels"] = int(learned_codec_config["hyper_channels"])
 
     config["format_version"] = RECOVER_CONFIG_VERSION
     config["codec_config"] = codec_config
@@ -3141,6 +3334,10 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config.setdefault("fix_anchor_during_denoise", DEFAULT_FIX_ANCHOR_DURING_DENOISE)
     train_loss_config = dict(config.get("train_loss_config", {}))
     train_loss_config.setdefault("temporal_delta_loss_weight", DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
+    train_loss_config.setdefault("rate_loss_weight", DEFAULT_RATE_LOSS_WEIGHT)
+    train_loss_config.setdefault("rate_loss_warmup_steps", DEFAULT_RATE_LOSS_WARMUP_STEPS)
+    train_loss_config.setdefault("rate_loss_ramp_steps", DEFAULT_RATE_LOSS_RAMP_STEPS)
+    train_loss_config.setdefault("entropy_aux_learning_rate", DEFAULT_ENTROPY_AUX_LEARNING_RATE)
     config["temporal_delta_loss_weight"] = train_loss_config["temporal_delta_loss_weight"]
     config["train_loss_config"] = train_loss_config
     return config
@@ -3234,6 +3431,7 @@ def load_learned_tail_codec(
             f"Unexpected learned codec state dict mismatch while loading {state_dict_path}: "
             f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
         )
+    learned_tail_codec.update(force=True)
     learned_tail_codec.eval()
     learned_tail_codec.requires_grad_(False)
     return learned_tail_codec

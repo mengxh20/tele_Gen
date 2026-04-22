@@ -221,10 +221,17 @@ def encode_section_tail_residual(
     if tail_codec_type == LEARNED_TAIL_CODEC_TYPE:
         if learned_tail_codec is None:
             raise ValueError("learned_tail_codec must be provided when tail_codec_type=learned_cnn_v1.")
+        anchor_condition = decoded_anchor_latents.unsqueeze(0)
         if use_ste_quant:
-            payload = learned_tail_codec.encode_to_ste_payload(residual_tail.unsqueeze(0))
+            payload = learned_tail_codec.encode_to_training_payload(
+                residual=residual_tail.unsqueeze(0),
+                anchor_latents=anchor_condition,
+            )
         else:
-            payload = learned_tail_codec.encode_to_quantized_payload(residual_tail.unsqueeze(0))
+            payload = learned_tail_codec.encode_to_bitstream_payload(
+                residual=residual_tail.unsqueeze(0),
+                anchor_latents=anchor_condition,
+            )
         payload["tail_codec_type"] = LEARNED_TAIL_CODEC_TYPE
         payload["original_shape"] = original_shape
         return payload
@@ -264,7 +271,10 @@ def decode_section_tail_residual(
     if tail_codec_type == LEARNED_TAIL_CODEC_TYPE:
         if learned_tail_codec is None:
             raise ValueError("learned_tail_codec must be provided to decode learned tail payloads.")
-        restored_residual = learned_tail_codec.decode_payload(tail_payload)
+        restored_residual = learned_tail_codec.decode_payload(
+            tail_payload,
+            anchor_latents=decoded_anchor_latents.unsqueeze(0),
+        )
         anchor_source = decoded_anchor_latents.to(device=restored_residual.device, dtype=torch.float32)
     else:
         reduced_residual = _decode_quantized_block(tail_payload)
@@ -290,15 +300,16 @@ def estimate_anchor_plus_tail_codec_bytes(codec_payload: Dict[str, object]) -> i
                 value = payload.get(tensor_key)
                 if isinstance(value, torch.Tensor):
                     total_bytes += value.numel() * value.element_size()
-            if "ste_bottleneck" in payload:
-                reduced_shape = [int(value) for value in payload.get("reduced_shape", [])]
-                if reduced_shape:
-                    channel_count = int(reduced_shape[0])
-                    bottleneck_elements = 1
-                    for value in reduced_shape:
-                        bottleneck_elements *= int(value)
-                    total_bytes += bottleneck_elements
-                    total_bytes += channel_count * 4
+            if "reconstructed_residual" in payload:
+                rate_bits = payload.get("rate_bits")
+                if torch.is_tensor(rate_bits):
+                    total_bytes += int(math.ceil(float(rate_bits.detach().cpu().item()) / 8.0))
+                else:
+                    total_bytes += int(math.ceil(float(rate_bits or 0.0) / 8.0))
+            if "y_string" in payload:
+                total_bytes += len(bytes(payload["y_string"]))
+            if "z_string" in payload:
+                total_bytes += len(bytes(payload["z_string"]))
 
     metadata_values: List[int] = [len(codec_payload.get("chunk_lengths", []))]
     metadata_values.extend(int(value) for value in codec_payload.get("chunk_lengths", []))
@@ -308,7 +319,7 @@ def estimate_anchor_plus_tail_codec_bytes(codec_payload: Dict[str, object]) -> i
 
     for payload_key in ("section_anchor_payloads", "section_tail_payloads"):
         for payload in codec_payload.get(payload_key, []):
-            for shape_key in ("reduced_shape", "original_shape"):
+            for shape_key in ("reduced_shape", "original_shape", "y_shape", "z_shape"):
                 total_bytes += len(payload.get(shape_key, [])) * 4
 
     return int(total_bytes)
@@ -338,6 +349,9 @@ def encode_anchor_plus_tail_latents(
 
     section_anchor_payloads: List[Dict[str, object]] = []
     section_tail_payloads: List[Dict[str, object]] = []
+    aggregated_rate_bits: List[torch.Tensor] = []
+    aggregated_y_bits: List[torch.Tensor] = []
+    aggregated_z_bits: List[torch.Tensor] = []
     for section_start, section_end in section_ranges:
         section_latents = clean_full_latents[:, section_start:section_end]
         anchor_span = min(_as_int(codec_config, "anchor_span_latents"), section_latents.shape[1])
@@ -356,8 +370,14 @@ def encode_anchor_plus_tail_latents(
         )
         section_anchor_payloads.append(anchor_payload)
         section_tail_payloads.append(tail_payload)
+        if torch.is_tensor(tail_payload.get("rate_bits")):
+            aggregated_rate_bits.append(tail_payload["rate_bits"])
+        if torch.is_tensor(tail_payload.get("y_bits")):
+            aggregated_y_bits.append(tail_payload["y_bits"])
+        if torch.is_tensor(tail_payload.get("z_bits")):
+            aggregated_z_bits.append(tail_payload["z_bits"])
 
-    return {
+    codec_payload = {
         "chunk_lengths": [int(length) for length in chunk_lengths],
         "codec_config": dict(codec_config) if isinstance(codec_config, dict) else None,
         "global_keyframe": _maybe_to_cpu(global_keyframe, move_to_cpu),
@@ -365,6 +385,13 @@ def encode_anchor_plus_tail_latents(
         "section_anchor_payloads": section_anchor_payloads,
         "section_tail_payloads": section_tail_payloads,
     }
+    if aggregated_rate_bits:
+        codec_payload["rate_bits"] = torch.stack(aggregated_rate_bits).sum()
+    if aggregated_y_bits:
+        codec_payload["y_bits"] = torch.stack(aggregated_y_bits).sum()
+    if aggregated_z_bits:
+        codec_payload["z_bits"] = torch.stack(aggregated_z_bits).sum()
+    return codec_payload
 
 
 def decode_anchor_plus_tail_latents(codec_payload: Dict[str, object], learned_tail_codec=None) -> torch.Tensor:

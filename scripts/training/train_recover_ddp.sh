@@ -23,5 +23,12 @@ accelerate launch \
     --main_process_ip "${MASTER_ADDR}" \
     --main_process_port "${MASTER_PORT}" \
     reconstruct/recover.py train \
-    --output_dir "reconstruct/gen2recon_runs_condition" \
+    --output_dir "reconstruct/gen2recon_runs_HE2E" \
+    --batch_size 2 \
+    --gradient_accumulation_steps 2 \
+    --epochs 500 \
+    --rate_loss_weight 1.0 \
+    --rate_loss_warmup_steps 200 \
+    --rate_loss_ramp_steps 1000 \
+    --entropy_aux_learning_rate 1e-3 \
     "$@"
