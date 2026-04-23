@@ -142,7 +142,24 @@ def write_external_entropy_payload(
             **block_descriptor,
         }
 
-    global_keyframe_descriptor = add_tensor_block("global_keyframe", low_payload["global_keyframe"])
+    def add_quantized_tensor_payload(block_name: str, payload: Dict[str, object]) -> Dict[str, object]:
+        descriptor = {
+            "quantized": add_tensor_block(f"{block_name}_quantized", payload["quantized"]),
+            "scales": add_tensor_block(f"{block_name}_scales", payload["scales"]),
+            "reduced_shape": [int(value) for value in payload["reduced_shape"]],
+            "original_shape": [int(value) for value in payload["original_shape"]],
+        }
+        if "keyframe_codec_mode" in payload:
+            descriptor["keyframe_codec_mode"] = str(payload["keyframe_codec_mode"])
+        if "quant_dtype" in payload:
+            descriptor["quant_dtype"] = str(payload["quant_dtype"])
+        return descriptor
+
+    global_keyframe_payload = low_payload["global_keyframe"]
+    if isinstance(global_keyframe_payload, dict):
+        global_keyframe_descriptor = add_quantized_tensor_payload("global_keyframe", global_keyframe_payload)
+    else:
+        global_keyframe_descriptor = add_tensor_block("global_keyframe", global_keyframe_payload)
 
     section_anchor_payloads = []
     for section_idx, anchor_payload in enumerate(low_payload["section_anchor_payloads"]):
@@ -248,6 +265,29 @@ def read_external_entropy_payload(input_path: Path) -> Dict[str, object]:
         return _decompress_bytes(str(block_descriptor["codec"]), compressed)
 
     source_payload = metadata["source_payload"]
+    global_keyframe_metadata = metadata["global_keyframe"]
+    if "quantized" in global_keyframe_metadata and "scales" in global_keyframe_metadata:
+        global_keyframe = {
+            "quantized": _bytes_to_tensor(
+                decode_block(global_keyframe_metadata["quantized"]),
+                global_keyframe_metadata["quantized"],
+            ),
+            "scales": _bytes_to_tensor(
+                decode_block(global_keyframe_metadata["scales"]),
+                global_keyframe_metadata["scales"],
+            ),
+            "reduced_shape": global_keyframe_metadata["reduced_shape"],
+            "original_shape": global_keyframe_metadata["original_shape"],
+        }
+        if "keyframe_codec_mode" in global_keyframe_metadata:
+            global_keyframe["keyframe_codec_mode"] = global_keyframe_metadata["keyframe_codec_mode"]
+        if "quant_dtype" in global_keyframe_metadata:
+            global_keyframe["quant_dtype"] = global_keyframe_metadata["quant_dtype"]
+    else:
+        global_keyframe = _bytes_to_tensor(
+            decode_block(global_keyframe_metadata),
+            global_keyframe_metadata,
+        )
     low_payload = {
         "format_version": source_payload["format_version"],
         "input_path": source_payload["input_path"],
@@ -262,10 +302,7 @@ def read_external_entropy_payload(input_path: Path) -> Dict[str, object]:
         "section_ranges": source_payload["section_ranges"],
         "low_codec_bytes": source_payload["low_codec_bytes"],
         "low_bpp": source_payload["low_bpp"],
-        "global_keyframe": _bytes_to_tensor(
-            decode_block(metadata["global_keyframe"]),
-            metadata["global_keyframe"],
-        ),
+        "global_keyframe": global_keyframe,
         "section_anchor_payloads": [],
         "section_tail_payloads": [],
     }

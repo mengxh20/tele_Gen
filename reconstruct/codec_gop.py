@@ -9,6 +9,8 @@ from reconstruct.learned_codec import LEARNED_TAIL_CODEC_TYPE
 
 EPS = 1e-8
 TRILINEAR_TAIL_CODEC_TYPE = "trilinear"
+RAW_KEYFRAME_CODEC_MODE = "raw"
+QUANTIZED_INT8_KEYFRAME_CODEC_MODE = "quantized_int8"
 
 
 def _get_config_value(codec_config, key: str):
@@ -29,6 +31,12 @@ def _tail_codec_type(codec_config) -> str:
     if isinstance(codec_config, dict):
         return str(codec_config.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
     return str(getattr(codec_config, "tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
+
+
+def _keyframe_codec_mode(codec_config) -> str:
+    if isinstance(codec_config, dict):
+        return str(codec_config.get("keyframe_codec_mode", RAW_KEYFRAME_CODEC_MODE))
+    return str(getattr(codec_config, "keyframe_codec_mode", RAW_KEYFRAME_CODEC_MODE))
 
 
 def _maybe_to_cpu(tensor: torch.Tensor, move_to_cpu: bool) -> torch.Tensor:
@@ -78,6 +86,18 @@ def validate_codec_config(codec_config) -> None:
     keyframe_dtype = _as_str(codec_config, "keyframe_dtype")
     if keyframe_dtype not in {"float16", "float32"}:
         raise ValueError(f"Unsupported keyframe_dtype={keyframe_dtype}.")
+    keyframe_codec_mode = _keyframe_codec_mode(codec_config)
+    if keyframe_codec_mode not in {RAW_KEYFRAME_CODEC_MODE, QUANTIZED_INT8_KEYFRAME_CODEC_MODE}:
+        raise ValueError(
+            f"Unsupported keyframe_codec_mode={keyframe_codec_mode}. "
+            f"Expected {RAW_KEYFRAME_CODEC_MODE} or {QUANTIZED_INT8_KEYFRAME_CODEC_MODE}."
+        )
+    keyframe_quant_dtype = _as_str(codec_config, "keyframe_quant_dtype")
+    if keyframe_quant_dtype != "int8":
+        raise ValueError(f"keyframe_quant_dtype={keyframe_quant_dtype} is unsupported. Only int8 is implemented.")
+    keyframe_spatial_factor = _as_int(codec_config, "keyframe_spatial_factor")
+    if keyframe_spatial_factor < 1:
+        raise ValueError(f"keyframe_spatial_factor must be >= 1, got {keyframe_spatial_factor}.")
     tail_codec_type = _tail_codec_type(codec_config)
     if tail_codec_type not in {TRILINEAR_TAIL_CODEC_TYPE, LEARNED_TAIL_CODEC_TYPE}:
         raise ValueError(
@@ -180,6 +200,56 @@ def decode_refresh_anchor(anchor_payload: Dict[str, object]) -> torch.Tensor:
         (original_shape[1], original_shape[2], original_shape[3]),
     ).squeeze(0)
     return restored_anchor.float().contiguous()
+
+
+def encode_global_keyframe(global_keyframe: torch.Tensor, codec_config, move_to_cpu: bool = True):
+    if global_keyframe.ndim != 4:
+        raise ValueError(f"Expected global_keyframe with shape [C, T, H, W], got {tuple(global_keyframe.shape)}.")
+    if global_keyframe.shape[1] != 1:
+        raise ValueError(f"Expected a single-frame global keyframe, got shape {tuple(global_keyframe.shape)}.")
+
+    keyframe_codec_mode = _keyframe_codec_mode(codec_config)
+    if keyframe_codec_mode == RAW_KEYFRAME_CODEC_MODE:
+        keyframe_dtype = torch.float16 if _as_str(codec_config, "keyframe_dtype") == "float16" else torch.float32
+        return _maybe_to_cpu(global_keyframe.to(dtype=keyframe_dtype), move_to_cpu)
+
+    reduced_keyframe = global_keyframe
+    keyframe_spatial_factor = _as_int(codec_config, "keyframe_spatial_factor")
+    if keyframe_spatial_factor > 1:
+        reduced_keyframe = trilinear_resize(
+            global_keyframe.unsqueeze(0),
+            (
+                global_keyframe.shape[1],
+                max(1, math.ceil(global_keyframe.shape[2] / keyframe_spatial_factor)),
+                max(1, math.ceil(global_keyframe.shape[3] / keyframe_spatial_factor)),
+            ),
+        ).squeeze(0)
+    payload = _encode_quantized_block(
+        reduced_keyframe,
+        _as_str(codec_config, "keyframe_quant_dtype"),
+        move_to_cpu=move_to_cpu,
+    )
+    payload["original_shape"] = [int(value) for value in global_keyframe.shape]
+    payload["keyframe_codec_mode"] = keyframe_codec_mode
+    payload["quant_dtype"] = _as_str(codec_config, "keyframe_quant_dtype")
+    return payload
+
+
+def decode_global_keyframe(global_keyframe_payload) -> torch.Tensor:
+    if isinstance(global_keyframe_payload, torch.Tensor):
+        return global_keyframe_payload.float().contiguous()
+    if not isinstance(global_keyframe_payload, dict):
+        raise TypeError(f"Unsupported global_keyframe payload type: {type(global_keyframe_payload)!r}.")
+
+    original_shape = tuple(int(value) for value in global_keyframe_payload["original_shape"])
+    reduced_keyframe = _decode_quantized_block(global_keyframe_payload)
+    if tuple(reduced_keyframe.shape) == original_shape:
+        return reduced_keyframe.float().contiguous()
+    restored_keyframe = trilinear_resize(
+        reduced_keyframe.unsqueeze(0),
+        (original_shape[1], original_shape[2], original_shape[3]),
+    ).squeeze(0)
+    return restored_keyframe.float().contiguous()
 
 
 def encode_section_tail_residual(
@@ -289,10 +359,16 @@ def decode_section_tail_residual(
 
 def estimate_anchor_plus_tail_codec_bytes(codec_payload: Dict[str, object]) -> int:
     total_bytes = 0
-    for key in ("global_keyframe",):
-        value = codec_payload.get(key)
-        if isinstance(value, torch.Tensor):
-            total_bytes += value.numel() * value.element_size()
+    global_keyframe = codec_payload.get("global_keyframe")
+    if isinstance(global_keyframe, torch.Tensor):
+        total_bytes += global_keyframe.numel() * global_keyframe.element_size()
+    elif isinstance(global_keyframe, dict):
+        for tensor_key in ("quantized", "scales"):
+            value = global_keyframe.get(tensor_key)
+            if isinstance(value, torch.Tensor):
+                total_bytes += value.numel() * value.element_size()
+        for shape_key in ("reduced_shape", "original_shape"):
+            total_bytes += len(global_keyframe.get(shape_key, [])) * 4
 
     for payload_key in ("section_anchor_payloads", "section_tail_payloads"):
         for payload in codec_payload.get(payload_key, []):
@@ -339,8 +415,11 @@ def encode_anchor_plus_tail_latents(
             f"Expected clean_full_latents with shape [C, T, H, W], got {tuple(clean_full_latents.shape)}."
         )
 
-    keyframe_dtype = torch.float16 if _as_str(codec_config, "keyframe_dtype") == "float16" else torch.float32
-    global_keyframe = clean_full_latents[:, :1].to(keyframe_dtype).contiguous()
+    global_keyframe = encode_global_keyframe(
+        clean_full_latents[:, :1].contiguous(),
+        codec_config,
+        move_to_cpu=move_to_cpu,
+    )
     section_ranges = make_section_ranges(
         total_latent_frames=int(clean_full_latents.shape[1]),
         section_span_latents=_as_int(codec_config, "section_span_latents"),
@@ -380,7 +459,7 @@ def encode_anchor_plus_tail_latents(
     codec_payload = {
         "chunk_lengths": [int(length) for length in chunk_lengths],
         "codec_config": dict(codec_config) if isinstance(codec_config, dict) else None,
-        "global_keyframe": _maybe_to_cpu(global_keyframe, move_to_cpu),
+        "global_keyframe": global_keyframe,
         "section_ranges": [(int(start), int(end)) for start, end in section_ranges],
         "section_anchor_payloads": section_anchor_payloads,
         "section_tail_payloads": section_tail_payloads,
@@ -395,7 +474,7 @@ def encode_anchor_plus_tail_latents(
 
 
 def decode_anchor_plus_tail_latents(codec_payload: Dict[str, object], learned_tail_codec=None) -> torch.Tensor:
-    global_keyframe = codec_payload["global_keyframe"].float()
+    global_keyframe = decode_global_keyframe(codec_payload["global_keyframe"])
     target_device = _module_device(learned_tail_codec) or global_keyframe.device
     global_keyframe = global_keyframe.to(device=target_device, dtype=torch.float32)
     section_ranges = [tuple(int(value) for value in section_range) for section_range in codec_payload["section_ranges"]]

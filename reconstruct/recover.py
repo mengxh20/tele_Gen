@@ -39,6 +39,8 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, UMT5EncoderModel
 
 from reconstruct.codec_gop import (
+    QUANTIZED_INT8_KEYFRAME_CODEC_MODE,
+    RAW_KEYFRAME_CODEC_MODE,
     TRILINEAR_TAIL_CODEC_TYPE,
     decode_low_latents_payload,
     encode_anchor_plus_tail_latents,
@@ -71,6 +73,9 @@ DEFAULT_TEMPORAL_FACTOR = 2
 DEFAULT_SPATIAL_FACTOR = 4
 DEFAULT_QUANT_DTYPE = "int8"
 DEFAULT_KEYFRAME_DTYPE = "float16"
+DEFAULT_KEYFRAME_CODEC_MODE = RAW_KEYFRAME_CODEC_MODE
+DEFAULT_KEYFRAME_QUANT_DTYPE = "int8"
+DEFAULT_KEYFRAME_SPATIAL_FACTOR = 1
 DEFAULT_HISTORY_SIZES = [3, 1, 1]
 DEFAULT_LATENT_WINDOW_SIZE = 3  # Helios的VAE中4帧视频压缩成一个latent时间步，所以其实一个latent对应4帧,最终对应原视频的关系是 (DEFAULT_ANCHOR_SPAN_LATENTS + (DEFAULT_LATENT_WINDOW_SIZE - 1) * 4 = 原视频帧数)
 DEFAULT_SECTION_SPAN_LATENTS = DEFAULT_LATENT_WINDOW_SIZE
@@ -122,6 +127,9 @@ class CodecConfig:
     spatial_factor: int = DEFAULT_SPATIAL_FACTOR
     quant_dtype: str = DEFAULT_QUANT_DTYPE
     keyframe_dtype: str = DEFAULT_KEYFRAME_DTYPE
+    keyframe_codec_mode: str = DEFAULT_KEYFRAME_CODEC_MODE
+    keyframe_quant_dtype: str = DEFAULT_KEYFRAME_QUANT_DTYPE
+    keyframe_spatial_factor: int = DEFAULT_KEYFRAME_SPATIAL_FACTOR
     section_span_latents: int = DEFAULT_SECTION_SPAN_LATENTS
     anchor_span_latents: int = DEFAULT_ANCHOR_SPAN_LATENTS
     tail_span_latents: int = DEFAULT_TAIL_SPAN_LATENTS
@@ -330,6 +338,14 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--spatial_factor", type=int, default=DEFAULT_SPATIAL_FACTOR)
     parser.add_argument("--quant_dtype", type=str, default=DEFAULT_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--keyframe_dtype", type=str, default=DEFAULT_KEYFRAME_DTYPE, choices=["float16", "float32"])
+    parser.add_argument(
+        "--keyframe_codec_mode",
+        type=str,
+        default=DEFAULT_KEYFRAME_CODEC_MODE,
+        choices=[RAW_KEYFRAME_CODEC_MODE, QUANTIZED_INT8_KEYFRAME_CODEC_MODE],
+    )
+    parser.add_argument("--keyframe_quant_dtype", type=str, default=DEFAULT_KEYFRAME_QUANT_DTYPE, choices=["int8"])
+    parser.add_argument("--keyframe_spatial_factor", type=int, default=DEFAULT_KEYFRAME_SPATIAL_FACTOR)
     parser.add_argument("--section_span_latents", type=int, default=None)
     parser.add_argument("--anchor_span_latents", type=int, default=DEFAULT_ANCHOR_SPAN_LATENTS)
     parser.add_argument("--tail_span_latents", type=int, default=None)
@@ -1497,6 +1513,9 @@ def build_codec_config(args: argparse.Namespace) -> CodecConfig:
         spatial_factor=args.spatial_factor,
         quant_dtype=args.quant_dtype,
         keyframe_dtype=args.keyframe_dtype,
+        keyframe_codec_mode=args.keyframe_codec_mode,
+        keyframe_quant_dtype=args.keyframe_quant_dtype,
+        keyframe_spatial_factor=args.keyframe_spatial_factor,
         section_span_latents=section_span_latents,
         anchor_span_latents=anchor_span_latents,
         tail_span_latents=tail_span_latents,
@@ -3072,6 +3091,9 @@ def build_recover_config(
         "section_span_latents": codec_config.section_span_latents,
         "anchor_span_latents": codec_config.anchor_span_latents,
         "tail_span_latents": codec_config.tail_span_latents,
+        "keyframe_codec_mode": codec_config.keyframe_codec_mode,
+        "keyframe_quant_dtype": codec_config.keyframe_quant_dtype,
+        "keyframe_spatial_factor": codec_config.keyframe_spatial_factor,
         "anchor_quant_dtype": codec_config.anchor_quant_dtype,
         "anchor_spatial_factor": codec_config.anchor_spatial_factor,
         "tail_codec_type": codec_config.tail_codec_type,
@@ -3305,6 +3327,12 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
         "tail_span_latents",
         int(config.get("tail_span_latents", codec_config["section_span_latents"] - codec_config["anchor_span_latents"])),
     )
+    codec_config.setdefault("keyframe_codec_mode", config.get("keyframe_codec_mode", DEFAULT_KEYFRAME_CODEC_MODE))
+    codec_config.setdefault("keyframe_quant_dtype", config.get("keyframe_quant_dtype", DEFAULT_KEYFRAME_QUANT_DTYPE))
+    codec_config.setdefault(
+        "keyframe_spatial_factor",
+        int(config.get("keyframe_spatial_factor", DEFAULT_KEYFRAME_SPATIAL_FACTOR)),
+    )
     codec_config.setdefault("anchor_quant_dtype", config.get("anchor_quant_dtype", DEFAULT_ANCHOR_QUANT_DTYPE))
     codec_config.setdefault("anchor_spatial_factor", int(config.get("anchor_spatial_factor", DEFAULT_ANCHOR_SPATIAL_FACTOR)))
     codec_config.setdefault("tail_codec_type", config.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
@@ -3319,6 +3347,9 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["section_span_latents"] = int(codec_config["section_span_latents"])
     config["anchor_span_latents"] = int(codec_config["anchor_span_latents"])
     config["tail_span_latents"] = int(codec_config["tail_span_latents"])
+    config["keyframe_codec_mode"] = str(codec_config["keyframe_codec_mode"])
+    config["keyframe_quant_dtype"] = str(codec_config["keyframe_quant_dtype"])
+    config["keyframe_spatial_factor"] = int(codec_config["keyframe_spatial_factor"])
     config["anchor_quant_dtype"] = codec_config["anchor_quant_dtype"]
     config["anchor_spatial_factor"] = int(codec_config["anchor_spatial_factor"])
     config["tail_codec_type"] = str(codec_config["tail_codec_type"])

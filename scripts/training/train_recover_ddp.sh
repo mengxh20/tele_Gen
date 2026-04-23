@@ -15,6 +15,20 @@ export NUM_PROCESSES_PER_MACHINE="${NUM_PROCESSES_PER_MACHINE:-${NPROC_PER_NODE}
 export ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE:-scripts/accelerate_configs/multi_node_example_zero3.yaml}"
 export NUM_PROCESSES="$((NUM_MACHINES * NUM_PROCESSES_PER_MACHINE))"
 
+# Aggressive low-bitrate defaults. Override any of these from the shell when needed.
+export TEMPORAL_FACTOR="${TEMPORAL_FACTOR:-4}"
+export SPATIAL_FACTOR="${SPATIAL_FACTOR:-8}"
+export SECTION_SPAN_LATENTS="${SECTION_SPAN_LATENTS:-5}"
+export ANCHOR_SPAN_LATENTS="${ANCHOR_SPAN_LATENTS:-1}"
+export ANCHOR_SPATIAL_FACTOR="${ANCHOR_SPATIAL_FACTOR:-2}"
+export KEYFRAME_CODEC_MODE="${KEYFRAME_CODEC_MODE:-quantized_int8}"
+export KEYFRAME_QUANT_DTYPE="${KEYFRAME_QUANT_DTYPE:-int8}"
+export KEYFRAME_SPATIAL_FACTOR="${KEYFRAME_SPATIAL_FACTOR:-2}"
+export RATE_LOSS_WEIGHT="${RATE_LOSS_WEIGHT:-2.0}"
+export RATE_LOSS_WARMUP_STEPS="${RATE_LOSS_WARMUP_STEPS:-0}"
+export RATE_LOSS_RAMP_STEPS="${RATE_LOSS_RAMP_STEPS:-0}"
+export ENTROPY_AUX_LEARNING_RATE="${ENTROPY_AUX_LEARNING_RATE:-1e-3}"
+
 accelerate launch \
     --config_file "${ACCELERATE_CONFIG_FILE}" \
     --num_machines "${NUM_MACHINES}" \
@@ -23,12 +37,21 @@ accelerate launch \
     --main_process_ip "${MASTER_ADDR}" \
     --main_process_port "${MASTER_PORT}" \
     reconstruct/recover.py train \
-    --output_dir "reconstruct/gen2recon_runs_HE2E" \
+    --output_dir "reconstruct/gen2recon_runs_HE2E_2" \
     --batch_size 2 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 4 \
     --epochs 500 \
-    --rate_loss_weight 1.0 \
-    --rate_loss_warmup_steps 200 \
-    --rate_loss_ramp_steps 1000 \
-    --entropy_aux_learning_rate 1e-3 \
+    --temporal_factor "${TEMPORAL_FACTOR}" \
+    --spatial_factor "${SPATIAL_FACTOR}" \
+    --latent_window_size "${SECTION_SPAN_LATENTS}" \
+    --section_span_latents "${SECTION_SPAN_LATENTS}" \
+    --anchor_span_latents "${ANCHOR_SPAN_LATENTS}" \
+    --anchor_spatial_factor "${ANCHOR_SPATIAL_FACTOR}" \
+    --keyframe_codec_mode "${KEYFRAME_CODEC_MODE}" \
+    --keyframe_quant_dtype "${KEYFRAME_QUANT_DTYPE}" \
+    --keyframe_spatial_factor "${KEYFRAME_SPATIAL_FACTOR}" \
+    --rate_loss_weight "${RATE_LOSS_WEIGHT}" \
+    --rate_loss_warmup_steps "${RATE_LOSS_WARMUP_STEPS}" \
+    --rate_loss_ramp_steps "${RATE_LOSS_RAMP_STEPS}" \
+    --entropy_aux_learning_rate "${ENTROPY_AUX_LEARNING_RATE}" \
     "$@"

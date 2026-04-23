@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Inference uses torchrun multi-process sample sharding:
 # each rank handles a subset of input latent files instead of splitting one sample across GPUs.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 export NNODES="${NNODES:-1}"
 export NODE_RANK="${NODE_RANK:-0}"
@@ -13,7 +13,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export MAX_SAMPLES="${MAX_SAMPLES:-4}" # 推理4个样本看看就够了
 
 
-SAVEDIR="reconstruct/gen2recon_runs_HE2E"
+SAVEDIR="reconstruct/gen2recon_runs_HE2E_2"
 INFER_ARGS=(
     reconstruct/recover.py infer
     --checkpoint_dir "${SAVEDIR}/checkpoints"
@@ -39,7 +39,8 @@ torchrun \
 # python reconstruct/decoder.py -R ${SAVEDIR}/recover_outputs
 
 # 推理完之后自动走接收端链路：
-# low_latents -> recover network -> recover_latents -> video
+# enc_latents(.bin) -> entropy decode -> low_latents -> recover network -> recover_latents -> video
 python reconstruct/real_decoder.py \
     -R "${SAVEDIR}/recover_outputs" \
+    --input_dir "${SAVEDIR}/recover_outputs/enc_latents" \
     --checkpoint_dir "${SAVEDIR}/checkpoints"
