@@ -43,10 +43,24 @@ def _as_float(codec_config, key: str, default: float) -> float:
     return float(_get_optional_config_value(codec_config, key, default))
 
 
+def _as_optional_float(codec_config, key: str) -> Optional[float]:
+    value = _get_optional_config_value(codec_config, key, None)
+    if value is None:
+        return None
+    return float(value)
+
+
 def _tail_codec_type(codec_config) -> str:
     if isinstance(codec_config, dict):
         return str(codec_config.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
     return str(getattr(codec_config, "tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
+
+
+def _dual_tail_anchor_spatial_factor(codec_config) -> Optional[int]:
+    value = _get_optional_config_value(codec_config, "dual_tail_anchor_spatial_factor", None)
+    if value is None:
+        return None
+    return int(value)
 
 
 def _maybe_to_cpu(tensor: torch.Tensor, move_to_cpu: bool) -> torch.Tensor:
@@ -71,6 +85,7 @@ def validate_codec_config(codec_config) -> None:
     temporal_factor = _as_int(codec_config, "temporal_factor")
     spatial_factor = _as_int(codec_config, "spatial_factor")
     anchor_spatial_factor = _as_int(codec_config, "anchor_spatial_factor")
+    dual_tail_anchor_spatial_factor = _dual_tail_anchor_spatial_factor(codec_config)
 
     if section_span_latents < 1:
         raise ValueError(f"section_span_latents must be >= 1, got {section_span_latents}.")
@@ -89,6 +104,11 @@ def validate_codec_config(codec_config) -> None:
             f"got temporal_factor={temporal_factor}, spatial_factor={spatial_factor}, "
             f"anchor_spatial_factor={anchor_spatial_factor}."
         )
+    if dual_tail_anchor_spatial_factor is not None and dual_tail_anchor_spatial_factor < 1:
+        raise ValueError(
+            "dual_tail_anchor_spatial_factor must be >= 1 when set, "
+            f"got {dual_tail_anchor_spatial_factor}."
+        )
     for key in ("quant_dtype", "anchor_quant_dtype"):
         value = _as_str(codec_config, key)
         if value != "int8":
@@ -102,6 +122,9 @@ def validate_codec_config(codec_config) -> None:
             f"Unsupported tail_codec_type={tail_codec_type}. "
             f"Expected {TRILINEAR_TAIL_CODEC_TYPE} or {LEARNED_TAIL_CODEC_TYPE}."
         )
+    target_low_bpp = _as_optional_float(codec_config, "target_low_bpp")
+    if target_low_bpp is not None and target_low_bpp <= 0.0:
+        raise ValueError(f"target_low_bpp must be > 0 when set, got {target_low_bpp}.")
 
 
 def make_section_ranges(
@@ -164,13 +187,22 @@ def _decode_quantized_block(payload: Dict[str, object]) -> torch.Tensor:
     )
 
 
-def encode_refresh_anchor(anchor_latents: torch.Tensor, codec_config, move_to_cpu: bool = True) -> Dict[str, object]:
+def encode_refresh_anchor(
+    anchor_latents: torch.Tensor,
+    codec_config,
+    move_to_cpu: bool = True,
+    spatial_factor_override: Optional[int] = None,
+) -> Dict[str, object]:
     if anchor_latents.ndim != 4:
         raise ValueError(f"Expected anchor latents with shape [C, T, H, W], got {tuple(anchor_latents.shape)}.")
     if anchor_latents.shape[1] == 0:
         raise ValueError("Anchor latents must contain at least one time step.")
 
-    anchor_spatial_factor = _as_int(codec_config, "anchor_spatial_factor")
+    anchor_spatial_factor = (
+        int(spatial_factor_override)
+        if spatial_factor_override is not None
+        else _as_int(codec_config, "anchor_spatial_factor")
+    )
     anchor_quant_dtype = _as_str(codec_config, "anchor_quant_dtype")
 
     reduced_anchor = anchor_latents
@@ -332,20 +364,57 @@ def _estimate_refresh_anchor_bytes(anchor_payload: Dict[str, object]) -> int:
     return int(total_bytes)
 
 
-def _select_section_mode(
+def _analyze_section_mode_candidates(
     section_latents: torch.Tensor,
     history_latents: torch.Tensor,
     codec_config,
     sections_since_refresh: int,
+    move_to_cpu: bool = True,
 ) -> Dict[str, object]:
     section_length = int(section_latents.shape[1])
     anchor_span = _section_anchor_span(section_length, codec_config)
-    head_block = (0, section_latents[:, :anchor_span].contiguous())
+    head_clean_block = (0, section_latents[:, :anchor_span].contiguous())
     tail_start = max(0, section_length - anchor_span)
-    tail_block = (tail_start, section_latents[:, tail_start:].contiguous())
-    dual_blocks = [head_block]
+    tail_clean_block = (tail_start, section_latents[:, tail_start:].contiguous())
+
+    head_payload = encode_refresh_anchor(head_clean_block[1], codec_config, move_to_cpu=move_to_cpu)
+    head_decoded_block = (
+        int(head_clean_block[0]),
+        decode_refresh_anchor(head_payload).to(device=section_latents.device, dtype=torch.float32),
+    )
+    single_decoded_blocks = [head_decoded_block]
+    single_encoded_blocks = [
+        {
+            "start": int(head_clean_block[0]),
+            "length": int(head_clean_block[1].shape[1]),
+            "payload": head_payload,
+            "bytes": _estimate_refresh_anchor_bytes(head_payload),
+        }
+    ]
+
+    dual_decoded_blocks = list(single_decoded_blocks)
+    dual_encoded_blocks = list(single_encoded_blocks)
     if tail_start >= anchor_span and tail_start < section_length:
-        dual_blocks.append(tail_block)
+        tail_payload = encode_refresh_anchor(
+            tail_clean_block[1],
+            codec_config,
+            move_to_cpu=move_to_cpu,
+            spatial_factor_override=_dual_tail_anchor_spatial_factor(codec_config),
+        )
+        dual_decoded_blocks.append(
+            (
+                int(tail_clean_block[0]),
+                decode_refresh_anchor(tail_payload).to(device=section_latents.device, dtype=torch.float32),
+            )
+        )
+        dual_encoded_blocks.append(
+            {
+                "start": int(tail_clean_block[0]),
+                "length": int(tail_clean_block[1].shape[1]),
+                "payload": tail_payload,
+                "bytes": _estimate_refresh_anchor_bytes(tail_payload),
+            }
+        )
 
     none_prediction = _build_proxy_section_from_history(
         history_latents,
@@ -355,12 +424,12 @@ def _select_section_mode(
     single_prediction = _build_proxy_section_from_history(
         history_latents,
         tuple(int(value) for value in section_latents.shape),
-        [head_block],
+        single_decoded_blocks,
     )
     dual_prediction = _build_proxy_section_from_history(
         history_latents,
         tuple(int(value) for value in section_latents.shape),
-        dual_blocks,
+        dual_decoded_blocks,
     )
 
     error_none = _compute_proxy_error(none_prediction, section_latents)
@@ -368,6 +437,7 @@ def _select_section_mode(
     error_dual = _compute_proxy_error(dual_prediction, section_latents)
     gain_single = max(0.0, error_none - error_single)
     gain_dual = max(0.0, error_single - error_dual)
+    gain_predict_to_dual = max(0.0, error_none - error_dual)
     gain_ratio_single = gain_single / max(error_none, EPS)
     gain_ratio_dual = gain_dual / max(error_single, EPS)
     boundary_jump_l1 = _compute_boundary_jump_l1(history_latents, section_latents)
@@ -404,7 +474,235 @@ def _select_section_mode(
     )
 
     force_single = sections_since_refresh >= max_gap or boundary_jump_l1 >= boundary_jump_threshold
-    prefer_dual = boundary_jump_l1 >= cut_detection_threshold and len(dual_blocks) > 1
+    force_dual = boundary_jump_l1 >= cut_detection_threshold and len(dual_decoded_blocks) > 1
+
+    minimum_mode = PREDICT_ONLY_SECTION_MODE
+    if force_dual:
+        minimum_mode = DUAL_REFRESH_SECTION_MODE
+    elif force_single:
+        minimum_mode = SINGLE_REFRESH_SECTION_MODE
+
+    return {
+        "minimum_mode": minimum_mode,
+        "clean_blocks_by_mode": {
+            PREDICT_ONLY_SECTION_MODE: [],
+            SINGLE_REFRESH_SECTION_MODE: [(int(head_clean_block[0]), head_clean_block[1].contiguous())],
+            DUAL_REFRESH_SECTION_MODE: [
+                (int(block_start), block_latents.contiguous())
+                for block_start, block_latents in (
+                    [(int(head_clean_block[0]), head_clean_block[1])]
+                    + (
+                        [(int(tail_clean_block[0]), tail_clean_block[1])]
+                        if len(dual_decoded_blocks) > 1
+                        else []
+                    )
+                )
+            ],
+        },
+        "decoded_blocks_by_mode": {
+            PREDICT_ONLY_SECTION_MODE: [],
+            SINGLE_REFRESH_SECTION_MODE: list(single_decoded_blocks),
+            DUAL_REFRESH_SECTION_MODE: list(dual_decoded_blocks),
+        },
+        "encoded_blocks_by_mode": {
+            PREDICT_ONLY_SECTION_MODE: [],
+            SINGLE_REFRESH_SECTION_MODE: list(single_encoded_blocks),
+            DUAL_REFRESH_SECTION_MODE: list(dual_encoded_blocks),
+        },
+        "mode_total_anchor_bytes": {
+            PREDICT_ONLY_SECTION_MODE: 0,
+            SINGLE_REFRESH_SECTION_MODE: sum(
+                int(anchor_block["bytes"]) + 8 for anchor_block in single_encoded_blocks
+            ),
+            DUAL_REFRESH_SECTION_MODE: sum(
+                int(anchor_block["bytes"]) + 8 for anchor_block in dual_encoded_blocks
+            ),
+        },
+        "heuristic_scores": {
+            "error_none": float(error_none),
+            "error_single": float(error_single),
+            "error_dual": float(error_dual),
+            "gain_single": float(gain_single),
+            "gain_dual": float(gain_dual),
+            "gain_predict_to_dual": float(gain_predict_to_dual),
+            "gain_ratio_single": float(gain_ratio_single),
+            "gain_ratio_dual": float(gain_ratio_dual),
+            "boundary_jump_l1": float(boundary_jump_l1),
+        },
+    }
+
+
+def _select_section_mode_from_analysis(
+    section_analysis: Dict[str, object],
+    codec_config,
+) -> str:
+    heuristic_scores = section_analysis["heuristic_scores"]
+    gain_ratio_single = float(heuristic_scores["gain_ratio_single"])
+    gain_ratio_dual = float(heuristic_scores["gain_ratio_dual"])
+    minimum_mode = str(section_analysis["minimum_mode"])
+
+    single_gain_threshold = _as_float(
+        codec_config,
+        "single_refresh_gain_threshold",
+        DEFAULT_SINGLE_REFRESH_GAIN_THRESHOLD,
+    )
+    dual_gain_threshold = _as_float(
+        codec_config,
+        "dual_refresh_gain_threshold",
+        DEFAULT_DUAL_REFRESH_GAIN_THRESHOLD,
+    )
+
+    if minimum_mode == DUAL_REFRESH_SECTION_MODE:
+        return DUAL_REFRESH_SECTION_MODE
+    if minimum_mode == SINGLE_REFRESH_SECTION_MODE:
+        if gain_ratio_dual >= dual_gain_threshold and len(section_analysis["decoded_blocks_by_mode"][DUAL_REFRESH_SECTION_MODE]) > 1:
+            return DUAL_REFRESH_SECTION_MODE
+        return SINGLE_REFRESH_SECTION_MODE
+    if gain_ratio_single < single_gain_threshold:
+        return PREDICT_ONLY_SECTION_MODE
+    if gain_ratio_dual >= dual_gain_threshold and len(section_analysis["decoded_blocks_by_mode"][DUAL_REFRESH_SECTION_MODE]) > 1:
+        return DUAL_REFRESH_SECTION_MODE
+    return SINGLE_REFRESH_SECTION_MODE
+
+
+def _select_section_mode(
+    section_latents: torch.Tensor,
+    history_latents: torch.Tensor,
+    codec_config,
+    sections_since_refresh: int,
+    move_to_cpu: bool = True,
+) -> Dict[str, object]:
+    section_analysis = _analyze_section_mode_candidates(
+        section_latents=section_latents,
+        history_latents=history_latents,
+        codec_config=codec_config,
+        sections_since_refresh=sections_since_refresh,
+        move_to_cpu=move_to_cpu,
+    )
+    mode = _select_section_mode_from_analysis(section_analysis, codec_config)
+    return {
+        "mode": mode,
+        "anchor_blocks": list(section_analysis["decoded_blocks_by_mode"][mode]),
+        "encoded_anchor_blocks": list(section_analysis["encoded_blocks_by_mode"][mode]),
+        "heuristic_scores": dict(section_analysis["heuristic_scores"]),
+    }
+
+
+def _estimate_budget_fixed_bytes(
+    global_keyframe: torch.Tensor,
+    chunk_lengths: Sequence[int],
+    section_ranges: Sequence[Tuple[int, int]],
+    section_analyses: Sequence[Dict[str, object]],
+) -> int:
+    total_bytes = 0
+    total_bytes += global_keyframe.numel() * global_keyframe.element_size()
+    metadata_values: List[int] = [len(chunk_lengths)]
+    metadata_values.extend(int(value) for value in chunk_lengths)
+    for start, end in section_ranges:
+        metadata_values.extend([int(start), int(end)])
+    total_bytes += len(metadata_values) * 4
+    for section_analysis in section_analyses:
+        total_bytes += 4  # mode id
+        total_bytes += len(section_analysis["heuristic_scores"]) * 4
+    return int(total_bytes)
+
+
+def _resolve_budget_target_bytes(total_pixels: Optional[int], target_low_bpp: Optional[float]) -> Optional[int]:
+    if total_pixels is None or target_low_bpp is None:
+        return None
+    if total_pixels <= 0:
+        raise ValueError(f"total_pixels must be > 0 when target_low_bpp is set, got {total_pixels}.")
+    return max(0, int(math.floor(float(target_low_bpp) * float(total_pixels) / 8.0)))
+
+
+def _allocate_section_modes_with_budget(
+    section_analyses: Sequence[Dict[str, object]],
+    codec_config,
+    global_keyframe: torch.Tensor,
+    chunk_lengths: Sequence[int],
+    section_ranges: Sequence[Tuple[int, int]],
+    total_pixels: int,
+) -> Dict[str, object]:
+    target_low_bpp = _as_optional_float(codec_config, "target_low_bpp")
+    target_low_bytes = _resolve_budget_target_bytes(total_pixels, target_low_bpp)
+    if target_low_bytes is None:
+        raise ValueError("Budget allocation requires target_low_bpp and total_pixels.")
+
+    selected_modes = [str(section_analysis["minimum_mode"]) for section_analysis in section_analyses]
+    fixed_bytes = _estimate_budget_fixed_bytes(global_keyframe, chunk_lengths, section_ranges, section_analyses)
+    current_bytes = fixed_bytes + sum(
+        int(section_analysis["mode_total_anchor_bytes"][mode])
+        for section_analysis, mode in zip(section_analyses, selected_modes)
+    )
+
+    while current_bytes < target_low_bytes:
+        best_candidate = None
+        for section_index, section_analysis in enumerate(section_analyses):
+            current_mode = selected_modes[section_index]
+            heuristic_scores = section_analysis["heuristic_scores"]
+            mode_total_anchor_bytes = section_analysis["mode_total_anchor_bytes"]
+
+            candidates: List[Tuple[str, float, int]] = []
+            if current_mode == PREDICT_ONLY_SECTION_MODE:
+                single_extra_bytes = int(mode_total_anchor_bytes[SINGLE_REFRESH_SECTION_MODE])
+                if single_extra_bytes > 0:
+                    candidates.append(
+                        (
+                            SINGLE_REFRESH_SECTION_MODE,
+                            float(heuristic_scores["gain_single"]),
+                            single_extra_bytes,
+                        )
+                    )
+                if len(section_analysis["decoded_blocks_by_mode"][DUAL_REFRESH_SECTION_MODE]) > 1:
+                    dual_extra_bytes = int(mode_total_anchor_bytes[DUAL_REFRESH_SECTION_MODE])
+                    if dual_extra_bytes > 0:
+                        candidates.append(
+                            (
+                                DUAL_REFRESH_SECTION_MODE,
+                                float(heuristic_scores["gain_predict_to_dual"]),
+                                dual_extra_bytes,
+                            )
+                        )
+            elif current_mode == SINGLE_REFRESH_SECTION_MODE:
+                if len(section_analysis["decoded_blocks_by_mode"][DUAL_REFRESH_SECTION_MODE]) > 1:
+                    dual_extra_bytes = int(
+                        mode_total_anchor_bytes[DUAL_REFRESH_SECTION_MODE]
+                        - mode_total_anchor_bytes[SINGLE_REFRESH_SECTION_MODE]
+                    )
+                    if dual_extra_bytes > 0:
+                        candidates.append(
+                            (
+                                DUAL_REFRESH_SECTION_MODE,
+                                float(heuristic_scores["gain_dual"]),
+                                dual_extra_bytes,
+                            )
+                        )
+
+            for next_mode, gain_value, extra_bytes in candidates:
+                if gain_value <= 0.0:
+                    continue
+                if current_bytes + extra_bytes > target_low_bytes:
+                    continue
+                utility = gain_value / max(float(extra_bytes), 1.0)
+                if best_candidate is None:
+                    best_candidate = (utility, gain_value, -extra_bytes, section_index, next_mode, extra_bytes)
+                    continue
+                if (utility, gain_value, -extra_bytes) > best_candidate[:3]:
+                    best_candidate = (utility, gain_value, -extra_bytes, section_index, next_mode, extra_bytes)
+
+        if best_candidate is None:
+            break
+        _utility, _gain_value, _neg_extra_bytes, section_index, next_mode, extra_bytes = best_candidate
+        selected_modes[section_index] = next_mode
+        current_bytes += int(extra_bytes)
+
+    return {
+        "selected_modes": selected_modes,
+        "target_low_bpp": target_low_bpp,
+        "target_low_bytes": target_low_bytes,
+        "estimated_selected_bytes": int(current_bytes),
+        "estimated_fixed_bytes": int(fixed_bytes),
+    }
 
     if not force_single and gain_ratio_single < single_gain_threshold:
         mode = PREDICT_ONLY_SECTION_MODE
@@ -586,9 +884,12 @@ def encode_anchor_plus_tail_latents(
     clean_full_latents: torch.Tensor,
     codec_config,
     chunk_lengths: Sequence[int],
+    total_pixels: Optional[int] = None,
     learned_tail_codec=None,
     use_ste_quant: bool = False,
     move_to_cpu: bool = True,
+    train_mixed_dual_tail_spatial_factor: Optional[int] = None,
+    train_mixed_dual_tail_ratio: float = 0.0,
 ) -> Dict[str, object]:
     validate_codec_config(codec_config)
     if clean_full_latents.ndim != 4:
@@ -604,46 +905,98 @@ def encode_anchor_plus_tail_latents(
         start_index=1,
     )
 
+    target_low_bpp = _as_optional_float(codec_config, "target_low_bpp")
     decoded_history = global_keyframe.float()
     sections_since_refresh = 0
-    section_payloads: List[Dict[str, object]] = []
+    section_analyses: List[Dict[str, object]] = []
     for section_start, section_end in section_ranges:
         section_latents = clean_full_latents[:, section_start:section_end]
-        selection = _select_section_mode(
+        section_analysis = _analyze_section_mode_candidates(
             section_latents=section_latents,
             history_latents=decoded_history,
             codec_config=codec_config,
             sections_since_refresh=sections_since_refresh,
+            move_to_cpu=move_to_cpu,
         )
+        section_analyses.append(section_analysis)
 
-        encoded_anchor_blocks: List[Dict[str, object]] = []
-        decoded_anchor_blocks: List[Tuple[int, torch.Tensor]] = []
-        for block_start, anchor_latents in selection["anchor_blocks"]:
-            anchor_payload = encode_refresh_anchor(anchor_latents, codec_config, move_to_cpu=move_to_cpu)
-            decoded_anchor = decode_refresh_anchor(anchor_payload)
-            encoded_anchor_blocks.append(
-                {
-                    "start": int(block_start),
-                    "length": int(anchor_latents.shape[1]),
-                    "payload": anchor_payload,
-                    "bytes": _estimate_refresh_anchor_bytes(anchor_payload),
-                }
-            )
-            decoded_anchor_blocks.append((int(block_start), decoded_anchor))
-
+        baseline_mode = str(section_analysis["minimum_mode"])
         decoded_section = _build_proxy_section_from_history(
             history_latents=decoded_history,
             section_shape=tuple(int(value) for value in section_latents.shape),
-            anchor_blocks=decoded_anchor_blocks,
+            anchor_blocks=section_analysis["decoded_blocks_by_mode"][baseline_mode],
         )
         decoded_history = torch.cat([decoded_history, decoded_section.float()], dim=1).contiguous()
-        sections_since_refresh = 0 if encoded_anchor_blocks else sections_since_refresh + 1
+        sections_since_refresh = 0 if baseline_mode != PREDICT_ONLY_SECTION_MODE else sections_since_refresh + 1
 
+    if target_low_bpp is not None:
+        budget_result = _allocate_section_modes_with_budget(
+            section_analyses=section_analyses,
+            codec_config=codec_config,
+            global_keyframe=global_keyframe,
+            chunk_lengths=chunk_lengths,
+            section_ranges=section_ranges,
+            total_pixels=0 if total_pixels is None else int(total_pixels),
+        )
+        selected_modes = list(budget_result["selected_modes"])
+        mode_selection_strategy = "budget"
+    else:
+        selected_modes = [
+            _select_section_mode_from_analysis(section_analysis, codec_config)
+            for section_analysis in section_analyses
+        ]
+        budget_result = {
+            "selected_modes": selected_modes,
+            "target_low_bpp": None,
+            "target_low_bytes": None,
+            "estimated_selected_bytes": None,
+            "estimated_fixed_bytes": None,
+        }
+        mode_selection_strategy = "threshold"
+
+    section_payloads: List[Dict[str, object]] = []
+    cheap_tail_factor = (
+        None
+        if train_mixed_dual_tail_spatial_factor is None
+        else int(train_mixed_dual_tail_spatial_factor)
+    )
+    cheap_tail_ratio = float(train_mixed_dual_tail_ratio)
+    for section_analysis, selected_mode in zip(section_analyses, selected_modes):
+        encoded_anchor_blocks = list(section_analysis["encoded_blocks_by_mode"][selected_mode])
+        dual_tail_fidelity = None
+        if selected_mode == DUAL_REFRESH_SECTION_MODE:
+            dual_tail_fidelity = "full"
+            if (
+                cheap_tail_factor is not None
+                and cheap_tail_factor > 1
+                and cheap_tail_ratio > 0.0
+                and len(encoded_anchor_blocks) > 1
+                and len(section_analysis["clean_blocks_by_mode"][DUAL_REFRESH_SECTION_MODE]) > 1
+                and float(torch.rand((), device=clean_full_latents.device).item()) < cheap_tail_ratio
+            ):
+                tail_block_start, tail_clean_latents = section_analysis["clean_blocks_by_mode"][
+                    DUAL_REFRESH_SECTION_MODE
+                ][-1]
+                cheap_tail_payload = encode_refresh_anchor(
+                    tail_clean_latents,
+                    codec_config,
+                    move_to_cpu=move_to_cpu,
+                    spatial_factor_override=cheap_tail_factor,
+                )
+                encoded_anchor_blocks = list(encoded_anchor_blocks)
+                encoded_anchor_blocks[-1] = {
+                    "start": int(tail_block_start),
+                    "length": int(tail_clean_latents.shape[1]),
+                    "payload": cheap_tail_payload,
+                    "bytes": _estimate_refresh_anchor_bytes(cheap_tail_payload),
+                }
+                dual_tail_fidelity = f"cheap_x{cheap_tail_factor}"
         section_payloads.append(
             {
-                "mode": str(selection["mode"]),
+                "mode": str(selected_mode),
                 "anchor_blocks": encoded_anchor_blocks,
-                "heuristic_scores": dict(selection["heuristic_scores"]),
+                "heuristic_scores": dict(section_analysis["heuristic_scores"]),
+                "dual_tail_fidelity": dual_tail_fidelity,
             }
         )
 
@@ -653,6 +1006,11 @@ def encode_anchor_plus_tail_latents(
         "global_keyframe": _maybe_to_cpu(global_keyframe, move_to_cpu),
         "section_ranges": [(int(start), int(end)) for start, end in section_ranges],
         "section_payloads": section_payloads,
+        "mode_selection_strategy": mode_selection_strategy,
+        "target_low_bpp": budget_result["target_low_bpp"],
+        "target_low_bytes": budget_result["target_low_bytes"],
+        "estimated_selected_bytes": budget_result["estimated_selected_bytes"],
+        "estimated_fixed_bytes": budget_result["estimated_fixed_bytes"],
     }
 
 

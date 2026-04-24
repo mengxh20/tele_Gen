@@ -44,6 +44,9 @@ from reconstruct.codec_gop import (
     DEFAULT_DUAL_REFRESH_GAIN_THRESHOLD,
     DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS,
     DEFAULT_SINGLE_REFRESH_GAIN_THRESHOLD,
+    DUAL_REFRESH_SECTION_MODE,
+    PREDICT_ONLY_SECTION_MODE,
+    SINGLE_REFRESH_SECTION_MODE,
     TRILINEAR_TAIL_CODEC_TYPE,
     decode_low_latents_payload,
     encode_anchor_plus_tail_latents,
@@ -82,12 +85,14 @@ DEFAULT_ANCHOR_SPAN_LATENTS = 1
 DEFAULT_TAIL_SPAN_LATENTS = DEFAULT_SECTION_SPAN_LATENTS - DEFAULT_ANCHOR_SPAN_LATENTS
 DEFAULT_ANCHOR_QUANT_DTYPE = "int8"
 DEFAULT_ANCHOR_SPATIAL_FACTOR = 1
+DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR: Optional[int] = None
 DEFAULT_TAIL_CODEC_TYPE = TRILINEAR_TAIL_CODEC_TYPE
 DEFAULT_MAX_PREDICT_ONLY_GAP = DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS
 DEFAULT_SINGLE_REFRESH_GAIN = DEFAULT_SINGLE_REFRESH_GAIN_THRESHOLD
 DEFAULT_DUAL_REFRESH_GAIN = DEFAULT_DUAL_REFRESH_GAIN_THRESHOLD
 DEFAULT_BOUNDARY_JUMP = DEFAULT_BOUNDARY_JUMP_THRESHOLD
 DEFAULT_CUT_DETECTION = DEFAULT_CUT_DETECTION_THRESHOLD
+DEFAULT_TARGET_LOW_BPP: Optional[float] = None
 DEFAULT_NUM_INFERENCE_STEPS = 30
 DEFAULT_WEIGHT_DTYPE = "bf16"
 DEFAULT_LEARNING_RATE = 1e-5
@@ -103,6 +108,8 @@ DEFAULT_AUX_LOSS_WARMUP_STEPS = 500
 DEFAULT_AUX_LOSS_RAMP_STEPS = 1000
 DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT = 0.1
 DEFAULT_FIX_ANCHOR_DURING_DENOISE = True
+DEFAULT_SOFT_TAIL_HINT_STRENGTH = 0.35
+DEFAULT_SOFT_TAIL_HINT_STEP_FRACTION = 0.5
 DEFAULT_LOW_LATENT_FORMAT_VERSION = LOW_LATENT_FORMAT_V4
 RECOVER_CONFIG_VERSION = "helios_recover_v4"
 LEARNED_CODEC_CHECKPOINT_NAME = "learned_codec.pt"
@@ -110,6 +117,11 @@ LATEST_CHECKPOINT_LINK_NAME = "latest"
 LATEST_CHECKPOINT_POINTER_NAME = "latest_checkpoint.txt"
 EPS = 1e-8
 REQUIRED_BASE_MODEL_SUBDIRS = ("tokenizer", "text_encoder", "transformer", "scheduler")
+VALID_SECTION_MODES = {
+    PREDICT_ONLY_SECTION_MODE,
+    SINGLE_REFRESH_SECTION_MODE,
+    DUAL_REFRESH_SECTION_MODE,
+}
 
 
 @dataclass
@@ -135,6 +147,7 @@ class CodecConfig:
     tail_span_latents: int = DEFAULT_TAIL_SPAN_LATENTS
     anchor_quant_dtype: str = DEFAULT_ANCHOR_QUANT_DTYPE
     anchor_spatial_factor: int = DEFAULT_ANCHOR_SPATIAL_FACTOR
+    dual_tail_anchor_spatial_factor: Optional[int] = DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR
     tail_codec_type: str = DEFAULT_TAIL_CODEC_TYPE
     learned_codec_hidden_channels: Optional[int] = None
     max_predict_only_gap_sections: int = DEFAULT_MAX_PREDICT_ONLY_GAP
@@ -142,6 +155,7 @@ class CodecConfig:
     dual_refresh_gain_threshold: float = DEFAULT_DUAL_REFRESH_GAIN
     boundary_jump_threshold: float = DEFAULT_BOUNDARY_JUMP
     cut_detection_threshold: float = DEFAULT_CUT_DETECTION
+    target_low_bpp: Optional[float] = DEFAULT_TARGET_LOW_BPP
 
 
 @dataclass
@@ -317,6 +331,12 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
         help="Training output directory. Please pass from launch script.",
     )
     parser.add_argument("--base_model_path", type=str, default=DEFAULT_BASE_MODEL_PATH)
+    parser.add_argument(
+        "--init_checkpoint_dir",
+        type=Path,
+        default=None,
+        help="Optional recover checkpoint directory used to initialize the model for continued fine-tuning.",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -345,11 +365,35 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tail_span_latents", type=int, default=None)
     parser.add_argument("--anchor_quant_dtype", type=str, default=DEFAULT_ANCHOR_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--anchor_spatial_factor", type=int, default=DEFAULT_ANCHOR_SPATIAL_FACTOR)
+    parser.add_argument(
+        "--dual_tail_anchor_spatial_factor",
+        type=int,
+        default=DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR,
+        help="Optional spatial downsample factor applied only to the tail anchor in dual-refresh sections.",
+    )
     parser.add_argument("--max_predict_only_gap_sections", type=int, default=DEFAULT_MAX_PREDICT_ONLY_GAP)
     parser.add_argument("--single_refresh_gain_threshold", type=float, default=DEFAULT_SINGLE_REFRESH_GAIN)
     parser.add_argument("--dual_refresh_gain_threshold", type=float, default=DEFAULT_DUAL_REFRESH_GAIN)
     parser.add_argument("--boundary_jump_threshold", type=float, default=DEFAULT_BOUNDARY_JUMP)
     parser.add_argument("--cut_detection_threshold", type=float, default=DEFAULT_CUT_DETECTION)
+    parser.add_argument(
+        "--target_low_bpp",
+        type=float,
+        default=DEFAULT_TARGET_LOW_BPP,
+        help="Optional low-bpp target used by budget-driven sparse refresh allocation.",
+    )
+    parser.add_argument(
+        "--train_mixed_dual_tail_spatial_factor",
+        type=int,
+        default=None,
+        help="Optional cheap-tail spatial factor used only during training for dual-refresh tail augmentation.",
+    )
+    parser.add_argument(
+        "--train_mixed_dual_tail_ratio",
+        type=float,
+        default=0.0,
+        help="Probability of replacing a dual-refresh tail anchor with the cheap-tail variant during training.",
+    )
     parser.add_argument(
         "--tail_codec_type",
         type=str,
@@ -393,6 +437,18 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_FIX_ANCHOR_DURING_DENOISE,
     )
+    parser.add_argument(
+        "--soft_tail_hint_strength",
+        type=float,
+        default=DEFAULT_SOFT_TAIL_HINT_STRENGTH,
+        help="Soft blend strength used for dual-refresh tail hints during training and inference.",
+    )
+    parser.add_argument(
+        "--soft_tail_hint_step_fraction",
+        type=float,
+        default=DEFAULT_SOFT_TAIL_HINT_STEP_FRACTION,
+        help="Fraction of denoising steps that receive dual-refresh soft tail hints during inference.",
+    )
 
 
 def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
@@ -423,10 +479,52 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_NUM_INFERENCE_STEPS,
     )
     parser.add_argument(
+        "--dual_tail_anchor_spatial_factor",
+        type=int,
+        default=DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR,
+        help="Optional spatial downsample factor applied only to the tail anchor in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--target_low_bpp",
+        type=float,
+        default=DEFAULT_TARGET_LOW_BPP,
+        help="Optional low-bpp target used by budget-driven sparse refresh allocation.",
+    )
+    parser.add_argument(
+        "--predict_only_steps",
+        type=int,
+        default=None,
+        help="Override denoising steps for predict-only sections. Defaults to --steps when unset.",
+    )
+    parser.add_argument(
+        "--single_refresh_steps",
+        type=int,
+        default=None,
+        help="Override denoising steps for single-refresh sections. Defaults to --steps when unset.",
+    )
+    parser.add_argument(
+        "--dual_refresh_steps",
+        type=int,
+        default=None,
+        help="Override denoising steps for dual-refresh sections. Defaults to --steps when unset.",
+    )
+    parser.add_argument(
         "--max_samples",
         type=int,
         default=None,
         help="Only run inference on the first N latent files before distributed sharding.",
+    )
+    parser.add_argument(
+        "--soft_tail_hint_strength",
+        type=float,
+        default=None,
+        help="Override soft blend strength used for dual-refresh tail hints. Defaults to the checkpoint setting.",
+    )
+    parser.add_argument(
+        "--soft_tail_hint_step_fraction",
+        type=float,
+        default=None,
+        help="Override the fraction of denoising steps that receive dual-refresh soft tail hints.",
     )
 
 
@@ -553,6 +651,41 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError(f"aux_loss_ramp_steps must be >= 0, got {args.aux_loss_ramp_steps}.")
     if args.num_inference_steps <= 0:
         raise ValueError(f"num_inference_steps must be > 0, got {args.num_inference_steps}.")
+    target_low_bpp = getattr(args, "target_low_bpp", DEFAULT_TARGET_LOW_BPP)
+    if target_low_bpp is not None and float(target_low_bpp) <= 0.0:
+        raise ValueError(f"target_low_bpp must be > 0, got {target_low_bpp}.")
+    train_mixed_dual_tail_ratio = float(getattr(args, "train_mixed_dual_tail_ratio", 0.0))
+    if not 0.0 <= train_mixed_dual_tail_ratio <= 1.0:
+        raise ValueError(
+            f"train_mixed_dual_tail_ratio must be in [0, 1], got {train_mixed_dual_tail_ratio}."
+        )
+    train_mixed_dual_tail_spatial_factor = getattr(args, "train_mixed_dual_tail_spatial_factor", None)
+    if train_mixed_dual_tail_spatial_factor is not None and int(train_mixed_dual_tail_spatial_factor) < 1:
+        raise ValueError(
+            "train_mixed_dual_tail_spatial_factor must be >= 1 when set, "
+            f"got {train_mixed_dual_tail_spatial_factor}."
+        )
+    dual_tail_anchor_spatial_factor = getattr(
+        args,
+        "dual_tail_anchor_spatial_factor",
+        DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR,
+    )
+    if dual_tail_anchor_spatial_factor is not None and int(dual_tail_anchor_spatial_factor) < 1:
+        raise ValueError(
+            "dual_tail_anchor_spatial_factor must be >= 1 when set, "
+            f"got {dual_tail_anchor_spatial_factor}."
+        )
+    soft_tail_hint_strength = float(getattr(args, "soft_tail_hint_strength", DEFAULT_SOFT_TAIL_HINT_STRENGTH))
+    if soft_tail_hint_strength < 0.0:
+        raise ValueError(f"soft_tail_hint_strength must be >= 0, got {soft_tail_hint_strength}.")
+    soft_tail_hint_step_fraction = float(
+        getattr(args, "soft_tail_hint_step_fraction", DEFAULT_SOFT_TAIL_HINT_STEP_FRACTION)
+    )
+    if not 0.0 <= soft_tail_hint_step_fraction <= 1.0:
+        raise ValueError(
+            "soft_tail_hint_step_fraction must be in [0, 1], "
+            f"got {soft_tail_hint_step_fraction}."
+        )
 
 
 def build_codec_run_tag(section_span_latents: int, anchor_span_latents: int, num_inference_steps: int) -> str:
@@ -733,6 +866,11 @@ def init_offline_wandb_run(
             "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
             "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
             "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
+            "soft_tail_hint_strength": args.soft_tail_hint_strength,
+            "soft_tail_hint_step_fraction": args.soft_tail_hint_step_fraction,
+            "init_checkpoint_dir": None if args.init_checkpoint_dir is None else str(args.init_checkpoint_dir.resolve()),
+            "train_mixed_dual_tail_spatial_factor": args.train_mixed_dual_tail_spatial_factor,
+            "train_mixed_dual_tail_ratio": args.train_mixed_dual_tail_ratio,
         },
         reinit=True,
     )
@@ -804,8 +942,14 @@ def command_train(args: argparse.Namespace) -> None:
     latent_window_size = codec_config.section_span_latents
     history_sizes = normalize_history_sizes(args.history_sizes)
     input_root, latent_paths = discover_input_latent_paths(args.input_path)
+    init_checkpoint_dir = None
+    init_checkpoint_config = None
+    if args.init_checkpoint_dir is not None:
+        init_checkpoint_dir = resolve_checkpoint_dir_for_inference(args.init_checkpoint_dir.resolve())
+        init_checkpoint_config = load_recover_config(init_checkpoint_dir)
     args.base_model_path = resolve_local_base_model_path(
         args.base_model_path,
+        checkpoint_path=None if init_checkpoint_config is None else init_checkpoint_config.get("base_model_path"),
         latent_paths=latent_paths,
     )
     # 联合优化时训练阶段不预先固化 low latents，而是保留 clean latents，后续在线压缩并反传。
@@ -840,17 +984,25 @@ def command_train(args: argparse.Namespace) -> None:
         base_model_path=args.base_model_path,
         device=device,
         weight_dtype=weight_dtype,
-        checkpoint_dir=None,
+        checkpoint_dir=init_checkpoint_dir,
         gradient_checkpointing=args.gradient_checkpointing,
+        freeze_after_load=False,
     )
     transformer.train()
     learned_tail_codec = None
     learned_codec_trainable_params = 0
     if codec_config.tail_codec_type == LEARNED_TAIL_CODEC_TYPE:
-        learned_tail_codec = build_learned_tail_codec(
-            codec_config=asdict(codec_config),
-            in_channels=infer_latent_channels(prepared_sequences),
-        ).to(device)
+        learned_tail_codec = load_learned_tail_codec(
+            checkpoint_dir=init_checkpoint_dir,
+            codec_config=codec_config,
+            latent_channels=infer_latent_channels(prepared_sequences),
+            device=device,
+        )
+        if learned_tail_codec is None:
+            learned_tail_codec = build_learned_tail_codec(
+                codec_config=asdict(codec_config),
+                in_channels=infer_latent_channels(prepared_sequences),
+            ).to(device)
         learned_tail_codec.train()
         learned_codec_trainable_params = count_trainable_parameters(learned_tail_codec)
     # transformer 继续走 Accelerate/DeepSpeed；learned codec 保持各 rank 本地副本，手动同步梯度。
@@ -890,10 +1042,14 @@ def command_train(args: argparse.Namespace) -> None:
             f"device={device} world_size={accelerator.num_processes} "
             f"effective_global_batch_size={args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps} "
             f"tail_codec_type={codec_config.tail_codec_type} "
+            f"init_checkpoint_dir={init_checkpoint_dir} "
             f"save_every_epochs={checkpoint_save_interval_epochs} "
             f"loss_weighting_scheme={args.loss_weighting_scheme} "
             f"flow/x/noise/delta=({args.flow_loss_weight:.3f}/{args.x_loss_weight:.3f}/{args.noise_loss_weight:.3f}/{args.temporal_delta_loss_weight:.3f}) "
-            f"aux_warmup={args.aux_loss_warmup_steps} aux_ramp={args.aux_loss_ramp_steps}"
+            f"aux_warmup={args.aux_loss_warmup_steps} aux_ramp={args.aux_loss_ramp_steps} "
+            f"mixed_dual_tail=({args.train_mixed_dual_tail_spatial_factor}, ratio={args.train_mixed_dual_tail_ratio:.3f}) "
+            f"soft_tail_hint=(strength={args.soft_tail_hint_strength:.3f}, "
+            f"step_fraction={args.soft_tail_hint_step_fraction:.3f})"
         )
     accelerator.wait_for_everyone()
 
@@ -925,7 +1081,12 @@ def command_train(args: argparse.Namespace) -> None:
         "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
         "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
         "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
+        "soft_tail_hint_strength": args.soft_tail_hint_strength,
+        "soft_tail_hint_step_fraction": args.soft_tail_hint_step_fraction,
         "tail_codec_type": codec_config.tail_codec_type,
+        "init_checkpoint_dir": None if init_checkpoint_dir is None else str(init_checkpoint_dir),
+        "train_mixed_dual_tail_spatial_factor": args.train_mixed_dual_tail_spatial_factor,
+        "train_mixed_dual_tail_ratio": args.train_mixed_dual_tail_ratio,
         "loss_definition": {
             "optimized_loss": (
                 "flow_loss_weight * tail_position_weighted_mse(flow_pred, noise-latent) + "
@@ -1027,6 +1188,9 @@ def command_train(args: argparse.Namespace) -> None:
                         temporal_delta_loss_weight=args.temporal_delta_loss_weight,
                         aux_loss_warmup_steps=args.aux_loss_warmup_steps,
                         aux_loss_ramp_steps=args.aux_loss_ramp_steps,
+                        soft_tail_hint_strength=args.soft_tail_hint_strength,
+                        train_mixed_dual_tail_spatial_factor=args.train_mixed_dual_tail_spatial_factor,
+                        train_mixed_dual_tail_ratio=args.train_mixed_dual_tail_ratio,
                         global_step=global_step,
                     )
                     accelerator.backward(step_output.loss)
@@ -1328,13 +1492,63 @@ def command_infer(args: argparse.Namespace) -> None:
         )
         if args.num_inference_steps <= 0:
             raise ValueError(f"--num_inference_steps must be > 0, got {args.num_inference_steps}.")
+        mode_inference_steps = resolve_mode_inference_steps(args, checkpoint_config)
         codec_config = CodecConfig(**checkpoint_config["codec_config"])
+        resolved_dual_tail_anchor_spatial_factor = resolve_infer_value(
+            cli_value=args.dual_tail_anchor_spatial_factor,
+            default_value=DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR,
+            checkpoint_value=checkpoint_config.get("codec_config", {}).get("dual_tail_anchor_spatial_factor"),
+        )
+        codec_config.dual_tail_anchor_spatial_factor = (
+            None
+            if resolved_dual_tail_anchor_spatial_factor is None
+            else int(resolved_dual_tail_anchor_spatial_factor)
+        )
+        if (
+            codec_config.dual_tail_anchor_spatial_factor is not None
+            and codec_config.dual_tail_anchor_spatial_factor < 1
+        ):
+            raise ValueError(
+                "--dual_tail_anchor_spatial_factor must be >= 1, "
+                f"got {codec_config.dual_tail_anchor_spatial_factor}."
+            )
+        resolved_target_low_bpp = resolve_infer_value(
+            cli_value=args.target_low_bpp,
+            default_value=DEFAULT_TARGET_LOW_BPP,
+            checkpoint_value=checkpoint_config.get("codec_config", {}).get("target_low_bpp"),
+        )
+        codec_config.target_low_bpp = (
+            None if resolved_target_low_bpp is None else float(resolved_target_low_bpp)
+        )
+        if codec_config.target_low_bpp is not None and codec_config.target_low_bpp <= 0.0:
+            raise ValueError(f"--target_low_bpp must be > 0, got {codec_config.target_low_bpp}.")
         history_sizes = normalize_history_sizes(checkpoint_config["history_sizes"])
         latent_window_size = int(checkpoint_config.get("section_span_latents", checkpoint_config["latent_window_size"]))
         anchor_span_latents = int(checkpoint_config.get("anchor_span_latents", codec_config.anchor_span_latents))
         fix_anchor_during_denoise = bool(
             checkpoint_config.get("fix_anchor_during_denoise", DEFAULT_FIX_ANCHOR_DURING_DENOISE)
         )
+        soft_tail_hint_strength = float(
+            resolve_infer_value(
+                cli_value=args.soft_tail_hint_strength,
+                default_value=DEFAULT_SOFT_TAIL_HINT_STRENGTH,
+                checkpoint_value=checkpoint_config.get("soft_tail_hint_strength"),
+            )
+        )
+        if soft_tail_hint_strength < 0.0:
+            raise ValueError(f"--soft_tail_hint_strength must be >= 0, got {soft_tail_hint_strength}.")
+        soft_tail_hint_step_fraction = float(
+            resolve_infer_value(
+                cli_value=args.soft_tail_hint_step_fraction,
+                default_value=DEFAULT_SOFT_TAIL_HINT_STEP_FRACTION,
+                checkpoint_value=checkpoint_config.get("soft_tail_hint_step_fraction"),
+            )
+        )
+        if not 0.0 <= soft_tail_hint_step_fraction <= 1.0:
+            raise ValueError(
+                "--soft_tail_hint_step_fraction must be in [0, 1], "
+                f"got {soft_tail_hint_step_fraction}."
+            )
         weight_dtype = parse_weight_dtype(str(weight_dtype_name))
 
         input_root, latent_paths = discover_input_latent_paths(args.input_path)
@@ -1370,6 +1584,13 @@ def command_infer(args: argparse.Namespace) -> None:
                 f"device={device} world_size={distributed_context.world_size} "
                 f"checkpoint_dir={checkpoint_dir}"
             )
+            print(f"[infer] mode_inference_steps={mode_inference_steps}")
+            print(f"[infer] dual_tail_anchor_spatial_factor={codec_config.dual_tail_anchor_spatial_factor}")
+            print(f"[infer] target_low_bpp={codec_config.target_low_bpp}")
+            print(
+                f"[infer] soft_tail_hint=(strength={soft_tail_hint_strength:.3f}, "
+                f"step_fraction={soft_tail_hint_step_fraction:.3f})"
+            )
             if checkpoint_dir != requested_checkpoint_dir:
                 print(f"[infer] resolved checkpoint request {requested_checkpoint_dir} -> {checkpoint_dir}")
         distributed_barrier(distributed_context)
@@ -1385,7 +1606,7 @@ def command_infer(args: argparse.Namespace) -> None:
         per_video_latency_seconds: List[float] = []
 
         for sample_idx, latent_path in enumerate(assigned_latent_paths, start=1):
-            sample_start_time = time.perf_counter()
+            sample_start_time = start_synced_timer(device)
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             print(
@@ -1393,7 +1614,8 @@ def command_infer(args: argparse.Namespace) -> None:
                 f"input={latent_path}"
             )
 
-            stage_prepare_start = time.perf_counter()
+            prepare_timing: Dict[str, float] = {}
+            stage_prepare_start = start_synced_timer(device)
             sequence = prepare_sequence(
                 latent_path,
                 codec_config,
@@ -1401,10 +1623,13 @@ def command_infer(args: argparse.Namespace) -> None:
                 materialize_low_latents=True,
                 use_ste_quant=False,
                 move_to_cpu=True,
+                timing_device=device,
+                timing=prepare_timing,
             )
-            stage_prepare_seconds = time.perf_counter() - stage_prepare_start
+            stage_prepare_seconds = stop_synced_timer(stage_prepare_start, device)
 
-            stage_reconstruct_start = time.perf_counter()
+            reconstruct_timing: Dict[str, object] = {}
+            stage_reconstruct_start = start_synced_timer(device)
             recovered_full_latents = reconstruct_sequence(
                 sequence=sequence,
                 transformer=transformer,
@@ -1416,13 +1641,19 @@ def command_infer(args: argparse.Namespace) -> None:
                 latent_window_size=latent_window_size,
                 anchor_span_latents=anchor_span_latents,
                 num_inference_steps=args.num_inference_steps,
+                mode_inference_steps=mode_inference_steps,
                 seed=args.seed,
                 fix_anchor_during_denoise=fix_anchor_during_denoise,
+                soft_tail_hint_strength=soft_tail_hint_strength,
+                soft_tail_hint_step_fraction=soft_tail_hint_step_fraction,
                 distributed_context=distributed_context,
+                timing=reconstruct_timing,
             )
-            stage_reconstruct_seconds = time.perf_counter() - stage_reconstruct_start
+            stage_reconstruct_seconds = stop_synced_timer(stage_reconstruct_start, device)
 
-            stage_postprocess_start = time.perf_counter()
+            postprocess_timing: Dict[str, float] = {}
+            stage_postprocess_start = start_synced_timer(device)
+            resolve_paths_start_time = start_synced_timer(device)
             low_latent_path, recover_latent_path, metrics_path = resolve_output_paths(
                 input_path=latent_path,
                 input_root=input_root,
@@ -1430,8 +1661,12 @@ def command_infer(args: argparse.Namespace) -> None:
                 recover_dir=recover_dir,
                 metrics_dir=metrics_dir,
             )
+            postprocess_timing["resolve_output_paths_seconds"] = stop_synced_timer(resolve_paths_start_time, device)
+            save_low_start_time = start_synced_timer(device)
             low_payload = build_low_latent_payload(sequence)
             torch.save(low_payload, low_latent_path)
+            postprocess_timing["build_and_save_low_latents_seconds"] = stop_synced_timer(save_low_start_time, device)
+            save_recover_start_time = start_synced_timer(device)
             ensure_finite_recover_state(
                 stage="final_output",
                 input_path=sequence.path,
@@ -1448,7 +1683,12 @@ def command_infer(args: argparse.Namespace) -> None:
                 checkpoint_dir=checkpoint_dir,
             )
             torch.save(recover_payload, recover_latent_path)
+            postprocess_timing["build_and_save_recover_latents_seconds"] = stop_synced_timer(
+                save_recover_start_time,
+                device,
+            )
 
+            metrics_compute_start_time = start_synced_timer(device)
             direct_low_metrics = compute_tensor_metrics(sequence.low_full_latents, sequence.clean_full_latents)
             restored_metrics = compute_tensor_metrics(recovered_full_latents, sequence.clean_full_latents)
             low_tail_position_metrics = compute_tail_position_metrics(
@@ -1495,8 +1735,7 @@ def command_infer(args: argparse.Namespace) -> None:
                 prediction=recovered_full_latents,
                 target=sequence.clean_full_latents,
             )
-            sample_total_seconds = time.perf_counter() - sample_start_time
-            stage_postprocess_seconds = time.perf_counter() - stage_postprocess_start
+            postprocess_timing["compute_metrics_seconds"] = stop_synced_timer(metrics_compute_start_time, device)
             gpu_peak_memory = None
             if device.type == "cuda":
                 gpu_peak_memory = {
@@ -1508,8 +1747,11 @@ def command_infer(args: argparse.Namespace) -> None:
                 if sequence.metadata.source_fps > 0
                 else 0.0
             )
-            realtime_factor = (
-                sample_total_seconds / source_duration_seconds if source_duration_seconds > 0.0 else None
+            first_section_ready_seconds = reconstruct_timing.get("first_section_ready_seconds")
+            first_non_keyframe_ready_seconds = (
+                None
+                if first_section_ready_seconds is None
+                else stage_prepare_seconds + float(first_section_ready_seconds)
             )
             metrics_payload = {
                 "input_path": str(sequence.path),
@@ -1534,17 +1776,47 @@ def command_infer(args: argparse.Namespace) -> None:
                 "codec_config": asdict(codec_config),
                 "checkpoint_dir": str(checkpoint_dir),
                 "num_inference_steps": args.num_inference_steps,
+                "num_inference_steps_by_mode": {key: int(value) for key, value in mode_inference_steps.items()},
+                "effective_inference_steps": count_effective_inference_steps(
+                    sequence.low_codec_payload,
+                    mode_inference_steps,
+                ),
+                "section_mode_counts": summarize_section_modes(sequence.low_codec_payload),
+                "mode_selection_strategy": sequence.low_codec_payload.get("mode_selection_strategy"),
+                "target_low_bpp": sequence.low_codec_payload.get("target_low_bpp"),
+                "target_low_bytes": sequence.low_codec_payload.get("target_low_bytes"),
+                "estimated_selected_bytes": sequence.low_codec_payload.get("estimated_selected_bytes"),
+                "estimated_fixed_bytes": sequence.low_codec_payload.get("estimated_fixed_bytes"),
                 "latency_seconds": {
-                    "total": sample_total_seconds,
+                    "total": None,
                     "prepare_low_latents": stage_prepare_seconds,
                     "reconstruct": stage_reconstruct_seconds,
-                    "postprocess_io_and_metrics": stage_postprocess_seconds,
+                    "postprocess_io_and_metrics": None,
+                    "first_keyframe_ready": stage_prepare_seconds,
+                    "first_non_keyframe_ready": first_non_keyframe_ready_seconds,
                 },
+                "prepare_timing_seconds": prepare_timing,
+                "reconstruct_timing": reconstruct_timing,
+                "postprocess_timing_seconds": postprocess_timing,
                 "gpu_peak_memory": gpu_peak_memory,
                 "source_duration_seconds": source_duration_seconds,
-                "realtime_factor": realtime_factor,
+                "realtime_factor": None,
             }
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            write_metrics_start_time = start_synced_timer(device)
+            with metrics_path.open("w", encoding="utf-8") as handle:
+                json.dump(metrics_payload, handle, indent=2)
+            postprocess_timing["write_metrics_json_seconds"] = stop_synced_timer(write_metrics_start_time, device)
+            stage_postprocess_seconds = stop_synced_timer(stage_postprocess_start, device)
+            sample_total_seconds = stop_synced_timer(sample_start_time, device)
+            postprocess_timing["total_seconds"] = stage_postprocess_seconds
+            metrics_payload["latency_seconds"]["total"] = sample_total_seconds
+            metrics_payload["latency_seconds"]["postprocess_io_and_metrics"] = stage_postprocess_seconds
+            metrics_payload["postprocess_timing_seconds"] = postprocess_timing
+            realtime_factor = (
+                sample_total_seconds / source_duration_seconds if source_duration_seconds > 0.0 else None
+            )
+            metrics_payload["realtime_factor"] = realtime_factor
             with metrics_path.open("w", encoding="utf-8") as handle:
                 json.dump(metrics_payload, handle, indent=2)
 
@@ -1555,13 +1827,18 @@ def command_infer(args: argparse.Namespace) -> None:
                 alloc_gib = gpu_peak_memory["max_memory_allocated_bytes"] / (1024 ** 3)
                 reserve_gib = gpu_peak_memory["max_memory_reserved_bytes"] / (1024 ** 3)
                 gpu_peak_mem_text = f"alloc={alloc_gib:.3f}GiB reserved={reserve_gib:.3f}GiB"
+            first_non_keyframe_text = (
+                "n/a" if first_non_keyframe_ready_seconds is None else f"{first_non_keyframe_ready_seconds:.3f}s"
+            )
 
             print(
                 f"[infer][rank={distributed_context.rank}] saved low={low_latent_path} recover={recover_latent_path} "
                 f"low_bpp={sequence.low_codec_payload['low_bpp']:.6f} "
+                f"effective_steps={metrics_payload['effective_inference_steps']} "
                 f"direct_low_l1={direct_low_metrics['l1']:.6f} restored_l1={restored_metrics['l1']:.6f} "
                 f"latency={sample_total_seconds:.3f}s (prepare={stage_prepare_seconds:.3f}s "
-                f"reconstruct={stage_reconstruct_seconds:.3f}s post={stage_postprocess_seconds:.3f}s) "
+                f"reconstruct={stage_reconstruct_seconds:.3f}s post={stage_postprocess_seconds:.3f}s "
+                f"first_non_keyframe={first_non_keyframe_text}) "
                 f"rtf={realtime_factor_text} gpu_peak={gpu_peak_mem_text}"
             )
 
@@ -1602,12 +1879,14 @@ def build_codec_config(args: argparse.Namespace) -> CodecConfig:
         tail_span_latents=tail_span_latents,
         anchor_quant_dtype=args.anchor_quant_dtype,
         anchor_spatial_factor=args.anchor_spatial_factor,
+        dual_tail_anchor_spatial_factor=getattr(args, "dual_tail_anchor_spatial_factor", DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR),
         tail_codec_type=args.tail_codec_type,
         max_predict_only_gap_sections=args.max_predict_only_gap_sections,
         single_refresh_gain_threshold=args.single_refresh_gain_threshold,
         dual_refresh_gain_threshold=args.dual_refresh_gain_threshold,
         boundary_jump_threshold=args.boundary_jump_threshold,
         cut_detection_threshold=args.cut_detection_threshold,
+        target_low_bpp=getattr(args, "target_low_bpp", DEFAULT_TARGET_LOW_BPP),
     )
     validate_codec_config(asdict(codec_config))
     return codec_config
@@ -1656,6 +1935,8 @@ def prepare_sequence(
     materialize_low_latents: bool = True,
     use_ste_quant: bool = False,
     move_to_cpu: bool = True,
+    timing_device: Optional[torch.device] = None,
+    timing: Optional[Dict[str, float]] = None,
 ) -> PreparedSequence:
     """把单个 latent 文件预处理成 recover 主链路需要的统一结构。
 
@@ -1666,6 +1947,8 @@ def prepare_sequence(
 
     这样训练与推理都能围绕同一份中间表示展开。
     """
+    prepare_start_time = start_synced_timer(timing_device) if timing is not None else None
+    load_start_time = start_synced_timer(timing_device) if timing is not None else None
     payload = load_payload(path)
     validate_payload(payload, path)
     clean_full_latents = flatten_latent_chunks(payload["latent_chunks"]).float().contiguous()
@@ -1694,9 +1977,21 @@ def prepare_sequence(
         metadata=metadata,
         clean_full_latents=clean_full_latents,
     )
+    load_seconds = (
+        stop_synced_timer(load_start_time, timing_device)
+        if load_start_time is not None
+        else None
+    )
     if not materialize_low_latents:
+        if timing is not None:
+            timing.clear()
+            timing["total_seconds"] = stop_synced_timer(prepare_start_time, timing_device)
+            timing["load_metadata_and_flatten_seconds"] = 0.0 if load_seconds is None else float(load_seconds)
+            timing["materialize_low_latents_seconds"] = 0.0
         return sequence
 
+    materialize_start_time = start_synced_timer(timing_device) if timing is not None else None
+    low_latent_timing: Dict[str, float] = {}
     low_codec_payload, low_full_latents = build_sequence_low_latents(
         sequence=sequence,
         codec_config=codec_config,
@@ -1704,9 +1999,21 @@ def prepare_sequence(
         device=None,
         use_ste_quant=use_ste_quant,
         move_to_cpu=move_to_cpu,
+        timing_device=timing_device,
+        timing=low_latent_timing if timing is not None else None,
     )
     sequence.low_codec_payload = low_codec_payload
     sequence.low_full_latents = low_full_latents
+    if timing is not None:
+        timing.clear()
+        timing["total_seconds"] = stop_synced_timer(prepare_start_time, timing_device)
+        timing["load_metadata_and_flatten_seconds"] = 0.0 if load_seconds is None else float(load_seconds)
+        timing["materialize_low_latents_seconds"] = (
+            0.0
+            if materialize_start_time is None
+            else stop_synced_timer(materialize_start_time, timing_device)
+        )
+        timing.update(low_latent_timing)
     return sequence
 
 
@@ -1731,8 +2038,14 @@ def build_sequence_low_latents(
     device: Optional[torch.device],
     use_ste_quant: bool,
     move_to_cpu: bool,
+    train_mixed_dual_tail_spatial_factor: Optional[int] = None,
+    train_mixed_dual_tail_ratio: float = 0.0,
+    timing_device: Optional[torch.device] = None,
+    timing: Optional[Dict[str, float]] = None,
 ) -> Tuple[Dict[str, object], torch.Tensor]:
+    build_start_time = start_synced_timer(timing_device) if timing is not None else None
     clean_full_latents = sequence.clean_full_latents
+    move_input_start_time = start_synced_timer(timing_device) if timing is not None else None
     if device is None and learned_tail_codec is not None:
         try:
             device = next(learned_tail_codec.parameters()).device
@@ -1742,15 +2055,29 @@ def build_sequence_low_latents(
         clean_full_latents = clean_full_latents.to(device=device, dtype=torch.float32)
     else:
         clean_full_latents = clean_full_latents.float()
+    move_input_seconds = (
+        stop_synced_timer(move_input_start_time, timing_device)
+        if move_input_start_time is not None
+        else None
+    )
 
     # 压缩到低码率模式，模拟真实传输时候的码率
+    encode_start_time = start_synced_timer(timing_device) if timing is not None else None
     low_codec_payload = encode_low_latents(
         clean_full_latents=clean_full_latents,
         codec_config=codec_config,
         chunk_lengths=sequence.metadata.chunk_lengths,
+        total_pixels=sequence.metadata.total_pixels,
         learned_tail_codec=learned_tail_codec,
         use_ste_quant=use_ste_quant,
         move_to_cpu=move_to_cpu,
+        train_mixed_dual_tail_spatial_factor=train_mixed_dual_tail_spatial_factor,
+        train_mixed_dual_tail_ratio=train_mixed_dual_tail_ratio,
+    )
+    encode_seconds = (
+        stop_synced_timer(encode_start_time, timing_device)
+        if encode_start_time is not None
+        else None
     )
     low_codec_payload["low_codec_bytes"] = estimate_low_codec_bytes(low_codec_payload)
     low_codec_payload["low_bpp"] = compute_bpp_from_total_pixels(
@@ -1758,12 +2085,33 @@ def build_sequence_low_latents(
         sequence.metadata.total_pixels,
     )
     # 讲latents恢复到原尺寸
+    decode_start_time = start_synced_timer(timing_device) if timing is not None else None
     low_full_latents = decode_low_latents(
         codec_payload=low_codec_payload,
         learned_tail_codec=learned_tail_codec,
     ).float().contiguous()
+    decode_seconds = (
+        stop_synced_timer(decode_start_time, timing_device)
+        if decode_start_time is not None
+        else None
+    )
+    move_output_start_time = start_synced_timer(timing_device) if timing is not None else None
     if move_to_cpu:
         low_full_latents = low_full_latents.cpu().contiguous()
+    move_output_seconds = (
+        stop_synced_timer(move_output_start_time, timing_device)
+        if move_output_start_time is not None
+        else None
+    )
+    if timing is not None:
+        timing.clear()
+        timing["total_seconds"] = stop_synced_timer(build_start_time, timing_device)
+        timing["move_clean_latents_to_device_seconds"] = (
+            0.0 if move_input_seconds is None else float(move_input_seconds)
+        )
+        timing["encode_low_latents_seconds"] = 0.0 if encode_seconds is None else float(encode_seconds)
+        timing["decode_low_latents_seconds"] = 0.0 if decode_seconds is None else float(decode_seconds)
+        timing["move_low_latents_to_cpu_seconds"] = 0.0 if move_output_seconds is None else float(move_output_seconds)
     return low_codec_payload, low_full_latents
 
 
@@ -1771,18 +2119,24 @@ def encode_low_latents(
     clean_full_latents: torch.Tensor,
     codec_config: CodecConfig,
     chunk_lengths: Sequence[int],
+    total_pixels: Optional[int] = None,
     learned_tail_codec: Optional[torch.nn.Module] = None,
     use_ste_quant: bool = False,
     move_to_cpu: bool = True,
+    train_mixed_dual_tail_spatial_factor: Optional[int] = None,
+    train_mixed_dual_tail_ratio: float = 0.0,
 ) -> Dict[str, object]:
     """把 clean latents 编码成 `x0 + sparse refresh events` 低码率载荷。"""
     codec_payload = encode_anchor_plus_tail_latents(
         clean_full_latents=clean_full_latents,
         codec_config=asdict(codec_config),
         chunk_lengths=chunk_lengths,
+        total_pixels=total_pixels,
         learned_tail_codec=learned_tail_codec,
         use_ste_quant=use_ste_quant,
         move_to_cpu=move_to_cpu,
+        train_mixed_dual_tail_spatial_factor=train_mixed_dual_tail_spatial_factor,
+        train_mixed_dual_tail_ratio=train_mixed_dual_tail_ratio,
     )
     codec_payload["codec_config"] = asdict(codec_config)
     codec_payload["format_version"] = DEFAULT_LOW_LATENT_FORMAT_VERSION
@@ -1826,6 +2180,24 @@ def estimate_low_codec_bytes(codec_payload: Dict[str, object]) -> int:
     metadata_values.extend(int(value) for value in codec_payload["original_remainder_shape"])
     total_bytes += len(metadata_values) * 4
     return int(total_bytes)
+
+
+def synchronize_device_for_timing(device: Optional[torch.device]) -> None:
+    """在需要时同步设备，避免 CUDA 异步导致的时延统计失真。"""
+    if device is not None and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def start_synced_timer(device: Optional[torch.device]) -> float:
+    """开启一个同步后的 wall-clock 计时器。"""
+    synchronize_device_for_timing(device)
+    return time.perf_counter()
+
+
+def stop_synced_timer(start_time: float, device: Optional[torch.device]) -> float:
+    """结束一个同步后的 wall-clock 计时器。"""
+    synchronize_device_for_timing(device)
+    return time.perf_counter() - start_time
 
 
 def extract_target_window(
@@ -1889,15 +2261,187 @@ def build_section_payload_lookup(codec_payload: Dict[str, object]) -> Dict[int, 
     return lookup
 
 
-def build_section_anchor_canvas_and_mask(
+def resolve_section_mode(section_payload: Optional[Dict[str, object]]) -> str:
+    """把 payload 中记录的 section mode 规范化为已知枚举。"""
+    if section_payload is None:
+        return SINGLE_REFRESH_SECTION_MODE
+    mode_name = str(section_payload.get("mode", SINGLE_REFRESH_SECTION_MODE)).strip()
+    if mode_name not in VALID_SECTION_MODES:
+        return SINGLE_REFRESH_SECTION_MODE
+    return mode_name
+
+
+def summarize_section_modes(codec_payload: Dict[str, object]) -> Dict[str, int]:
+    """统计当前视频各类 section mode 的数量。"""
+    counts = {
+        PREDICT_ONLY_SECTION_MODE: 0,
+        SINGLE_REFRESH_SECTION_MODE: 0,
+        DUAL_REFRESH_SECTION_MODE: 0,
+    }
+    section_payloads = codec_payload.get("section_payloads")
+    if isinstance(section_payloads, list) and section_payloads:
+        for section_payload in section_payloads:
+            counts[resolve_section_mode(section_payload)] += 1
+        return counts
+
+    for _section_range in codec_payload.get("section_ranges", []):
+        counts[SINGLE_REFRESH_SECTION_MODE] += 1
+    return counts
+
+
+def count_effective_inference_steps(codec_payload: Dict[str, object], mode_inference_steps: Dict[str, int]) -> int:
+    """根据 section mode 统计当前视频实际会执行的 denoise 步数。"""
+    total_steps = 0
+    section_payloads = codec_payload.get("section_payloads")
+    if isinstance(section_payloads, list) and section_payloads:
+        for section_payload in section_payloads:
+            total_steps += int(mode_inference_steps[resolve_section_mode(section_payload)])
+        return total_steps
+
+    return len(codec_payload.get("section_ranges", [])) * int(mode_inference_steps[SINGLE_REFRESH_SECTION_MODE])
+
+
+def build_section_anchor_blocks(
+    low_full_latents: torch.Tensor,
+    section_payload: Optional[Dict[str, object]],
+    section_start: int,
+    valid_target_frames: int,
+    anchor_span_latents: int,
+) -> List[Tuple[int, torch.Tensor]]:
+    """从 low latent / sparse payload 里提取当前 section 的 anchor block 列表。"""
+    anchor_blocks: List[Tuple[int, torch.Tensor]] = []
+    if section_payload is not None:
+        for anchor_block in section_payload.get("anchor_blocks", []):
+            block_start = int(anchor_block.get("start", 0))
+            block_length = int(anchor_block.get("length", 0))
+            if block_length <= 0 or block_start >= valid_target_frames:
+                continue
+            block_end = min(valid_target_frames, block_start + block_length)
+            source_start = section_start + block_start
+            source_end = section_start + block_end
+            anchor_values = low_full_latents[:, source_start:source_end]
+            if anchor_values.shape[1] == 0:
+                continue
+            anchor_blocks.append((block_start, anchor_values[:, : block_end - block_start].contiguous()))
+        if anchor_blocks:
+            return anchor_blocks
+
+    anchor_steps = min(anchor_span_latents, valid_target_frames)
+    if anchor_steps <= 0:
+        return anchor_blocks
+    anchor_values = low_full_latents[:, section_start : section_start + anchor_steps]
+    if anchor_values.shape[1] > 0:
+        anchor_blocks.append((0, anchor_values.contiguous()))
+    return anchor_blocks
+
+
+def predict_section_from_history(
+    history_latents: torch.Tensor,
+    section_shape: Tuple[int, int, int, int],
+) -> torch.Tensor:
+    """使用最后两帧历史做一个非常便宜的线性外推。"""
+    channel_count, section_length, height, width = section_shape
+    if section_length <= 0:
+        raise ValueError(f"section_length must be > 0, got {section_length}.")
+    if history_latents.ndim != 4:
+        raise ValueError(
+            f"Expected history_latents with shape [C, T, H, W], got {tuple(history_latents.shape)}."
+        )
+    if history_latents.shape[0] != channel_count:
+        raise ValueError(
+            f"History channel count {history_latents.shape[0]} does not match section channel count {channel_count}."
+        )
+
+    device = history_latents.device
+    if history_latents.shape[1] == 0:
+        return torch.zeros(section_shape, device=device, dtype=torch.float32)
+
+    last_frame = history_latents[:, -1:].float()
+    if history_latents.shape[1] >= 2:
+        delta = (history_latents[:, -1:] - history_latents[:, -2:-1]).float()
+    else:
+        delta = torch.zeros_like(last_frame, dtype=torch.float32)
+
+    steps = torch.arange(1, section_length + 1, device=device, dtype=torch.float32).view(1, section_length, 1, 1)
+    predicted = last_frame.expand(-1, section_length, -1, -1) + steps * delta.expand(-1, section_length, -1, -1)
+    if predicted.shape[2] != height or predicted.shape[3] != width:
+        predicted = torch.nn.functional.interpolate(
+            predicted.unsqueeze(0),
+            size=(section_length, height, width),
+            mode="trilinear",
+            align_corners=False,
+        ).squeeze(0)
+    return predicted.float().contiguous()
+
+
+def overlay_anchor_blocks(
+    section_prediction: torch.Tensor,
+    anchor_blocks: Sequence[Tuple[int, torch.Tensor]],
+) -> torch.Tensor:
+    """把 anchor block 覆写到 section 预测上。"""
+    updated = section_prediction.clone()
+    for block_start, block_latents in anchor_blocks:
+        if block_latents.ndim != 4:
+            raise ValueError(
+                f"Expected anchor block with shape [C, T, H, W], got {tuple(block_latents.shape)}."
+            )
+        block_length = int(block_latents.shape[1])
+        if block_length <= 0:
+            continue
+        updated[:, block_start : block_start + block_length] = block_latents.to(
+            device=updated.device,
+            dtype=updated.dtype,
+        )
+    return updated.contiguous()
+
+
+def interpolate_between_anchor_blocks(
+    section_prediction: torch.Tensor,
+    anchor_blocks: Sequence[Tuple[int, torch.Tensor]],
+) -> torch.Tensor:
+    """当存在头尾双 anchor 时，对中间 gap 做线性插值。"""
+    if len(anchor_blocks) < 2:
+        return section_prediction
+
+    updated = section_prediction.clone()
+    sorted_blocks = sorted(anchor_blocks, key=lambda item: int(item[0]))
+    for (left_start, left_block), (right_start, right_block) in zip(sorted_blocks[:-1], sorted_blocks[1:]):
+        left_end = int(left_start) + int(left_block.shape[1]) - 1
+        right_begin = int(right_start)
+        gap = right_begin - left_end - 1
+        if gap <= 0:
+            continue
+        left_frame = left_block[:, -1:].to(device=updated.device, dtype=updated.dtype)
+        right_frame = right_block[:, :1].to(device=updated.device, dtype=updated.dtype)
+        for offset in range(1, gap + 1):
+            alpha = float(offset) / float(gap + 1)
+            interpolated = (1.0 - alpha) * left_frame + alpha * right_frame
+            updated[:, left_end + offset : left_end + offset + 1] = interpolated
+    return updated.contiguous()
+
+
+def build_proxy_section_from_history(
+    history_latents: torch.Tensor,
+    section_shape: Tuple[int, int, int, int],
+    anchor_blocks: Sequence[Tuple[int, torch.Tensor]],
+) -> torch.Tensor:
+    """为 0-step / 超低步数场景构造一个安全的 section 代理结果。"""
+    prediction = predict_section_from_history(history_latents, section_shape)
+    prediction = overlay_anchor_blocks(prediction, anchor_blocks)
+    prediction = interpolate_between_anchor_blocks(prediction, anchor_blocks)
+    prediction = overlay_anchor_blocks(prediction, anchor_blocks)
+    return prediction.contiguous()
+
+
+def build_section_condition_canvases_and_masks(
     low_full_latents: torch.Tensor,
     section_payload: Optional[Dict[str, object]],
     section_start: int,
     valid_target_frames: int,
     latent_window_size: int,
     anchor_span_latents: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    anchor_canvas = torch.zeros(
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    hard_anchor_canvas = torch.zeros(
         low_full_latents.shape[0],
         latent_window_size,
         low_full_latents.shape[2],
@@ -1905,7 +2449,7 @@ def build_section_anchor_canvas_and_mask(
         device=low_full_latents.device,
         dtype=low_full_latents.dtype,
     )
-    anchor_mask = torch.zeros(
+    hard_anchor_mask = torch.zeros(
         1,
         latent_window_size,
         1,
@@ -1913,6 +2457,8 @@ def build_section_anchor_canvas_and_mask(
         device=low_full_latents.device,
         dtype=low_full_latents.dtype,
     )
+    soft_tail_canvas = torch.zeros_like(hard_anchor_canvas)
+    soft_tail_mask = torch.zeros_like(hard_anchor_mask)
 
     if section_payload is not None:
         for anchor_block in section_payload.get("anchor_blocks", []):
@@ -1926,17 +2472,103 @@ def build_section_anchor_canvas_and_mask(
             anchor_values = low_full_latents[:, source_start:source_end]
             if anchor_values.shape[1] == 0:
                 continue
-            anchor_canvas[:, block_start:block_end] = anchor_values[:, : block_end - block_start]
-            anchor_mask[:, block_start:block_end] = 1
-        return anchor_canvas.contiguous(), anchor_mask.contiguous()
+            target_canvas = hard_anchor_canvas if block_start == 0 else soft_tail_canvas
+            target_mask = hard_anchor_mask if block_start == 0 else soft_tail_mask
+            target_canvas[:, block_start:block_end] = anchor_values[:, : block_end - block_start]
+            target_mask[:, block_start:block_end] = 1
+        return (
+            hard_anchor_canvas.contiguous(),
+            hard_anchor_mask.contiguous(),
+            soft_tail_canvas.contiguous(),
+            soft_tail_mask.contiguous(),
+        )
 
     anchor_steps = min(anchor_span_latents, valid_target_frames)
     if anchor_steps <= 0:
-        return anchor_canvas.contiguous(), anchor_mask.contiguous()
+        return (
+            hard_anchor_canvas.contiguous(),
+            hard_anchor_mask.contiguous(),
+            soft_tail_canvas.contiguous(),
+            soft_tail_mask.contiguous(),
+        )
     anchor_values = low_full_latents[:, section_start : section_start + anchor_steps]
-    anchor_canvas[:, :anchor_steps] = anchor_values
-    anchor_mask[:, :anchor_steps] = 1
-    return anchor_canvas.contiguous(), anchor_mask.contiguous()
+    hard_anchor_canvas[:, :anchor_steps] = anchor_values
+    hard_anchor_mask[:, :anchor_steps] = 1
+    return (
+        hard_anchor_canvas.contiguous(),
+        hard_anchor_mask.contiguous(),
+        soft_tail_canvas.contiguous(),
+        soft_tail_mask.contiguous(),
+    )
+
+
+def build_section_anchor_canvas_and_mask(
+    low_full_latents: torch.Tensor,
+    section_payload: Optional[Dict[str, object]],
+    section_start: int,
+    valid_target_frames: int,
+    latent_window_size: int,
+    anchor_span_latents: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    hard_anchor_canvas, hard_anchor_mask, _soft_tail_canvas, _soft_tail_mask = (
+        build_section_condition_canvases_and_masks(
+            low_full_latents=low_full_latents,
+            section_payload=section_payload,
+            section_start=section_start,
+            valid_target_frames=valid_target_frames,
+            latent_window_size=latent_window_size,
+            anchor_span_latents=anchor_span_latents,
+        )
+    )
+    return hard_anchor_canvas, hard_anchor_mask
+
+
+def blend_soft_condition_latents(
+    latents: torch.Tensor,
+    condition_canvas: torch.Tensor,
+    condition_mask: torch.Tensor,
+    strength: torch.Tensor | float,
+) -> torch.Tensor:
+    if latents.shape != condition_canvas.shape:
+        raise ValueError(
+            f"Latent shape {tuple(latents.shape)} does not match condition canvas shape {tuple(condition_canvas.shape)}."
+        )
+    if condition_mask.ndim != 5:
+        raise ValueError(
+            f"Expected condition_mask with shape [B, 1, T, 1, 1], got {tuple(condition_mask.shape)}."
+        )
+    if float(condition_mask.sum().item()) <= 0.0:
+        return latents
+    if torch.is_tensor(strength):
+        strength_tensor = strength.to(device=latents.device, dtype=latents.dtype)
+    else:
+        strength_tensor = torch.tensor(float(strength), device=latents.device, dtype=latents.dtype)
+    if float(strength_tensor.max().item()) <= 0.0:
+        return latents
+    while strength_tensor.ndim < latents.ndim:
+        strength_tensor = strength_tensor.unsqueeze(-1)
+    expanded_mask = condition_mask.to(device=latents.device, dtype=latents.dtype).expand_as(latents)
+    condition_canvas = condition_canvas.to(device=latents.device, dtype=latents.dtype)
+    blend_weight = (expanded_mask * strength_tensor).clamp_(0.0, 1.0)
+    return (latents + (condition_canvas - latents) * blend_weight).contiguous()
+
+
+def compute_soft_tail_hint_schedule_strength(
+    *,
+    step_idx: int,
+    num_inference_steps: int,
+    base_strength: float,
+    step_fraction: float,
+) -> float:
+    if base_strength <= 0.0 or step_fraction <= 0.0 or num_inference_steps <= 0:
+        return 0.0
+    active_steps = max(1, int(math.ceil(float(num_inference_steps) * float(step_fraction))))
+    if step_idx >= active_steps:
+        return 0.0
+    if active_steps == 1:
+        return float(base_strength)
+    remaining = 1.0 - float(step_idx) / float(active_steps - 1)
+    return max(0.0, float(base_strength) * remaining)
 
 
 def build_anchor_distance_weights(
@@ -1984,6 +2616,8 @@ def build_training_batch_tensors(
     history_sizes: Sequence[int],
     latent_window_size: int,
     anchor_span_latents: int,
+    train_mixed_dual_tail_spatial_factor: Optional[int] = None,
+    train_mixed_dual_tail_ratio: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
     history_window_size = sum(int(value) for value in history_sizes)
     seq_indices_value = batch["seq_idx"]
@@ -2010,6 +2644,8 @@ def build_training_batch_tensors(
             device=device,
             use_ste_quant=codec_config.tail_codec_type == LEARNED_TAIL_CODEC_TYPE,
             move_to_cpu=False,
+            train_mixed_dual_tail_spatial_factor=train_mixed_dual_tail_spatial_factor,
+            train_mixed_dual_tail_ratio=train_mixed_dual_tail_ratio,
         )
         clean_latent_cache[seq_idx] = sequence.clean_full_latents.to(device=device, dtype=torch.float32).contiguous()
         low_latent_cache[seq_idx] = low_full_latents.to(device=device, dtype=torch.float32).contiguous()
@@ -2017,8 +2653,10 @@ def build_training_batch_tensors(
 
     history_latents: List[torch.Tensor] = []
     target_latents: List[torch.Tensor] = []
-    anchor_canvases: List[torch.Tensor] = []
-    anchor_masks: List[torch.Tensor] = []
+    hard_anchor_canvases: List[torch.Tensor] = []
+    hard_anchor_masks: List[torch.Tensor] = []
+    soft_tail_canvases: List[torch.Tensor] = []
+    soft_tail_masks: List[torch.Tensor] = []
     x0_latents: List[torch.Tensor] = []
     valid_target_frames: List[int] = []
     for seq_idx, section_start in zip(seq_indices, section_starts):
@@ -2035,7 +2673,12 @@ def build_training_batch_tensors(
             section_start=section_start,
             history_window_size=history_window_size,
         )
-        anchor_canvas, anchor_mask = build_section_anchor_canvas_and_mask(
+        (
+            hard_anchor_canvas,
+            hard_anchor_mask,
+            soft_tail_canvas,
+            soft_tail_mask,
+        ) = build_section_condition_canvases_and_masks(
             low_full_latents=low_full_latents,
             section_payload=section_payload,
             section_start=section_start,
@@ -2045,16 +2688,20 @@ def build_training_batch_tensors(
         )
         history_latents.append(history_latent)
         target_latents.append(target_latent)
-        anchor_canvases.append(anchor_canvas)
-        anchor_masks.append(anchor_mask)
+        hard_anchor_canvases.append(hard_anchor_canvas)
+        hard_anchor_masks.append(hard_anchor_mask)
+        soft_tail_canvases.append(soft_tail_canvas)
+        soft_tail_masks.append(soft_tail_mask)
         x0_latents.append(clean_full_latents[:, :1])
         valid_target_frames.append(valid_frames)
 
     return {
         "history_latents": torch.stack(history_latents, dim=0).contiguous(),
         "target_latents": torch.stack(target_latents, dim=0).contiguous(),
-        "section_anchor_canvas": torch.stack(anchor_canvases, dim=0).contiguous(),
-        "section_anchor_mask": torch.stack(anchor_masks, dim=0).contiguous(),
+        "section_hard_anchor_canvas": torch.stack(hard_anchor_canvases, dim=0).contiguous(),
+        "section_hard_anchor_mask": torch.stack(hard_anchor_masks, dim=0).contiguous(),
+        "section_soft_tail_canvas": torch.stack(soft_tail_canvases, dim=0).contiguous(),
+        "section_soft_tail_mask": torch.stack(soft_tail_masks, dim=0).contiguous(),
         "x0_latents": torch.stack(x0_latents, dim=0).contiguous(),
         "valid_target_frames": torch.tensor(valid_target_frames, device=device, dtype=torch.long),
     }
@@ -2067,6 +2714,7 @@ def load_transformer_bundle(
     checkpoint_dir: Optional[Path],
     gradient_checkpointing: bool,
     accelerator=None,
+    freeze_after_load: Optional[bool] = None,
 ) -> Tuple[torch.nn.Module, object, torch.Tensor]:
     """加载 recover 所需的 Helios transformer、scheduler 和空 prompt embedding。
 
@@ -2121,9 +2769,12 @@ def load_transformer_bundle(
         local_files_only=True,
     )
 
+    if freeze_after_load is None:
+        freeze_after_load = checkpoint_dir is not None
+
     if checkpoint_dir is None:
         # 训练模式：从 base transformer 初始化，后续参数参与优化。
-        transformer.requires_grad_(True)
+        transformer.requires_grad_(not freeze_after_load)
     else:
         state_dict_path = checkpoint_dir / "transformer_full.pt"
         if not state_dict_path.exists():
@@ -2135,8 +2786,7 @@ def load_transformer_bundle(
                 f"Unexpected state dict mismatch while loading {state_dict_path}: "
                 f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
             )
-        # 推理模式：只做前向恢复，不需要梯度。
-        transformer.requires_grad_(False)
+        transformer.requires_grad_(not freeze_after_load)
 
     if gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
@@ -2166,6 +2816,9 @@ def training_step(
     temporal_delta_loss_weight: float,
     aux_loss_warmup_steps: int,
     aux_loss_ramp_steps: int,
+    soft_tail_hint_strength: float,
+    train_mixed_dual_tail_spatial_factor: Optional[int],
+    train_mixed_dual_tail_ratio: float,
     global_step: int,
 ) -> TrainingStepOutput:
     """执行一次 recover 训练步。
@@ -2189,11 +2842,15 @@ def training_step(
         history_sizes=history_sizes,
         latent_window_size=latent_window_size,
         anchor_span_latents=anchor_span_latents,
+        train_mixed_dual_tail_spatial_factor=train_mixed_dual_tail_spatial_factor,
+        train_mixed_dual_tail_ratio=train_mixed_dual_tail_ratio,
     )
     history_latents = materialized_batch["history_latents"].to(dtype=weight_dtype)
     target_latents = materialized_batch["target_latents"].to(dtype=weight_dtype)
-    section_anchor_canvas = materialized_batch["section_anchor_canvas"].to(dtype=weight_dtype)
-    section_anchor_mask = materialized_batch["section_anchor_mask"].to(dtype=weight_dtype)
+    section_hard_anchor_canvas = materialized_batch["section_hard_anchor_canvas"].to(dtype=weight_dtype)
+    section_hard_anchor_mask = materialized_batch["section_hard_anchor_mask"].to(dtype=weight_dtype)
+    section_soft_tail_canvas = materialized_batch["section_soft_tail_canvas"].to(dtype=weight_dtype)
+    section_soft_tail_mask = materialized_batch["section_soft_tail_mask"].to(dtype=weight_dtype)
     x0_latents = materialized_batch["x0_latents"].to(dtype=weight_dtype)
     valid_target_frames = materialized_batch["valid_target_frames"]
 
@@ -2236,8 +2893,15 @@ def training_step(
     flow_target = noise - model_input
     noisy_model_input = overwrite_anchor_latents(
         noisy_model_input,
-        section_anchor_canvas,
-        section_anchor_mask,
+        section_hard_anchor_canvas,
+        section_hard_anchor_mask,
+    )
+    soft_tail_strength = sigma.to(dtype=weight_dtype).view(-1, 1, 1, 1, 1) * float(soft_tail_hint_strength)
+    noisy_model_input = blend_soft_condition_latents(
+        noisy_model_input,
+        section_soft_tail_canvas,
+        section_soft_tail_mask,
+        soft_tail_strength,
     )
     timesteps = sigma * 1000.0
 
@@ -2266,10 +2930,10 @@ def training_step(
         dtype=torch.float32,
         valid_start=0,
     )
-    anchor_mask_float = section_anchor_mask.to(device=device, dtype=torch.float32)
-    mask = valid_mask * (1.0 - anchor_mask_float)
+    hard_anchor_mask_float = section_hard_anchor_mask.to(device=device, dtype=torch.float32)
+    mask = valid_mask * (1.0 - hard_anchor_mask_float)
     tail_position_weights = build_anchor_distance_weights(
-        anchor_masks=anchor_mask_float,
+        anchor_masks=hard_anchor_mask_float,
         valid_target_frames=valid_target_frames,
         latent_window_size=latent_window_size,
         device=device,
@@ -2286,13 +2950,13 @@ def training_step(
     noise_pred = xt + (1.0 - sigma_view_float) * flow_pred
     x_pred_for_temporal = overwrite_anchor_latents(
         x_pred.clone(),
-        section_anchor_canvas.float(),
-        anchor_mask_float,
+        section_hard_anchor_canvas.float(),
+        hard_anchor_mask_float,
     )
     x_target_for_temporal = overwrite_anchor_latents(
         x_target.clone(),
-        section_anchor_canvas.float(),
-        anchor_mask_float,
+        section_hard_anchor_canvas.float(),
+        hard_anchor_mask_float,
     )
 
     flow_sq_error = (flow_pred - flow_target).pow(2)
@@ -2594,9 +3258,13 @@ def reconstruct_sequence(
     latent_window_size: int,
     anchor_span_latents: int,
     num_inference_steps: int,
+    mode_inference_steps: Dict[str, int],
     seed: int,
     fix_anchor_during_denoise: bool,
+    soft_tail_hint_strength: float,
+    soft_tail_hint_step_fraction: float,
     distributed_context: DistributedContext,
+    timing: Optional[Dict[str, object]] = None,
 ) -> torch.Tensor:
     """把一段 low latents 重建成 recover latents。
 
@@ -2606,10 +3274,57 @@ def reconstruct_sequence(
 
     这与训练时的数据组织保持一致，也更贴近真实压缩恢复链路中的分段重建过程。
     """
+    reconstruct_start_time = start_synced_timer(device) if timing is not None else None
+    mode_order = (
+        PREDICT_ONLY_SECTION_MODE,
+        SINGLE_REFRESH_SECTION_MODE,
+        DUAL_REFRESH_SECTION_MODE,
+    )
+    section_count_by_mode = {mode_name: 0 for mode_name in mode_order}
+    section_seconds_by_mode = {mode_name: 0.0 for mode_name in mode_order}
+    denoise_submodule_seconds = {
+        "total_seconds": 0.0,
+        "random_init_and_scheduler_setup_seconds": 0.0,
+        "anchor_overwrite_seconds": 0.0,
+        "latent_to_weight_dtype_seconds": 0.0,
+        "soft_tail_blend_seconds": 0.0,
+        "transformer_forward_seconds": 0.0,
+        "scheduler_step_seconds": 0.0,
+        "finalize_seconds": 0.0,
+        "num_steps": 0,
+    }
+    first_section_ready_seconds = None
+    history_window_seconds = 0.0
+    condition_build_seconds = 0.0
+    stage1_prepare_inputs_seconds = 0.0
+    proxy_section_build_seconds = 0.0
+    stage1_denoise_seconds = 0.0
+    prefix_concat_seconds = 0.0
     clean_full = sequence.clean_full_latents
     low_full = sequence.low_full_latents
     if clean_full.shape[1] == 1:
-        return clean_full.clone().cpu().contiguous()
+        output = clean_full.clone().cpu().contiguous()
+        if timing is not None:
+            timing.clear()
+            timing.update(
+                {
+                    "total_seconds": stop_synced_timer(reconstruct_start_time, device),
+                    "first_section_ready_seconds": 0.0,
+                    "history_window_seconds": 0.0,
+                    "condition_build_seconds": 0.0,
+                    "stage1_prepare_inputs_seconds": 0.0,
+                    "proxy_section_build_seconds": 0.0,
+                    "stage1_denoise_seconds": 0.0,
+                    "prefix_concat_seconds": 0.0,
+                    "assemble_output_seconds": 0.0,
+                    "section_count": 0,
+                    "section_count_by_mode": section_count_by_mode,
+                    "section_seconds_by_mode": section_seconds_by_mode,
+                    "avg_section_seconds_by_mode": {mode_name: 0.0 for mode_name in mode_order},
+                    "stage1_denoise_submodule_seconds": denoise_submodule_seconds,
+                }
+            )
+        return output
     if low_full is None or sequence.low_codec_payload is None:
         raise ValueError("sequence.low_full_latents / low_codec_payload are missing. Please materialize low latents first.")
 
@@ -2629,20 +3344,33 @@ def reconstruct_sequence(
         dtype=weight_dtype,
     )
     x0_latents = clean_full[:, :1].unsqueeze(0).to(device=device, dtype=weight_dtype)
+    validate_mode_inference_steps(mode_inference_steps)
 
     for section_start in tqdm(
         section_starts,
         desc=f"Reconstructing sections rank={distributed_context.rank}",
         disable=distributed_context.is_distributed and not distributed_context.is_main_process,
     ):
+        section_wall_start_time = start_synced_timer(device) if timing is not None else None
+        history_start_time = start_synced_timer(device) if timing is not None else None
         history_latents = extract_history_window(
             source_full_latents=recovered_prefix,
             section_start=int(recovered_prefix.shape[1]),
             history_window_size=sum(history_sizes),
         ).unsqueeze(0)
+        if history_start_time is not None:
+            history_window_seconds += stop_synced_timer(history_start_time, device)
         valid_target_frames = min(latent_window_size, clean_full.shape[1] - section_start)
         section_payload = section_payload_lookup.get(section_start)
-        section_anchor_canvas, section_anchor_mask = build_section_anchor_canvas_and_mask(
+        section_mode = resolve_section_mode(section_payload)
+        section_num_inference_steps = int(mode_inference_steps[section_mode])
+        condition_start_time = start_synced_timer(device) if timing is not None else None
+        (
+            section_hard_anchor_canvas,
+            section_hard_anchor_mask,
+            section_soft_tail_canvas,
+            section_soft_tail_mask,
+        ) = build_section_condition_canvases_and_masks(
             low_full_latents=low_full,
             section_payload=section_payload,
             section_start=section_start,
@@ -2650,59 +3378,138 @@ def reconstruct_sequence(
             latent_window_size=latent_window_size,
             anchor_span_latents=anchor_span_latents,
         )
+        if condition_start_time is not None:
+            condition_build_seconds += stop_synced_timer(condition_start_time, device)
 
-        (
-            _,
-            indices_hidden_states,
-            indices_latents_history_short,
-            indices_latents_history_mid,
-            indices_latents_history_long,
-            latents_history_short,
-            latents_history_mid,
-            latents_history_long,
-        ) = prepare_stage1_clean_input_from_latents(
-            history_latents=history_latents.to(device=device, dtype=weight_dtype),
-            target_latents=dummy_target,
-            x0_latents=x0_latents,
-            latent_window_size=latent_window_size,
-            history_sizes=history_sizes,
-            is_random_drop=False,
-            random_drop_v2v_ratio=0.0,
-            random_drop_t2v_ratio=0.0,
-            is_keep_x0=True,
-            dtype=weight_dtype,
-            device=device,
-        )
-
-        section_latents = run_stage1_denoise(
-            transformer=transformer,
-            scheduler=scheduler,
-            prompt_embeds=prompt_embeds,
-            device=device,
-            weight_dtype=weight_dtype,
-            input_path=sequence.path,
-            section_start=section_start,
-            latent_shape=(1, clean_full.shape[0], latent_window_size, clean_full.shape[2], clean_full.shape[3]),
-            indices_hidden_states=indices_hidden_states,
-            indices_latents_history_short=indices_latents_history_short,
-            indices_latents_history_mid=indices_latents_history_mid,
-            indices_latents_history_long=indices_latents_history_long,
-            latents_history_short=latents_history_short,
-            latents_history_mid=latents_history_mid,
-            latents_history_long=latents_history_long,
-            num_inference_steps=num_inference_steps,
-            seed=seed + section_start,
-            anchor_canvas=section_anchor_canvas.unsqueeze(0).to(device=device, dtype=weight_dtype),
-            anchor_mask=section_anchor_mask.unsqueeze(0).to(device=device, dtype=weight_dtype),
-            fix_anchor_during_denoise=fix_anchor_during_denoise,
-        )
-        valid_section = section_latents[0, :, :valid_target_frames].contiguous()
+        if section_num_inference_steps == 0:
+            proxy_start_time = start_synced_timer(device) if timing is not None else None
+            anchor_blocks = build_section_anchor_blocks(
+                low_full_latents=low_full,
+                section_payload=section_payload,
+                section_start=section_start,
+                valid_target_frames=valid_target_frames,
+                anchor_span_latents=anchor_span_latents,
+            )
+            valid_section = build_proxy_section_from_history(
+                history_latents=history_latents[0].float().cpu(),
+                section_shape=(
+                    int(clean_full.shape[0]),
+                    int(valid_target_frames),
+                    int(clean_full.shape[2]),
+                    int(clean_full.shape[3]),
+                ),
+                anchor_blocks=anchor_blocks,
+            ).contiguous()
+            if proxy_start_time is not None:
+                proxy_section_build_seconds += stop_synced_timer(proxy_start_time, device)
+        else:
+            prepare_inputs_start_time = start_synced_timer(device) if timing is not None else None
+            (
+                _,
+                indices_hidden_states,
+                indices_latents_history_short,
+                indices_latents_history_mid,
+                indices_latents_history_long,
+                latents_history_short,
+                latents_history_mid,
+                latents_history_long,
+            ) = prepare_stage1_clean_input_from_latents(
+                history_latents=history_latents.to(device=device, dtype=weight_dtype),
+                target_latents=dummy_target,
+                x0_latents=x0_latents,
+                latent_window_size=latent_window_size,
+                history_sizes=history_sizes,
+                is_random_drop=False,
+                random_drop_v2v_ratio=0.0,
+                random_drop_t2v_ratio=0.0,
+                is_keep_x0=True,
+                dtype=weight_dtype,
+                device=device,
+            )
+            if prepare_inputs_start_time is not None:
+                stage1_prepare_inputs_seconds += stop_synced_timer(prepare_inputs_start_time, device)
+            section_denoise_timing: Dict[str, float] = {}
+            denoise_start_time = start_synced_timer(device) if timing is not None else None
+            section_latents = run_stage1_denoise(
+                transformer=transformer,
+                scheduler=scheduler,
+                prompt_embeds=prompt_embeds,
+                device=device,
+                weight_dtype=weight_dtype,
+                input_path=sequence.path,
+                section_start=section_start,
+                latent_shape=(1, clean_full.shape[0], latent_window_size, clean_full.shape[2], clean_full.shape[3]),
+                indices_hidden_states=indices_hidden_states,
+                indices_latents_history_short=indices_latents_history_short,
+                indices_latents_history_mid=indices_latents_history_mid,
+                indices_latents_history_long=indices_latents_history_long,
+                latents_history_short=latents_history_short,
+                latents_history_mid=latents_history_mid,
+                latents_history_long=latents_history_long,
+                num_inference_steps=section_num_inference_steps,
+                seed=seed + section_start,
+                hard_anchor_canvas=section_hard_anchor_canvas.unsqueeze(0).to(device=device, dtype=weight_dtype),
+                hard_anchor_mask=section_hard_anchor_mask.unsqueeze(0).to(device=device, dtype=weight_dtype),
+                soft_tail_canvas=section_soft_tail_canvas.unsqueeze(0).to(device=device, dtype=weight_dtype),
+                soft_tail_mask=section_soft_tail_mask.unsqueeze(0).to(device=device, dtype=weight_dtype),
+                fix_anchor_during_denoise=fix_anchor_during_denoise,
+                soft_tail_hint_strength=soft_tail_hint_strength,
+                soft_tail_hint_step_fraction=soft_tail_hint_step_fraction,
+                timing=section_denoise_timing if timing is not None else None,
+            )
+            if denoise_start_time is not None:
+                stage1_denoise_seconds += stop_synced_timer(denoise_start_time, device)
+            for key, value in section_denoise_timing.items():
+                if key == "num_steps":
+                    denoise_submodule_seconds["num_steps"] += int(value)
+                else:
+                    denoise_submodule_seconds[key] += float(value)
+            valid_section = section_latents[0, :, :valid_target_frames].contiguous()
+        prefix_concat_start_time = start_synced_timer(device) if timing is not None else None
         recovered_sections.append(valid_section)
         recovered_prefix = torch.cat([recovered_prefix, valid_section.cpu()], dim=1).contiguous()
+        if prefix_concat_start_time is not None:
+            prefix_concat_seconds += stop_synced_timer(prefix_concat_start_time, device)
+        section_count_by_mode[section_mode] += 1
+        if section_wall_start_time is not None:
+            section_wall_seconds = stop_synced_timer(section_wall_start_time, device)
+            section_seconds_by_mode[section_mode] += float(section_wall_seconds)
+            if first_section_ready_seconds is None:
+                first_section_ready_seconds = stop_synced_timer(reconstruct_start_time, device)
 
+    assemble_start_time = start_synced_timer(device) if timing is not None else None
     recovered_remainder = torch.cat(recovered_sections, dim=1)
     recovered_remainder = recovered_remainder[:, : clean_full.shape[1] - 1]
-    return torch.cat([clean_full[:, :1].cpu(), recovered_remainder], dim=1).contiguous()
+    output = torch.cat([clean_full[:, :1].cpu(), recovered_remainder], dim=1).contiguous()
+    if timing is not None:
+        assemble_output_seconds = stop_synced_timer(assemble_start_time, device)
+        timing.clear()
+        timing.update(
+            {
+                "total_seconds": stop_synced_timer(reconstruct_start_time, device),
+                "first_section_ready_seconds": first_section_ready_seconds,
+                "history_window_seconds": history_window_seconds,
+                "condition_build_seconds": condition_build_seconds,
+                "stage1_prepare_inputs_seconds": stage1_prepare_inputs_seconds,
+                "proxy_section_build_seconds": proxy_section_build_seconds,
+                "stage1_denoise_seconds": stage1_denoise_seconds,
+                "prefix_concat_seconds": prefix_concat_seconds,
+                "assemble_output_seconds": assemble_output_seconds,
+                "section_count": len(section_starts),
+                "section_count_by_mode": section_count_by_mode,
+                "section_seconds_by_mode": section_seconds_by_mode,
+                "avg_section_seconds_by_mode": {
+                    mode_name: (
+                        section_seconds_by_mode[mode_name] / section_count_by_mode[mode_name]
+                        if section_count_by_mode[mode_name] > 0
+                        else 0.0
+                    )
+                    for mode_name in mode_order
+                },
+                "stage1_denoise_submodule_seconds": denoise_submodule_seconds,
+            }
+        )
+    return output
 
 
 @torch.inference_mode()
@@ -2724,29 +3531,54 @@ def run_stage1_denoise(
     latents_history_long: torch.Tensor,
     num_inference_steps: int,
     seed: int,
-    anchor_canvas: torch.Tensor,
-    anchor_mask: torch.Tensor,
+    hard_anchor_canvas: torch.Tensor,
+    hard_anchor_mask: torch.Tensor,
+    soft_tail_canvas: torch.Tensor,
+    soft_tail_mask: torch.Tensor,
     fix_anchor_during_denoise: bool,
+    soft_tail_hint_strength: float,
+    soft_tail_hint_step_fraction: float,
+    timing: Optional[Dict[str, float]] = None,
 ) -> torch.Tensor:
     """执行单个 section 的扩散式去噪恢复。"""
+    if num_inference_steps <= 0:
+        raise ValueError(f"run_stage1_denoise requires num_inference_steps > 0, got {num_inference_steps}.")
+    denoise_start_time = start_synced_timer(device) if timing is not None else None
     base_transformer = unwrap_model(transformer)
     generator = torch.Generator(device=device).manual_seed(seed)
     # 输入 hidden_states 是当前 section 的待恢复 latent，先随机初始化为高斯噪声；当前配置下 shape 近似是 [1, 16, 9, H, W]
+    setup_start_time = start_synced_timer(device) if timing is not None else None
     latents = torch.randn(latent_shape, device=device, dtype=torch.float32, generator=generator)
+    anchor_overwrite_seconds = 0.0
     if fix_anchor_during_denoise:
-        latents = overwrite_anchor_latents(latents, anchor_canvas.float(), anchor_mask.float())
+        anchor_overwrite_start_time = start_synced_timer(device) if timing is not None else None
+        latents = overwrite_anchor_latents(latents, hard_anchor_canvas.float(), hard_anchor_mask.float())
+        if anchor_overwrite_start_time is not None:
+            anchor_overwrite_seconds += stop_synced_timer(anchor_overwrite_start_time, device)
     prepare_stage1_inference_scheduler(
         scheduler=scheduler,
         latents=latents,
         num_inference_steps=num_inference_steps,
         device=device,
     )
+    setup_seconds = (
+        stop_synced_timer(setup_start_time, device)
+        if setup_start_time is not None
+        else None
+    )
     scheduler_type = str(get_scheduler_config_value(scheduler, "scheduler_type", "")).lower()
     supports_first_step_flag = model_supports_argument(base_transformer, "is_first_denoising_step")
+    latent_to_weight_dtype_seconds = 0.0
+    soft_tail_blend_seconds = 0.0
+    transformer_forward_seconds = 0.0
+    scheduler_step_seconds = 0.0
 
     for step_idx, timestep in enumerate(scheduler.timesteps):
         if fix_anchor_during_denoise:
-            latents = overwrite_anchor_latents(latents, anchor_canvas.float(), anchor_mask.float())
+            anchor_overwrite_start_time = start_synced_timer(device) if timing is not None else None
+            latents = overwrite_anchor_latents(latents, hard_anchor_canvas.float(), hard_anchor_mask.float())
+            if anchor_overwrite_start_time is not None:
+                anchor_overwrite_seconds += stop_synced_timer(anchor_overwrite_start_time, device)
         current_sigma = get_scheduler_sigma_for_step(scheduler, step_idx)
         ensure_finite_recover_state(
             stage="pre_model",
@@ -2758,7 +3590,25 @@ def run_stage1_denoise(
             latents=latents,
         )
         timestep_batch = timestep.expand(latents.shape[0])
+        cast_start_time = start_synced_timer(device) if timing is not None else None
         latent_model_input = latents.to(weight_dtype)
+        if cast_start_time is not None:
+            latent_to_weight_dtype_seconds += stop_synced_timer(cast_start_time, device)
+        current_soft_tail_strength = compute_soft_tail_hint_schedule_strength(
+            step_idx=step_idx,
+            num_inference_steps=num_inference_steps,
+            base_strength=soft_tail_hint_strength,
+            step_fraction=soft_tail_hint_step_fraction,
+        )
+        soft_tail_start_time = start_synced_timer(device) if timing is not None else None
+        latent_model_input = blend_soft_condition_latents(
+            latent_model_input,
+            soft_tail_canvas.to(weight_dtype),
+            soft_tail_mask.to(weight_dtype),
+            current_soft_tail_strength,
+        )
+        if soft_tail_start_time is not None:
+            soft_tail_blend_seconds += stop_synced_timer(soft_tail_start_time, device)
         transformer_kwargs = {
             "hidden_states": latent_model_input,
             "timestep": timestep_batch,
@@ -2775,11 +3625,14 @@ def run_stage1_denoise(
         if supports_first_step_flag:
             transformer_kwargs["is_first_denoising_step"] = step_idx == 0
 
+        model_start_time = start_synced_timer(device) if timing is not None else None
         with get_model_cache_context(base_transformer, "cond"):
             # DiT的前向过程
             noise_pred = transformer(
                 **transformer_kwargs,
             )[0]
+        if model_start_time is not None:
+            transformer_forward_seconds += stop_synced_timer(model_start_time, device)
         ensure_finite_recover_state(
             stage="post_model",
             input_path=input_path,
@@ -2791,12 +3644,18 @@ def run_stage1_denoise(
             noise_pred=noise_pred,
         )
         #  scheduler 用DiT前向的输出更新 latents，进入下一轮
+        scheduler_step_start_time = start_synced_timer(device) if timing is not None else None
         if scheduler_type == "unipc" and hasattr(scheduler, "step_unipc"):
             latents = scheduler.step_unipc(noise_pred.float(), timestep, latents, return_dict=False)[0]
         else:
             latents = scheduler.step(noise_pred.float(), timestep, latents, return_dict=False)[0]
+        if scheduler_step_start_time is not None:
+            scheduler_step_seconds += stop_synced_timer(scheduler_step_start_time, device)
         if fix_anchor_during_denoise:
-            latents = overwrite_anchor_latents(latents, anchor_canvas.float(), anchor_mask.float())
+            anchor_overwrite_start_time = start_synced_timer(device) if timing is not None else None
+            latents = overwrite_anchor_latents(latents, hard_anchor_canvas.float(), hard_anchor_mask.float())
+            if anchor_overwrite_start_time is not None:
+                anchor_overwrite_seconds += stop_synced_timer(anchor_overwrite_start_time, device)
         ensure_finite_recover_state(
             stage="post_step",
             input_path=input_path,
@@ -2808,10 +3667,32 @@ def run_stage1_denoise(
             noise_pred=noise_pred,
         )
 
+    finalize_start_time = start_synced_timer(device) if timing is not None else None
     if hasattr(base_transformer, "clear_kv_cache"):
         # 长序列逐段推理后清 cache，避免显存逐步累积。
         base_transformer.clear_kv_cache()
-    return latents.cpu()
+    output = latents.cpu()
+    finalize_seconds = (
+        stop_synced_timer(finalize_start_time, device)
+        if finalize_start_time is not None
+        else None
+    )
+    if timing is not None:
+        timing.clear()
+        timing.update(
+            {
+                "total_seconds": stop_synced_timer(denoise_start_time, device),
+                "random_init_and_scheduler_setup_seconds": 0.0 if setup_seconds is None else float(setup_seconds),
+                "anchor_overwrite_seconds": anchor_overwrite_seconds,
+                "latent_to_weight_dtype_seconds": latent_to_weight_dtype_seconds,
+                "soft_tail_blend_seconds": soft_tail_blend_seconds,
+                "transformer_forward_seconds": transformer_forward_seconds,
+                "scheduler_step_seconds": scheduler_step_seconds,
+                "finalize_seconds": 0.0 if finalize_seconds is None else float(finalize_seconds),
+                "num_steps": len(scheduler.timesteps),
+            }
+        )
+    return output
 
 
 def build_low_latent_payload(sequence: PreparedSequence) -> Dict[str, object]:
@@ -2834,6 +3715,11 @@ def build_low_latent_payload(sequence: PreparedSequence) -> Dict[str, object]:
         "section_payloads": sequence.low_codec_payload.get("section_payloads"),
         "section_anchor_payloads": sequence.low_codec_payload.get("section_anchor_payloads"),
         "section_tail_payloads": sequence.low_codec_payload.get("section_tail_payloads"),
+        "mode_selection_strategy": sequence.low_codec_payload.get("mode_selection_strategy"),
+        "target_low_bpp": sequence.low_codec_payload.get("target_low_bpp"),
+        "target_low_bytes": sequence.low_codec_payload.get("target_low_bytes"),
+        "estimated_selected_bytes": sequence.low_codec_payload.get("estimated_selected_bytes"),
+        "estimated_fixed_bytes": sequence.low_codec_payload.get("estimated_fixed_bytes"),
         "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
         "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
     }
@@ -3121,12 +4007,15 @@ def build_recover_config(
         "tail_span_latents": codec_config.tail_span_latents,
         "anchor_quant_dtype": codec_config.anchor_quant_dtype,
         "anchor_spatial_factor": codec_config.anchor_spatial_factor,
+        "dual_tail_anchor_spatial_factor": codec_config.dual_tail_anchor_spatial_factor,
         "tail_codec_type": codec_config.tail_codec_type,
         "num_inference_steps": args.num_inference_steps,
         "low_latent_format_version": DEFAULT_LOW_LATENT_FORMAT_VERSION,
         "learned_codec_checkpoint": LEARNED_CODEC_CHECKPOINT_NAME if learned_tail_codec is not None else None,
         "learned_codec_config": learned_codec_config,
         "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
+        "soft_tail_hint_strength": args.soft_tail_hint_strength,
+        "soft_tail_hint_step_fraction": args.soft_tail_hint_step_fraction,
         "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
         "codec_config": asdict(codec_config),
         "train_loss_config": {
@@ -3320,6 +4209,11 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     )
     codec_config.setdefault("anchor_quant_dtype", config.get("anchor_quant_dtype", DEFAULT_ANCHOR_QUANT_DTYPE))
     codec_config.setdefault("anchor_spatial_factor", int(config.get("anchor_spatial_factor", DEFAULT_ANCHOR_SPATIAL_FACTOR)))
+    dual_tail_anchor_spatial_factor = config.get("dual_tail_anchor_spatial_factor")
+    codec_config.setdefault(
+        "dual_tail_anchor_spatial_factor",
+        None if dual_tail_anchor_spatial_factor is None else int(dual_tail_anchor_spatial_factor),
+    )
     codec_config.setdefault("tail_codec_type", config.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
     learned_codec_config = dict(config.get("learned_codec_config") or {})
     if "hidden_channels" in learned_codec_config and "learned_codec_hidden_channels" not in codec_config:
@@ -3332,6 +4226,7 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["tail_span_latents"] = int(codec_config["tail_span_latents"])
     config["anchor_quant_dtype"] = codec_config["anchor_quant_dtype"]
     config["anchor_spatial_factor"] = int(codec_config["anchor_spatial_factor"])
+    config["dual_tail_anchor_spatial_factor"] = codec_config["dual_tail_anchor_spatial_factor"]
     config["tail_codec_type"] = str(codec_config["tail_codec_type"])
     config["num_inference_steps"] = int(config.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS))
     config["low_latent_format_version"] = config.get(
@@ -3341,6 +4236,8 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["learned_codec_checkpoint"] = config.get("learned_codec_checkpoint")
     config["learned_codec_config"] = learned_codec_config
     config.setdefault("fix_anchor_during_denoise", DEFAULT_FIX_ANCHOR_DURING_DENOISE)
+    config.setdefault("soft_tail_hint_strength", DEFAULT_SOFT_TAIL_HINT_STRENGTH)
+    config.setdefault("soft_tail_hint_step_fraction", DEFAULT_SOFT_TAIL_HINT_STEP_FRACTION)
     train_loss_config = dict(config.get("train_loss_config") or {})
     train_loss_config.setdefault("temporal_delta_loss_weight", DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
     config["temporal_delta_loss_weight"] = train_loss_config["temporal_delta_loss_weight"]
@@ -3397,11 +4294,59 @@ def resolve_infer_value(cli_value: object, default_value: object, checkpoint_val
     - 若用户显式传了非默认 CLI 值，则尊重 CLI
     - 否则沿用 checkpoint 中训练时保存的值
     """
+    if cli_value is None:
+        return checkpoint_value if checkpoint_value is not None else default_value
     if checkpoint_value is None:
         return cli_value
     if cli_value != default_value:
         return cli_value
     return checkpoint_value
+
+
+def resolve_optional_infer_int(cli_value: Optional[int], checkpoint_value: object, fallback_value: int) -> int:
+    """解析可选的整型推理覆盖值。"""
+    if checkpoint_value is None:
+        checkpoint_int = None
+    else:
+        checkpoint_int = int(checkpoint_value)
+    resolved = cli_value if cli_value is not None else checkpoint_int
+    if resolved is None:
+        resolved = int(fallback_value)
+    return int(resolved)
+
+
+def resolve_mode_inference_steps(args: argparse.Namespace, checkpoint_config: Dict[str, object]) -> Dict[str, int]:
+    """解析不同 section mode 在推理时使用的 denoise 步数。"""
+    global_steps = int(args.num_inference_steps)
+    mode_steps = {
+        PREDICT_ONLY_SECTION_MODE: resolve_optional_infer_int(
+            cli_value=args.predict_only_steps,
+            checkpoint_value=checkpoint_config.get("predict_only_num_inference_steps"),
+            fallback_value=global_steps,
+        ),
+        SINGLE_REFRESH_SECTION_MODE: resolve_optional_infer_int(
+            cli_value=args.single_refresh_steps,
+            checkpoint_value=checkpoint_config.get("single_refresh_num_inference_steps"),
+            fallback_value=global_steps,
+        ),
+        DUAL_REFRESH_SECTION_MODE: resolve_optional_infer_int(
+            cli_value=args.dual_refresh_steps,
+            checkpoint_value=checkpoint_config.get("dual_refresh_num_inference_steps"),
+            fallback_value=global_steps,
+        ),
+    }
+    validate_mode_inference_steps(mode_steps)
+    return mode_steps
+
+
+def validate_mode_inference_steps(mode_inference_steps: Dict[str, int]) -> None:
+    """校验按 mode 配置的推理步数。"""
+    missing_modes = sorted(VALID_SECTION_MODES - set(mode_inference_steps.keys()))
+    if missing_modes:
+        raise KeyError(f"mode_inference_steps is missing modes: {missing_modes}")
+    for mode_name, step_count in mode_inference_steps.items():
+        if int(step_count) < 0:
+            raise ValueError(f"Inference steps for mode={mode_name} must be >= 0, got {step_count}.")
 
 
 def load_state_dict_file(path: Path) -> Dict[str, torch.Tensor]:
