@@ -22,7 +22,11 @@ from reconstruct.decoder import (
     load_payload,
     resolve_device,
 )
-from reconstruct.external_entropy import read_external_entropy_payload
+from reconstruct.external_entropy import (
+    deserialize_external_entropy_payload,
+    read_external_entropy_payload,
+    serialize_external_entropy_payload,
+)
 from reconstruct.latent_io import (
     DEFAULT_BASE_MODEL_PATH,
     LATENT_FORMAT_V2,
@@ -52,6 +56,7 @@ from reconstruct.recover import (
 ROOT_DIR = "reconstruct/outputs_CNN"
 DEFAULT_INPUT_SUBDIR = "enc_latents"
 DEFAULT_OUTPUT_SUBDIR = "Videos"
+TRANSPORT_INPUT_MODE_CHOICES = ("auto", "low_latents", "simulate_entropy", "entropy_bin")
 
 
 @dataclass
@@ -81,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         "-I",
         type=Path,
         default=None,
-        help=f"Default: <root_dir>/{DEFAULT_INPUT_SUBDIR}",
+        help="Default: auto-detect <root_dir>/enc_latents first, then <root_dir>/low_latents.",
     )
     parser.add_argument(
         "--output_dir",
@@ -127,6 +132,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source_video_dir", type=Path, default=Path("reconstruct/videos"))
     parser.add_argument("--compare_output_dir", type=Path, default=None)
     parser.add_argument("--compare_mode", type=str, default="both", choices=COMPARE_MODE_CHOICES)
+    parser.add_argument(
+        "--transport_input_mode",
+        type=str,
+        default="auto",
+        choices=TRANSPORT_INPUT_MODE_CHOICES,
+        help="How low_latent payloads should be treated at the receiver. 'auto' prefers real .bin inputs and otherwise simulates entropy transport in memory.",
+    )
     return parser.parse_args()
 
 
@@ -193,6 +205,99 @@ def load_entropy_metrics_payload(entropy_metrics_path: Path) -> Optional[Dict[st
 
 def resolve_entropy_metrics_path(entropy_metrics_dir: Path, relative_path: Path) -> Path:
     return entropy_metrics_dir / relative_path.with_suffix(".json")
+
+
+def resolve_default_input_dir(root_dir: Path) -> Path:
+    for subdir_name in ("enc_latents", "low_latents"):
+        candidate = (root_dir / subdir_name).resolve()
+        if candidate.exists():
+            return candidate
+    return (root_dir / DEFAULT_INPUT_SUBDIR).resolve()
+
+
+def resolve_transport_input_mode(
+    cli_mode: str,
+    latent_path: Path,
+    *,
+    is_low_payload: bool,
+) -> str:
+    suffix = latent_path.suffix.lower()
+    if suffix == ".bin":
+        if cli_mode not in {"auto", "entropy_bin"}:
+            raise ValueError(
+                f"Transport mode {cli_mode!r} is incompatible with entropy bitstream input {latent_path}."
+            )
+        return "entropy_bin"
+
+    if is_low_payload:
+        if cli_mode == "low_latents":
+            return "low_latents"
+        if cli_mode in {"auto", "simulate_entropy"}:
+            return "simulate_entropy"
+        raise ValueError(
+            f"Transport mode {cli_mode!r} is incompatible with low_latent payload input {latent_path}."
+        )
+
+    if cli_mode != "auto":
+        raise ValueError(
+            f"Transport mode {cli_mode!r} only supports low_latent or entropy bitstream inputs, got {latent_path}."
+        )
+    return "direct_decode"
+
+
+def build_simulated_entropy_metrics_payload(
+    low_payload: Dict[str, object],
+    relative_path: Path,
+    latent_path: Path,
+    entropy_metrics_dir: Path,
+    entropy_summary: Dict[str, object],
+) -> Dict[str, object]:
+    entropy_metrics_path = resolve_entropy_metrics_path(
+        entropy_metrics_dir=entropy_metrics_dir,
+        relative_path=relative_path,
+    )
+    metrics_payload = load_entropy_metrics_payload(entropy_metrics_path) or {}
+    total_pixels = (
+        int(low_payload["source_num_frames"])
+        * int(low_payload["source_width"])
+        * int(low_payload["source_height"])
+    )
+    entropy_codec_bytes = int(metrics_payload.get("entropy_codec_bytes", entropy_summary["entropy_codec_bytes"]))
+    return {
+        **metrics_payload,
+        "input_low_latent_path": str(metrics_payload.get("input_low_latent_path") or latent_path),
+        "enc_latent_path": metrics_payload.get("enc_latent_path"),
+        "transport_storage": str(metrics_payload.get("transport_storage", "memory_only")),
+        "entropy_codec_bytes": entropy_codec_bytes,
+        "entropy_bpp": float(
+            metrics_payload.get(
+                "entropy_bpp",
+                compute_bpp_from_total_pixels(entropy_codec_bytes, total_pixels),
+            )
+        ),
+        "entropy_codec": str(metrics_payload.get("entropy_codec", entropy_summary["entropy_codec"])),
+        "field_strategy": str(metrics_payload.get("field_strategy", entropy_summary["field_strategy"])),
+        "block_lengths": metrics_payload.get("block_lengths", entropy_summary["block_lengths"]),
+        "section_anchor_entropy_bytes": metrics_payload.get(
+            "section_anchor_entropy_bytes",
+            entropy_summary.get("section_anchor_entropy_bytes", []),
+        ),
+        "section_tail_entropy_bytes": metrics_payload.get(
+            "section_tail_entropy_bytes",
+            entropy_summary.get("section_tail_entropy_bytes", []),
+        ),
+        "section_entropy_bytes": metrics_payload.get(
+            "section_entropy_bytes",
+            entropy_summary.get("section_entropy_bytes", []),
+        ),
+        "section_entropy_bpp": metrics_payload.get(
+            "section_entropy_bpp",
+            [
+                float(section_bytes * 8.0 / float(total_pixels))
+                for section_bytes in entropy_summary.get("section_entropy_bytes", [])
+            ],
+        ),
+    }
 
 
 def resolve_requested_checkpoint_dir(
@@ -338,10 +443,24 @@ def build_recover_payload_from_low(
             [int(value) for value in section_range]
             for section_range in low_payload.get("section_ranges", [])
         ],
+        "dynamic_rate_policy": low_payload.get("dynamic_rate_policy"),
+        "section_motion_scores": list(low_payload.get("section_motion_scores", [])),
+        "section_anchor_profiles": list(low_payload.get("section_anchor_profiles", [])),
+        "section_tail_quality_scales": list(low_payload.get("section_tail_quality_scales", [])),
+        "section_anchor_bytes": list(low_payload.get("section_anchor_bytes", [])),
+        "section_tail_bytes": list(low_payload.get("section_tail_bytes", [])),
+        "section_total_bytes": list(low_payload.get("section_total_bytes", [])),
+        "section_bpp": list(low_payload.get("section_bpp", [])),
+        "video_mean_motion_score": float(low_payload.get("video_mean_motion_score", 0.0)),
+        "video_mean_tail_quality_scale": float(low_payload.get("video_mean_tail_quality_scale", 1.0)),
+        "video_section_bpp_mean": float(low_payload.get("video_section_bpp_mean", 0.0)),
         "generated_by": "reconstruct/real_decoder.py",
     }
     if transport_mode == "low_latents":
         recovery_metadata["low_latent_path"] = str(latent_path)
+    elif transport_mode == "simulated_entropy":
+        recovery_metadata["low_latent_path"] = str(latent_path)
+        recovery_metadata["simulated_entropy_transport"] = True
     elif transport_mode == "entropy_bin":
         recovery_metadata["entropy_bin_path"] = str(latent_path)
     if metrics_payload is not None and metrics_payload.get("low_latent_path") is not None:
@@ -355,6 +474,18 @@ def build_recover_payload_from_low(
             recovery_metadata["entropy_bpp"] = float(entropy_metrics_payload["entropy_bpp"])
         if entropy_metrics_payload.get("entropy_codec") is not None:
             recovery_metadata["entropy_codec"] = str(entropy_metrics_payload["entropy_codec"])
+        if entropy_metrics_payload.get("transport_storage") is not None:
+            recovery_metadata["transport_storage"] = str(entropy_metrics_payload["transport_storage"])
+        if entropy_metrics_payload.get("field_strategy") is not None:
+            recovery_metadata["field_strategy"] = str(entropy_metrics_payload["field_strategy"])
+        for key in (
+            "section_anchor_entropy_bytes",
+            "section_tail_entropy_bytes",
+            "section_entropy_bytes",
+            "section_entropy_bpp",
+        ):
+            if entropy_metrics_payload.get(key) is not None:
+                recovery_metadata[key] = entropy_metrics_payload[key]
     if metrics_payload is not None and metrics_payload.get("raw_bpp") is not None:
         recovery_metadata["raw_bpp"] = float(metrics_payload["raw_bpp"])
 
@@ -507,7 +638,7 @@ def decode_low_latent_file_to_output_path(
     )
     transport_file_bytes = int(latent_path.stat().st_size)
     transport_bpp = compute_bpp_from_total_pixels(transport_file_bytes, total_pixels)
-    if transport_mode == "entropy_bin" and entropy_metrics_payload is not None:
+    if transport_mode in {"entropy_bin", "simulated_entropy"} and entropy_metrics_payload is not None:
         if entropy_metrics_payload.get("entropy_codec_bytes") is not None:
             transport_file_bytes = int(entropy_metrics_payload["entropy_codec_bytes"])
         if entropy_metrics_payload.get("entropy_bpp") is not None:
@@ -590,12 +721,18 @@ def decode_latent_file(
     model_bundle_cache: Dict[str, ModelBundle],
     device: torch.device,
     compare_config: Optional[CompareExportConfig],
+    transport_input_mode: str,
 ) -> Path:
     relative_path = latent_path.relative_to(input_dir)
     output_path = output_dir / relative_path.with_suffix(".mp4")
     entropy_metrics_dir = (root_dir / "entropy_metrics").resolve()
 
     if latent_path.suffix.lower() == ".bin":
+        resolve_transport_input_mode(
+            transport_input_mode,
+            latent_path,
+            is_low_payload=False,
+        )
         print(f"[real_decoder] input_mode=entropy_bin path={latent_path}")
         entropy_metrics_path = resolve_entropy_metrics_path(
             entropy_metrics_dir=entropy_metrics_dir,
@@ -625,8 +762,52 @@ def decode_latent_file(
         )
 
     payload = load_payload(latent_path)
+    low_payload_input = is_low_latent_payload(payload)
+    resolved_transport_mode = resolve_transport_input_mode(
+        transport_input_mode,
+        latent_path,
+        is_low_payload=low_payload_input,
+    )
 
-    if is_low_latent_payload(payload):
+    if low_payload_input and resolved_transport_mode == "simulate_entropy":
+        print(f"[real_decoder] input_mode=simulate_entropy_from_low_latents path={latent_path}")
+        transport_bytes, entropy_summary = serialize_external_entropy_payload(
+            payload,
+            relative_path=str(relative_path),
+        )
+        simulated_payload = deserialize_external_entropy_payload(
+            transport_bytes,
+            source=f"in_memory:{latent_path}",
+        )
+        entropy_metrics_payload = build_simulated_entropy_metrics_payload(
+            low_payload=payload,
+            relative_path=relative_path,
+            latent_path=latent_path,
+            entropy_metrics_dir=entropy_metrics_dir,
+            entropy_summary=entropy_summary,
+        )
+        return decode_low_latent_file_to_output_path(
+            low_payload=simulated_payload,
+            latent_path=latent_path,
+            relative_path=relative_path,
+            output_path=output_path,
+            root_dir=root_dir,
+            metrics_dir=metrics_dir,
+            recover_latent_output_dir=recover_latent_output_dir,
+            cli_checkpoint_dir=cli_checkpoint_dir,
+            cli_base_model_path=cli_base_model_path,
+            cli_weight_dtype=cli_weight_dtype,
+            cli_num_inference_steps=cli_num_inference_steps,
+            seed=seed,
+            runtime_cache=runtime_cache,
+            model_bundle_cache=model_bundle_cache,
+            device=device,
+            compare_config=compare_config,
+            transport_mode="simulated_entropy",
+            entropy_metrics_payload=entropy_metrics_payload,
+        )
+
+    if low_payload_input:
         print(f"[real_decoder] input_mode=low_latents path={latent_path}")
         return decode_low_latent_file_to_output_path(
             low_payload=payload,
@@ -645,7 +826,7 @@ def decode_latent_file(
             model_bundle_cache=model_bundle_cache,
             device=device,
             compare_config=compare_config,
-            transport_mode="low_latents",
+            transport_mode=resolved_transport_mode,
             entropy_metrics_payload=None,
         )
 
@@ -666,7 +847,7 @@ def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
     root_dir = args.root_dir.resolve()
-    input_dir = args.input_dir.resolve() if args.input_dir else (root_dir / DEFAULT_INPUT_SUBDIR).resolve()
+    input_dir = args.input_dir.resolve() if args.input_dir else resolve_default_input_dir(root_dir)
     output_dir = args.output_dir.resolve() if args.output_dir else (root_dir / DEFAULT_OUTPUT_SUBDIR).resolve()
     metrics_dir = args.metrics_dir.resolve() if args.metrics_dir else (root_dir / "metrics").resolve()
     recover_latent_output_dir = (
@@ -681,6 +862,7 @@ def main() -> None:
     print(f"[real_decoder] checkpoint_dir={args.checkpoint_dir.resolve() if args.checkpoint_dir else 'auto'}")
     print(f"[real_decoder] base_model_path={args.base_model_path or 'from-checkpoint-or-latent-metadata'}")
     print(f"[real_decoder] recover_latent_output_dir={recover_latent_output_dir or 'off'}")
+    print(f"[real_decoder] transport_input_mode={args.transport_input_mode}")
     if compare_config is None:
         print("[real_decoder] compare_mode=off")
     else:
@@ -707,6 +889,7 @@ def main() -> None:
             model_bundle_cache=model_bundle_cache,
             device=device,
             compare_config=compare_config,
+            transport_input_mode=args.transport_input_mode,
         )
 
 

@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import zlib
@@ -103,6 +104,17 @@ def _build_source_payload(low_payload: Dict[str, object], relative_path: str | N
         "section_ranges": [[int(value) for value in section_range] for section_range in low_payload["section_ranges"]],
         "low_codec_bytes": int(low_payload["low_codec_bytes"]),
         "low_bpp": float(low_payload["low_bpp"]),
+        "dynamic_rate_policy": low_payload.get("dynamic_rate_policy"),
+        "section_motion_scores": list(low_payload.get("section_motion_scores", [])),
+        "section_anchor_profiles": list(low_payload.get("section_anchor_profiles", [])),
+        "section_tail_quality_scales": list(low_payload.get("section_tail_quality_scales", [])),
+        "section_anchor_bytes": list(low_payload.get("section_anchor_bytes", [])),
+        "section_tail_bytes": list(low_payload.get("section_tail_bytes", [])),
+        "section_total_bytes": list(low_payload.get("section_total_bytes", [])),
+        "section_bpp": list(low_payload.get("section_bpp", [])),
+        "video_mean_motion_score": float(low_payload.get("video_mean_motion_score", 0.0)),
+        "video_mean_tail_quality_scale": float(low_payload.get("video_mean_tail_quality_scale", 1.0)),
+        "video_section_bpp_mean": float(low_payload.get("video_section_bpp_mean", 0.0)),
     }
 
 
@@ -117,12 +129,11 @@ def _build_block(block_name: str, raw: bytes) -> Tuple[Dict[str, object], bytes]
     return descriptor, compressed
 
 
-def write_external_entropy_payload(
+def serialize_external_entropy_payload(
     low_payload: Dict[str, object],
-    output_path: Path,
     *,
     relative_path: str | None = None,
-) -> Dict[str, object]:
+) -> Tuple[bytes, Dict[str, object]]:
     block_order: List[str] = []
     block_lengths: Dict[str, int] = {}
     block_payloads: List[bytes] = []
@@ -173,6 +184,8 @@ def write_external_entropy_payload(
         )
 
     section_tail_payloads = []
+    section_anchor_entropy_bytes: List[int] = []
+    section_tail_entropy_bytes: List[int] = []
     for section_idx, tail_payload in enumerate(low_payload["section_tail_payloads"]):
         payload_record = {
             "tail_codec_type": str(tail_payload["tail_codec_type"]),
@@ -198,13 +211,39 @@ def write_external_entropy_payload(
                 bytes(tail_payload["z_string"]),
             )
             payload_record["z_shape"] = [int(value) for value in tail_payload["z_shape"]]
+        if "quality_side_data" in tail_payload:
+            payload_record["quality_side_data"] = add_bytes_block(
+                f"tail_quality_side_data_{section_idx:04d}",
+                bytes(tail_payload["quality_side_data"]),
+            )
         if "reduced_shape" in tail_payload:
             payload_record["reduced_shape"] = [int(value) for value in tail_payload["reduced_shape"]]
         if "bitstream_bytes" in tail_payload:
             payload_record["bitstream_bytes"] = int(tail_payload["bitstream_bytes"])
         if "bitstream_bits" in tail_payload:
             payload_record["bitstream_bits"] = int(tail_payload["bitstream_bits"])
+        if "quality_scale" in tail_payload:
+            payload_record["quality_scale"] = float(tail_payload["quality_scale"])
+        if "quality_side_bytes" in tail_payload:
+            payload_record["quality_side_bytes"] = int(tail_payload["quality_side_bytes"])
+        if "quality_side_bits" in tail_payload:
+            payload_record["quality_side_bits"] = int(tail_payload["quality_side_bits"])
         section_tail_payloads.append(payload_record)
+
+    for section_idx, anchor_payload in enumerate(section_anchor_payloads):
+        total_bytes = 0
+        for key in ("quantized", "scales"):
+            descriptor = anchor_payload.get(key)
+            if isinstance(descriptor, dict):
+                total_bytes += int(descriptor.get("compressed_num_bytes", 0))
+        section_anchor_entropy_bytes.append(total_bytes)
+    for section_idx, tail_payload in enumerate(section_tail_payloads):
+        total_bytes = 0
+        for key in ("quantized", "scales", "y_string", "z_string", "quality_side_data"):
+            descriptor = tail_payload.get(key)
+            if isinstance(descriptor, dict):
+                total_bytes += int(descriptor.get("compressed_num_bytes", 0))
+        section_tail_entropy_bytes.append(total_bytes)
 
     metadata = {
         "format_name": FORMAT_NAME,
@@ -220,44 +259,66 @@ def write_external_entropy_payload(
     }
     metadata_bytes = json.dumps(metadata, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = output_path.parent / f".{output_path.name}.tmp_{os.getpid()}"
-    try:
-        with temp_path.open("wb") as handle:
-            handle.write(MAGIC)
-            handle.write(VERSION.to_bytes(4, "little", signed=False))
-            handle.write(len(metadata_bytes).to_bytes(8, "little", signed=False))
-            handle.write(metadata_bytes)
-            for payload in block_payloads:
-                handle.write(payload)
-        os.replace(temp_path, output_path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
+    output_buffer = io.BytesIO()
+    output_buffer.write(MAGIC)
+    output_buffer.write(VERSION.to_bytes(4, "little", signed=False))
+    output_buffer.write(len(metadata_bytes).to_bytes(8, "little", signed=False))
+    output_buffer.write(metadata_bytes)
+    for payload in block_payloads:
+        output_buffer.write(payload)
+    payload_bytes = output_buffer.getvalue()
 
-    return {
+    return payload_bytes, {
         "format_name": FORMAT_NAME,
         "entropy_codec": metadata["entropy_codec"],
         "field_strategy": FIELD_STRATEGY,
         "block_lengths": block_lengths,
-        "entropy_codec_bytes": int(output_path.stat().st_size),
+        "entropy_codec_bytes": len(payload_bytes),
+        "section_anchor_entropy_bytes": section_anchor_entropy_bytes,
+        "section_tail_entropy_bytes": section_tail_entropy_bytes,
+        "section_entropy_bytes": [
+            int(anchor_bytes + tail_bytes)
+            for anchor_bytes, tail_bytes in zip(section_anchor_entropy_bytes, section_tail_entropy_bytes)
+        ],
     }
 
 
-def read_external_entropy_payload(input_path: Path) -> Dict[str, object]:
-    with input_path.open("rb") as handle:
-        magic = handle.read(len(MAGIC))
-        if magic != MAGIC:
-            raise ValueError(f"Unexpected external entropy magic in {input_path}: {magic!r}")
-        version = int.from_bytes(handle.read(4), "little", signed=False)
-        if version != VERSION:
-            raise ValueError(f"Unsupported external entropy version={version} in {input_path}.")
-        metadata_len = int.from_bytes(handle.read(8), "little", signed=False)
-        metadata = json.loads(handle.read(metadata_len).decode("utf-8"))
-        compressed_blocks = {}
-        for block_name in metadata["block_order"]:
-            block_len = int(metadata["block_lengths"][block_name])
-            compressed_blocks[block_name] = handle.read(block_len)
+def write_external_entropy_payload(
+    low_payload: Dict[str, object],
+    output_path: Path,
+    *,
+    relative_path: str | None = None,
+) -> Dict[str, object]:
+    payload_bytes, summary = serialize_external_entropy_payload(
+        low_payload,
+        relative_path=relative_path,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.parent / f".{output_path.name}.tmp_{os.getpid()}"
+    try:
+        with temp_path.open("wb") as handle:
+            handle.write(payload_bytes)
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return summary
+
+
+def deserialize_external_entropy_payload(payload_bytes: bytes, *, source: str = "<memory>") -> Dict[str, object]:
+    handle = io.BytesIO(payload_bytes)
+    magic = handle.read(len(MAGIC))
+    if magic != MAGIC:
+        raise ValueError(f"Unexpected external entropy magic in {source}: {magic!r}")
+    version = int.from_bytes(handle.read(4), "little", signed=False)
+    if version != VERSION:
+        raise ValueError(f"Unsupported external entropy version={version} in {source}.")
+    metadata_len = int.from_bytes(handle.read(8), "little", signed=False)
+    metadata = json.loads(handle.read(metadata_len).decode("utf-8"))
+    compressed_blocks = {}
+    for block_name in metadata["block_order"]:
+        block_len = int(metadata["block_lengths"][block_name])
+        compressed_blocks[block_name] = handle.read(block_len)
 
     def decode_block(block_descriptor: Dict[str, object]) -> bytes:
         block_name = str(block_descriptor["block"])
@@ -302,6 +363,17 @@ def read_external_entropy_payload(input_path: Path) -> Dict[str, object]:
         "section_ranges": source_payload["section_ranges"],
         "low_codec_bytes": source_payload["low_codec_bytes"],
         "low_bpp": source_payload["low_bpp"],
+        "dynamic_rate_policy": source_payload.get("dynamic_rate_policy"),
+        "section_motion_scores": source_payload.get("section_motion_scores", []),
+        "section_anchor_profiles": source_payload.get("section_anchor_profiles", []),
+        "section_tail_quality_scales": source_payload.get("section_tail_quality_scales", []),
+        "section_anchor_bytes": source_payload.get("section_anchor_bytes", []),
+        "section_tail_bytes": source_payload.get("section_tail_bytes", []),
+        "section_total_bytes": source_payload.get("section_total_bytes", []),
+        "section_bpp": source_payload.get("section_bpp", []),
+        "video_mean_motion_score": source_payload.get("video_mean_motion_score", 0.0),
+        "video_mean_tail_quality_scale": source_payload.get("video_mean_tail_quality_scale", 1.0),
+        "video_section_bpp_mean": source_payload.get("video_section_bpp_mean", 0.0),
         "global_keyframe": global_keyframe,
         "section_anchor_payloads": [],
         "section_tail_payloads": [],
@@ -348,12 +420,25 @@ def read_external_entropy_payload(input_path: Path) -> Dict[str, object]:
         if "z_string" in tail_payload:
             payload_record["z_string"] = decode_block(tail_payload["z_string"])
             payload_record["z_shape"] = tail_payload["z_shape"]
+        if "quality_side_data" in tail_payload:
+            payload_record["quality_side_data"] = decode_block(tail_payload["quality_side_data"])
         if "reduced_shape" in tail_payload:
             payload_record["reduced_shape"] = tail_payload["reduced_shape"]
         if "bitstream_bytes" in tail_payload:
             payload_record["bitstream_bytes"] = tail_payload["bitstream_bytes"]
         if "bitstream_bits" in tail_payload:
             payload_record["bitstream_bits"] = tail_payload["bitstream_bits"]
+        if "quality_scale" in tail_payload:
+            payload_record["quality_scale"] = float(tail_payload["quality_scale"])
+        if "quality_side_bytes" in tail_payload:
+            payload_record["quality_side_bytes"] = int(tail_payload["quality_side_bytes"])
+        if "quality_side_bits" in tail_payload:
+            payload_record["quality_side_bits"] = int(tail_payload["quality_side_bits"])
         low_payload["section_tail_payloads"].append(payload_record)
 
     return low_payload
+
+
+def read_external_entropy_payload(input_path: Path) -> Dict[str, object]:
+    with input_path.open("rb") as handle:
+        return deserialize_external_entropy_payload(handle.read(), source=str(input_path))

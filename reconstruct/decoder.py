@@ -1,5 +1,6 @@
 import argparse
 import json
+import pickle
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -172,6 +173,16 @@ def load_payload(latent_path: Path) -> Dict:
         return torch.load(latent_path, map_location="cpu", weights_only=True)
     except TypeError:
         return torch.load(latent_path, map_location="cpu")
+    except pickle.UnpicklingError as exc:
+        message = str(exc)
+        if "Unsupported global: GLOBAL builtins.bytes" not in message and "Unsupported global: GLOBAL bytes" not in message:
+            raise
+        safe_globals = getattr(torch.serialization, "safe_globals", None)
+        if safe_globals is not None:
+            # low_latent payloads can contain trusted learned-codec bitstream bytes.
+            with safe_globals([bytes]):
+                return torch.load(latent_path, map_location="cpu", weights_only=True)
+        return torch.load(latent_path, map_location="cpu", weights_only=False)
 
 
 def resolve_model_bundle(

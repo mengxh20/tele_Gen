@@ -13,7 +13,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export MAX_SAMPLES="${MAX_SAMPLES:-4}" # 推理4个样本看看就够了
 
 
-SAVEDIR="reconstruct/gen2recon_runs_HE2E_2"
+SAVEDIR="reconstruct/gen2recon_runs_HE2E_dyn"
 INFER_ARGS=(
     reconstruct/recover.py infer
     --checkpoint_dir "${SAVEDIR}/checkpoints"
@@ -39,8 +39,10 @@ torchrun \
 # python reconstruct/decoder.py -R ${SAVEDIR}/recover_outputs
 
 # 推理完之后自动走接收端链路：
-# enc_latents(.bin) -> entropy decode -> low_latents -> recover network -> recover_latents -> video
+# 直接以 low_latents 作为输入，在内存中模拟真实运输码流，再 recover -> video。
+# 这样不会依赖 enc_latents/.bin，也能避免旧 .bin 残留影响当前结果。
 python reconstruct/real_decoder.py \
     -R "${SAVEDIR}/recover_outputs" \
-    --input_dir "${SAVEDIR}/recover_outputs/enc_latents" \
+    --input_dir "${SAVEDIR}/recover_outputs/low_latents" \
+    --transport_input_mode simulate_entropy \
     --checkpoint_dir "${SAVEDIR}/checkpoints"

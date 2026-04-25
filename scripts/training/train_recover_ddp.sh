@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # Recover 14B full fine-tuning should use Accelerate + DeepSpeed ZeRO-3 so model states are sharded.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+# export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 export NNODES="${NNODES:-1}"
 export NODE_RANK="${NODE_RANK:-0}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-export MASTER_PORT="${MASTER_PORT:-29521}"
+export MASTER_PORT="${MASTER_PORT:-29522}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.9}"
 export NUM_MACHINES="${NUM_MACHINES:-${NNODES}}"
 export MACHINE_RANK="${MACHINE_RANK:-${NODE_RANK}}"
@@ -28,7 +28,26 @@ export RATE_LOSS_WEIGHT="${RATE_LOSS_WEIGHT:-2.0}"
 export RATE_LOSS_WARMUP_STEPS="${RATE_LOSS_WARMUP_STEPS:-0}"
 export RATE_LOSS_RAMP_STEPS="${RATE_LOSS_RAMP_STEPS:-0}"
 export ENTROPY_AUX_LEARNING_RATE="${ENTROPY_AUX_LEARNING_RATE:-1e-3}"
+export DYNAMIC_RATE_ENABLED="${DYNAMIC_RATE_ENABLED:-true}"
+export MOTION_SCORE_TYPE="${MOTION_SCORE_TYPE:-latent_delta_l1_norm}"
+export TAIL_QUALITY_MIN="${TAIL_QUALITY_MIN:-0.75}"
+export TAIL_QUALITY_MAX="${TAIL_QUALITY_MAX:-1.35}"
+export ANCHOR_PROFILE_LOW="${ANCHOR_PROFILE_LOW:-4}"
+export ANCHOR_PROFILE_BASE="${ANCHOR_PROFILE_BASE:-2}"
+export ANCHOR_PROFILE_HIGH="${ANCHOR_PROFILE_HIGH:-1}"
 
+DYNAMIC_RATE_FLAG="--dynamic_rate_enabled"
+if [[ "${DYNAMIC_RATE_ENABLED}" == "0" || "${DYNAMIC_RATE_ENABLED}" == "false" || "${DYNAMIC_RATE_ENABLED}" == "False" ]]; then
+    DYNAMIC_RATE_FLAG="--no-dynamic_rate_enabled"
+fi
+
+
+# torchrun \
+#     --nproc_per_node "${NPROC_PER_NODE}" \
+#     --nnodes "${NNODES}" \
+#     --node_rank "${NODE_RANK}" \
+#     --master_addr "${MASTER_ADDR}" \
+#     --master_port "${MASTER_PORT}" \
 accelerate launch \
     --config_file "${ACCELERATE_CONFIG_FILE}" \
     --num_machines "${NUM_MACHINES}" \
@@ -37,7 +56,7 @@ accelerate launch \
     --main_process_ip "${MASTER_ADDR}" \
     --main_process_port "${MASTER_PORT}" \
     reconstruct/recover.py train \
-    --output_dir "reconstruct/gen2recon_runs_HE2E_2" \
+    --output_dir "reconstruct/gen2recon_runs_HE2E_dyn" \
     --batch_size 2 \
     --gradient_accumulation_steps 4 \
     --epochs 500 \
@@ -54,4 +73,11 @@ accelerate launch \
     --rate_loss_warmup_steps "${RATE_LOSS_WARMUP_STEPS}" \
     --rate_loss_ramp_steps "${RATE_LOSS_RAMP_STEPS}" \
     --entropy_aux_learning_rate "${ENTROPY_AUX_LEARNING_RATE}" \
+    "${DYNAMIC_RATE_FLAG}" \
+    --motion_score_type "${MOTION_SCORE_TYPE}" \
+    --tail_quality_min "${TAIL_QUALITY_MIN}" \
+    --tail_quality_max "${TAIL_QUALITY_MAX}" \
+    --anchor_profile_low "${ANCHOR_PROFILE_LOW}" \
+    --anchor_profile_base "${ANCHOR_PROFILE_BASE}" \
+    --anchor_profile_high "${ANCHOR_PROFILE_HIGH}" \
     "$@"

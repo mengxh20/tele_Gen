@@ -1,4 +1,5 @@
 import io
+import pickle
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -93,6 +94,16 @@ def load_payload(latent_path: Path) -> Dict:
         return torch.load(latent_path, map_location="cpu", weights_only=True)
     except TypeError:
         return torch.load(latent_path, map_location="cpu")
+    except pickle.UnpicklingError as exc:
+        message = str(exc)
+        if "Unsupported global: GLOBAL builtins.bytes" not in message and "Unsupported global: GLOBAL bytes" not in message:
+            raise
+        safe_globals = getattr(torch.serialization, "safe_globals", None)
+        if safe_globals is not None:
+            # low_latent payloads can contain trusted learned-codec bitstream bytes.
+            with safe_globals([bytes]):
+                return torch.load(latent_path, map_location="cpu", weights_only=True)
+        return torch.load(latent_path, map_location="cpu", weights_only=False)
 
 
 def load_vae_bundle(base_model_path: str, device: torch.device) -> ModelBundle:

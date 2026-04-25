@@ -42,13 +42,14 @@ from reconstruct.codec_gop import (
     QUANTIZED_INT8_KEYFRAME_CODEC_MODE,
     RAW_KEYFRAME_CODEC_MODE,
     TRILINEAR_TAIL_CODEC_TYPE,
+    compute_section_motion_scores,
     decode_low_latents_payload,
     encode_anchor_plus_tail_latents,
     estimate_anchor_plus_tail_codec_bytes,
     make_section_ranges,
     validate_codec_config,
 )
-from reconstruct.external_entropy import write_external_entropy_payload
+from reconstruct.external_entropy import serialize_external_entropy_payload, write_external_entropy_payload
 from reconstruct.learned_codec import LEARNED_TAIL_CODEC_TYPE, build_learned_tail_codec
 from reconstruct.latent_io import (
     DEFAULT_BASE_MODEL_PATH,
@@ -110,6 +111,15 @@ CURRENT_LOW_TARGET_INIT_PATCH_SHORT = "patch_short"
 LEARNED_CODEC_CHECKPOINT_NAME = "learned_codec.pt"
 LATEST_CHECKPOINT_LINK_NAME = "latest"
 LATEST_CHECKPOINT_POINTER_NAME = "latest_checkpoint.txt"
+DEFAULT_DYNAMIC_RATE_ENABLED = False
+DEFAULT_MOTION_SCORE_TYPE = "latent_delta_l1_norm"
+DEFAULT_MOTION_Q20 = None
+DEFAULT_MOTION_Q80 = None
+DEFAULT_TAIL_QUALITY_MIN = 0.75
+DEFAULT_TAIL_QUALITY_MAX = 1.35
+DEFAULT_ANCHOR_PROFILE_LOW = 4
+DEFAULT_ANCHOR_PROFILE_BASE = 2
+DEFAULT_ANCHOR_PROFILE_HIGH = 1
 EPS = 1e-8
 
 
@@ -138,6 +148,15 @@ class CodecConfig:
     tail_codec_type: str = DEFAULT_TAIL_CODEC_TYPE
     learned_codec_hidden_channels: Optional[int] = None
     learned_codec_hyper_channels: Optional[int] = None
+    dynamic_rate_enabled: bool = DEFAULT_DYNAMIC_RATE_ENABLED
+    motion_score_type: str = DEFAULT_MOTION_SCORE_TYPE
+    motion_q20: Optional[float] = DEFAULT_MOTION_Q20
+    motion_q80: Optional[float] = DEFAULT_MOTION_Q80
+    tail_quality_min: float = DEFAULT_TAIL_QUALITY_MIN
+    tail_quality_max: float = DEFAULT_TAIL_QUALITY_MAX
+    anchor_profile_low: int = DEFAULT_ANCHOR_PROFILE_LOW
+    anchor_profile_base: int = DEFAULT_ANCHOR_PROFILE_BASE
+    anchor_profile_high: int = DEFAULT_ANCHOR_PROFILE_HIGH
 
 
 @dataclass
@@ -388,6 +407,24 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--aux_loss_warmup_steps", type=int, default=DEFAULT_AUX_LOSS_WARMUP_STEPS)
     parser.add_argument("--aux_loss_ramp_steps", type=int, default=DEFAULT_AUX_LOSS_RAMP_STEPS)
     parser.add_argument(
+        "--dynamic_rate_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_DYNAMIC_RATE_ENABLED,
+    )
+    parser.add_argument(
+        "--motion_score_type",
+        type=str,
+        default=DEFAULT_MOTION_SCORE_TYPE,
+        choices=[DEFAULT_MOTION_SCORE_TYPE],
+    )
+    parser.add_argument("--motion_q20", type=float, default=DEFAULT_MOTION_Q20)
+    parser.add_argument("--motion_q80", type=float, default=DEFAULT_MOTION_Q80)
+    parser.add_argument("--tail_quality_min", type=float, default=DEFAULT_TAIL_QUALITY_MIN)
+    parser.add_argument("--tail_quality_max", type=float, default=DEFAULT_TAIL_QUALITY_MAX)
+    parser.add_argument("--anchor_profile_low", type=int, default=DEFAULT_ANCHOR_PROFILE_LOW)
+    parser.add_argument("--anchor_profile_base", type=int, default=DEFAULT_ANCHOR_PROFILE_BASE)
+    parser.add_argument("--anchor_profile_high", type=int, default=DEFAULT_ANCHOR_PROFILE_HIGH)
+    parser.add_argument(
         "--fix_anchor_during_denoise",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_FIX_ANCHOR_DURING_DENOISE,
@@ -420,6 +457,12 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Only run inference on the first N latent files before distributed sharding.",
+    )
+    parser.add_argument(
+        "--save_entropy_bin",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to persist external entropy transport bitstreams as enc_latents/*.bin.",
     )
 
 
@@ -700,6 +743,7 @@ def command_train(args: argparse.Namespace) -> None:
         )
         for path in latent_paths
     ]
+    calibrate_motion_thresholds(prepared_sequences, codec_config)
     dataset = LatentWindowDataset(
         sequences=prepared_sequences,
         history_sizes=history_sizes,
@@ -1256,6 +1300,10 @@ def command_infer(args: argparse.Namespace) -> None:
             checkpoint_value=checkpoint_config.get("weight_dtype"),
         )
         codec_config = CodecConfig(**checkpoint_config["codec_config"])
+        if codec_config.dynamic_rate_enabled and (codec_config.motion_q20 is None or codec_config.motion_q80 is None):
+            raise ValueError(
+                f"Checkpoint {checkpoint_dir} enables dynamic_rate but is missing calibrated motion_q20/motion_q80."
+            )
         history_sizes = normalize_history_sizes(checkpoint_config["history_sizes"])
         latent_window_size = int(checkpoint_config.get("section_span_latents", checkpoint_config["latent_window_size"]))
         anchor_span_latents = int(checkpoint_config.get("anchor_span_latents", codec_config.anchor_span_latents))
@@ -1287,19 +1335,21 @@ def command_infer(args: argparse.Namespace) -> None:
         low_dir = output_dir / "low_latents"
         recover_dir = output_dir / "recover_latents"
         metrics_dir = output_dir / "metrics"
-        enc_dir = output_dir / "enc_latents"
+        enc_dir = output_dir / "enc_latents" if args.save_entropy_bin else None
         entropy_metrics_dir = output_dir / "entropy_metrics"
 
         if distributed_context.is_main_process:
             low_dir.mkdir(parents=True, exist_ok=True)
             recover_dir.mkdir(parents=True, exist_ok=True)
             metrics_dir.mkdir(parents=True, exist_ok=True)
-            enc_dir.mkdir(parents=True, exist_ok=True)
+            if enc_dir is not None:
+                enc_dir.mkdir(parents=True, exist_ok=True)
             entropy_metrics_dir.mkdir(parents=True, exist_ok=True)
             print(
                 f"[infer] input_root={input_root} files={len(latent_paths)}/{total_input_files} "
                 f"device={device} world_size={distributed_context.world_size} "
-                f"checkpoint_dir={checkpoint_dir}"
+                f"checkpoint_dir={checkpoint_dir} "
+                f"save_entropy_bin={args.save_entropy_bin}"
             )
             if checkpoint_dir != requested_checkpoint_dir:
                 print(f"[infer] resolved checkpoint request {requested_checkpoint_dir} -> {checkpoint_dir}")
@@ -1358,11 +1408,18 @@ def command_infer(args: argparse.Namespace) -> None:
             )
             low_payload = build_low_latent_payload(sequence)
             torch.save(low_payload, low_latent_path)
-            entropy_summary = write_external_entropy_payload(
-                low_payload,
-                enc_latent_path,
-                relative_path=str(latent_path.relative_to(input_root)),
-            )
+            relative_transport_path = str(latent_path.relative_to(input_root))
+            if enc_latent_path is not None:
+                entropy_summary = write_external_entropy_payload(
+                    low_payload,
+                    enc_latent_path,
+                    relative_path=relative_transport_path,
+                )
+            else:
+                _, entropy_summary = serialize_external_entropy_payload(
+                    low_payload,
+                    relative_path=relative_transport_path,
+                )
             ensure_finite_recover_state(
                 stage="final_output",
                 input_path=sequence.path,
@@ -1426,6 +1483,13 @@ def command_infer(args: argparse.Namespace) -> None:
                 prediction=recovered_full_latents,
                 target=sequence.clean_full_latents,
             )
+            section_metrics = compute_section_metrics_payload(
+                low_prediction=sequence.low_full_latents,
+                recovered_prediction=recovered_full_latents,
+                target=sequence.clean_full_latents,
+                codec_payload=sequence.low_codec_payload,
+                anchor_span_latents=anchor_span_latents,
+            )
             metrics_payload = {
                 "input_path": str(sequence.path),
                 "low_latent_path": str(low_latent_path),
@@ -1434,6 +1498,12 @@ def command_infer(args: argparse.Namespace) -> None:
                 "raw_bpp": sequence.metadata.raw_bpp,
                 "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
                 "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
+                "dynamic_rate_policy": sequence.low_codec_payload.get("dynamic_rate_policy"),
+                "video_mean_motion_score": float(sequence.low_codec_payload.get("video_mean_motion_score", 0.0)),
+                "video_mean_tail_quality_scale": float(
+                    sequence.low_codec_payload.get("video_mean_tail_quality_scale", 1.0)
+                ),
+                "video_section_bpp_mean": float(sequence.low_codec_payload.get("video_section_bpp_mean", 0.0)),
                 "direct_low_metrics": direct_low_metrics,
                 "restored_metrics": restored_metrics,
                 "low_tail_position_metrics": low_tail_position_metrics,
@@ -1449,6 +1519,7 @@ def command_infer(args: argparse.Namespace) -> None:
                 "codec_config": asdict(codec_config),
                 "checkpoint_dir": str(checkpoint_dir),
                 "num_inference_steps": args.num_inference_steps,
+                "sections": section_metrics,
             }
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
             with metrics_path.open("w", encoding="utf-8") as handle:
@@ -1463,7 +1534,8 @@ def command_infer(args: argparse.Namespace) -> None:
             )
             entropy_metrics_payload = {
                 "input_low_latent_path": str(low_latent_path),
-                "enc_latent_path": str(enc_latent_path),
+                "enc_latent_path": str(enc_latent_path) if enc_latent_path is not None else None,
+                "transport_storage": "disk_bin" if enc_latent_path is not None else "memory_only",
                 "source_low_codec_bytes": source_low_codec_bytes,
                 "source_low_bpp": source_low_bpp,
                 "entropy_codec_bytes": entropy_codec_bytes,
@@ -1477,6 +1549,13 @@ def command_infer(args: argparse.Namespace) -> None:
                 "entropy_codec": str(entropy_summary["entropy_codec"]),
                 "field_strategy": str(entropy_summary["field_strategy"]),
                 "block_lengths": entropy_summary["block_lengths"],
+                "section_anchor_entropy_bytes": entropy_summary.get("section_anchor_entropy_bytes", []),
+                "section_tail_entropy_bytes": entropy_summary.get("section_tail_entropy_bytes", []),
+                "section_entropy_bytes": entropy_summary.get("section_entropy_bytes", []),
+                "section_entropy_bpp": [
+                    float(section_bytes * 8.0 / float(sequence.metadata.total_pixels))
+                    for section_bytes in entropy_summary.get("section_entropy_bytes", [])
+                ],
             }
             entropy_metrics_path.parent.mkdir(parents=True, exist_ok=True)
             with entropy_metrics_path.open("w", encoding="utf-8") as handle:
@@ -1484,6 +1563,7 @@ def command_infer(args: argparse.Namespace) -> None:
 
             print(
                 f"[infer][rank={distributed_context.rank}] saved low={low_latent_path} recover={recover_latent_path} "
+                f"transport={'enc_latents/.bin' if enc_latent_path is not None else 'memory_only'} "
                 f"low_bpp={sequence.low_codec_payload['low_bpp']:.6f} "
                 f"entropy_bpp={entropy_bpp:.6f} "
                 f"direct_low_l1={direct_low_metrics['l1']:.6f} restored_l1={restored_metrics['l1']:.6f}"
@@ -1524,9 +1604,67 @@ def build_codec_config(args: argparse.Namespace) -> CodecConfig:
         tail_codec_type=args.tail_codec_type,
         learned_codec_hidden_channels=getattr(args, "learned_codec_hidden_channels", None),
         learned_codec_hyper_channels=getattr(args, "learned_codec_hyper_channels", None),
+        dynamic_rate_enabled=bool(getattr(args, "dynamic_rate_enabled", DEFAULT_DYNAMIC_RATE_ENABLED)),
+        motion_score_type=str(getattr(args, "motion_score_type", DEFAULT_MOTION_SCORE_TYPE)),
+        motion_q20=getattr(args, "motion_q20", DEFAULT_MOTION_Q20),
+        motion_q80=getattr(args, "motion_q80", DEFAULT_MOTION_Q80),
+        tail_quality_min=float(getattr(args, "tail_quality_min", DEFAULT_TAIL_QUALITY_MIN)),
+        tail_quality_max=float(getattr(args, "tail_quality_max", DEFAULT_TAIL_QUALITY_MAX)),
+        anchor_profile_low=int(getattr(args, "anchor_profile_low", DEFAULT_ANCHOR_PROFILE_LOW)),
+        anchor_profile_base=int(getattr(args, "anchor_profile_base", DEFAULT_ANCHOR_PROFILE_BASE)),
+        anchor_profile_high=int(getattr(args, "anchor_profile_high", DEFAULT_ANCHOR_PROFILE_HIGH)),
     )
     validate_codec_config(asdict(codec_config))
     return codec_config
+
+
+def build_dynamic_rate_policy(codec_config: CodecConfig) -> Dict[str, object]:
+    return {
+        "enabled": bool(codec_config.dynamic_rate_enabled),
+        "motion_score_type": str(codec_config.motion_score_type),
+        "motion_q20": codec_config.motion_q20,
+        "motion_q80": codec_config.motion_q80,
+        "tail_quality_min": float(codec_config.tail_quality_min),
+        "tail_quality_max": float(codec_config.tail_quality_max),
+        "anchor_profile_table": {
+            "low": int(codec_config.anchor_profile_low),
+            "base": int(codec_config.anchor_profile_base),
+            "high": int(codec_config.anchor_profile_high),
+        },
+    }
+
+
+def calibrate_motion_thresholds(
+    sequences: Sequence[PreparedSequence],
+    codec_config: CodecConfig,
+) -> Tuple[Optional[float], Optional[float]]:
+    if not codec_config.dynamic_rate_enabled:
+        return codec_config.motion_q20, codec_config.motion_q80
+    if codec_config.motion_q20 is not None and codec_config.motion_q80 is not None:
+        return codec_config.motion_q20, codec_config.motion_q80
+
+    motion_values: List[float] = []
+    for sequence in sequences:
+        section_ranges = make_section_ranges(
+            total_latent_frames=int(sequence.clean_full_latents.shape[1]),
+            section_span_latents=int(codec_config.section_span_latents),
+            start_index=1,
+        )
+        motion_values.extend(
+            compute_section_motion_scores(
+                clean_full_latents=sequence.clean_full_latents,
+                section_ranges=section_ranges,
+            )
+        )
+    if not motion_values:
+        codec_config.motion_q20 = 0.0
+        codec_config.motion_q80 = 0.0
+        return codec_config.motion_q20, codec_config.motion_q80
+
+    motion_tensor = torch.tensor(motion_values, dtype=torch.float32)
+    codec_config.motion_q20 = float(torch.quantile(motion_tensor, 0.20).item())
+    codec_config.motion_q80 = float(torch.quantile(motion_tensor, 0.80).item())
+    return codec_config.motion_q20, codec_config.motion_q80
 
 
 def normalize_history_sizes(history_sizes: Sequence[int]) -> List[int]:
@@ -1688,6 +1826,38 @@ def build_sequence_low_latents(
     low_codec_payload["low_bpp"] = compute_bpp_from_total_pixels(
         int(low_codec_payload["low_codec_bytes"]),
         sequence.metadata.total_pixels,
+    )
+    section_motion_scores = [float(value) for value in low_codec_payload.get("section_motion_scores", [])]
+    section_anchor_profiles = list(low_codec_payload.get("section_anchor_profiles", []))
+    section_tail_quality_scales = [float(value) for value in low_codec_payload.get("section_tail_quality_scales", [])]
+    section_anchor_bytes = [int(value) for value in low_codec_payload.get("section_anchor_bytes", [])]
+    section_tail_bytes = [int(value) for value in low_codec_payload.get("section_tail_bytes", [])]
+    section_total_bytes = [int(value) for value in low_codec_payload.get("section_total_bytes", [])]
+    section_bpp = [
+        float(section_bytes * 8.0 / float(sequence.metadata.total_pixels))
+        for section_bytes in section_total_bytes
+    ]
+    low_codec_payload["dynamic_rate_policy"] = low_codec_payload.get(
+        "dynamic_rate_policy",
+        build_dynamic_rate_policy(codec_config),
+    )
+    low_codec_payload["section_motion_scores"] = section_motion_scores
+    low_codec_payload["section_anchor_profiles"] = section_anchor_profiles
+    low_codec_payload["section_tail_quality_scales"] = section_tail_quality_scales
+    low_codec_payload["section_anchor_bytes"] = section_anchor_bytes
+    low_codec_payload["section_tail_bytes"] = section_tail_bytes
+    low_codec_payload["section_total_bytes"] = section_total_bytes
+    low_codec_payload["section_bpp"] = section_bpp
+    low_codec_payload["video_mean_motion_score"] = (
+        float(sum(section_motion_scores) / len(section_motion_scores)) if section_motion_scores else 0.0
+    )
+    low_codec_payload["video_mean_tail_quality_scale"] = (
+        float(sum(section_tail_quality_scales) / len(section_tail_quality_scales))
+        if section_tail_quality_scales
+        else 1.0
+    )
+    low_codec_payload["video_section_bpp_mean"] = (
+        float(sum(section_bpp) / len(section_bpp)) if section_bpp else 0.0
     )
     # 讲latents恢复到原尺寸
     low_full_latents = decode_low_latents(
@@ -1889,6 +2059,18 @@ def build_training_batch_tensors(
     low_latent_cache: Dict[int, torch.Tensor] = {}
     clean_latent_cache: Dict[int, torch.Tensor] = {}
     codec_rate_bpp_cache: Dict[int, torch.Tensor] = {}
+    section_index_cache: Dict[int, Dict[int, int]] = {}
+    section_motion_cache: Dict[int, torch.Tensor] = {}
+    section_anchor_profile_cache: Dict[int, torch.Tensor] = {}
+    section_tail_quality_cache: Dict[int, torch.Tensor] = {}
+    section_anchor_bytes_cache: Dict[int, torch.Tensor] = {}
+    section_tail_bits_cache: Dict[int, torch.Tensor] = {}
+    section_total_bpp_cache: Dict[int, torch.Tensor] = {}
+    anchor_profile_factor_map = {
+        "low": int(codec_config.anchor_profile_low),
+        "base": int(codec_config.anchor_profile_base),
+        "high": int(codec_config.anchor_profile_high),
+    }
     for seq_idx in unique_seq_indices:
         sequence = sequences[seq_idx]
         codec_payload, low_full_latents = build_sequence_low_latents(
@@ -1902,6 +2084,34 @@ def build_training_batch_tensors(
         clean_latent_cache[seq_idx] = sequence.clean_full_latents.to(device=device, dtype=torch.float32).contiguous()
         low_latent_cache[seq_idx] = low_full_latents.to(device=device, dtype=torch.float32).contiguous()
         codec_rate_bpp_cache[seq_idx] = codec_payload["low_bpp_loss"].to(device=device, dtype=torch.float32)
+        section_ranges = [tuple(int(v) for v in section_range) for section_range in codec_payload.get("section_ranges", [])]
+        num_sections = len(section_ranges)
+        section_index_cache[seq_idx] = {int(start): section_idx for section_idx, (start, _end) in enumerate(section_ranges)}
+        default_section_bpp = float(codec_payload["low_bpp_loss"].detach().cpu().item()) if num_sections > 0 else 0.0
+        motion_scores = codec_payload.get("section_motion_scores", [0.0] * num_sections)
+        anchor_profiles = codec_payload.get("section_anchor_profiles", ["base"] * num_sections)
+        tail_quality_scales = codec_payload.get("section_tail_quality_scales", [1.0] * num_sections)
+        section_anchor_bytes = codec_payload.get("section_anchor_bytes", [0] * num_sections)
+        section_tail_bytes = codec_payload.get("section_tail_bytes", [0] * num_sections)
+        section_bpp = codec_payload.get("section_bpp", [default_section_bpp] * num_sections)
+        section_motion_cache[seq_idx] = torch.tensor(motion_scores, device=device, dtype=torch.float32)
+        section_anchor_profile_cache[seq_idx] = torch.tensor(
+            [anchor_profile_factor_map.get(str(profile), int(codec_config.anchor_profile_base)) for profile in anchor_profiles],
+            device=device,
+            dtype=torch.long,
+        )
+        section_tail_quality_cache[seq_idx] = torch.tensor(
+            tail_quality_scales,
+            device=device,
+            dtype=torch.float32,
+        )
+        section_anchor_bytes_cache[seq_idx] = torch.tensor(section_anchor_bytes, device=device, dtype=torch.float32)
+        section_tail_bits_cache[seq_idx] = torch.tensor(
+            [float(value) * 8.0 for value in section_tail_bytes],
+            device=device,
+            dtype=torch.float32,
+        )
+        section_total_bpp_cache[seq_idx] = torch.tensor(section_bpp, device=device, dtype=torch.float32)
 
     history_latents: List[torch.Tensor] = []
     target_latents: List[torch.Tensor] = []
@@ -1910,9 +2120,18 @@ def build_training_batch_tensors(
     x0_latents: List[torch.Tensor] = []
     valid_target_frames: List[int] = []
     codec_rate_bpp: List[torch.Tensor] = []
+    section_motion_score: List[torch.Tensor] = []
+    section_anchor_profile: List[torch.Tensor] = []
+    section_tail_quality_scale: List[torch.Tensor] = []
+    section_anchor_bytes: List[torch.Tensor] = []
+    section_tail_bits: List[torch.Tensor] = []
+    section_total_bpp: List[torch.Tensor] = []
     for seq_idx, section_start in zip(seq_indices, section_starts):
         clean_full_latents = clean_latent_cache[seq_idx]
         low_full_latents = low_latent_cache[seq_idx]
+        section_idx = section_index_cache[seq_idx].get(int(section_start))
+        if section_idx is None:
+            raise KeyError(f"Missing section statistics for seq_idx={seq_idx}, section_start={section_start}.")
         target_latent, valid_frames = extract_target_window(
             clean_full_latents=clean_full_latents,
             section_start=section_start,
@@ -1946,6 +2165,12 @@ def build_training_batch_tensors(
         x0_latents.append(clean_full_latents[:, :1])
         valid_target_frames.append(valid_frames)
         codec_rate_bpp.append(codec_rate_bpp_cache[seq_idx])
+        section_motion_score.append(section_motion_cache[seq_idx][section_idx])
+        section_anchor_profile.append(section_anchor_profile_cache[seq_idx][section_idx])
+        section_tail_quality_scale.append(section_tail_quality_cache[seq_idx][section_idx])
+        section_anchor_bytes.append(section_anchor_bytes_cache[seq_idx][section_idx])
+        section_tail_bits.append(section_tail_bits_cache[seq_idx][section_idx])
+        section_total_bpp.append(section_total_bpp_cache[seq_idx][section_idx])
 
     return {
         "history_latents": torch.stack(history_latents, dim=0).contiguous(),
@@ -1955,6 +2180,12 @@ def build_training_batch_tensors(
         "x0_latents": torch.stack(x0_latents, dim=0).contiguous(),
         "valid_target_frames": torch.tensor(valid_target_frames, device=device, dtype=torch.long),
         "codec_rate_bpp": torch.stack(codec_rate_bpp, dim=0).contiguous(),
+        "section_motion_score": torch.stack(section_motion_score, dim=0).contiguous(),
+        "section_anchor_profile": torch.stack(section_anchor_profile, dim=0).contiguous(),
+        "section_tail_quality_scale": torch.stack(section_tail_quality_scale, dim=0).contiguous(),
+        "section_anchor_bytes": torch.stack(section_anchor_bytes, dim=0).contiguous(),
+        "section_tail_bits": torch.stack(section_tail_bits, dim=0).contiguous(),
+        "section_total_bpp": torch.stack(section_total_bpp, dim=0).contiguous(),
     }
 
 
@@ -2135,6 +2366,7 @@ def training_step(
     x0_latents = materialized_batch["x0_latents"].to(dtype=weight_dtype)
     valid_target_frames = materialized_batch["valid_target_frames"]
     codec_rate_bpp = materialized_batch["codec_rate_bpp"].to(device=device, dtype=torch.float32)
+    section_total_bpp = materialized_batch["section_total_bpp"].to(device=device, dtype=torch.float32)
 
     # 这段代码讲short,mid,long三档历史和target一起拼成 transformer 输入，后续 transformer 内部会区分处理。
     (
@@ -2249,7 +2481,7 @@ def training_step(
         device=device,
         position_weights=tail_position_weights,
     )
-    rate_bpp_value = codec_rate_bpp.mean()
+    rate_bpp_value = section_total_bpp.mean()
     rate_loss = rate_bpp_value if learned_tail_codec is not None else torch.zeros((), device=device, dtype=torch.float32)
     codec_aux_loss = (
         learned_tail_codec.aux_loss().float()
@@ -2793,6 +3025,17 @@ def build_low_latent_payload(sequence: PreparedSequence) -> Dict[str, object]:
         "section_tail_payloads": sequence.low_codec_payload["section_tail_payloads"],
         "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
         "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
+        "dynamic_rate_policy": sequence.low_codec_payload.get("dynamic_rate_policy"),
+        "section_motion_scores": list(sequence.low_codec_payload.get("section_motion_scores", [])),
+        "section_anchor_profiles": list(sequence.low_codec_payload.get("section_anchor_profiles", [])),
+        "section_tail_quality_scales": list(sequence.low_codec_payload.get("section_tail_quality_scales", [])),
+        "section_anchor_bytes": list(sequence.low_codec_payload.get("section_anchor_bytes", [])),
+        "section_tail_bytes": list(sequence.low_codec_payload.get("section_tail_bytes", [])),
+        "section_total_bytes": list(sequence.low_codec_payload.get("section_total_bytes", [])),
+        "section_bpp": list(sequence.low_codec_payload.get("section_bpp", [])),
+        "video_mean_motion_score": float(sequence.low_codec_payload.get("video_mean_motion_score", 0.0)),
+        "video_mean_tail_quality_scale": float(sequence.low_codec_payload.get("video_mean_tail_quality_scale", 1.0)),
+        "video_section_bpp_mean": float(sequence.low_codec_payload.get("video_section_bpp_mean", 0.0)),
     }
 
 
@@ -2823,6 +3066,14 @@ def build_recover_latent_payload(
             "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
             "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
             "section_ranges": [list(section_range) for section_range in sequence.low_codec_payload["section_ranges"]],
+            "dynamic_rate_policy": sequence.low_codec_payload.get("dynamic_rate_policy"),
+            "section_motion_scores": list(sequence.low_codec_payload.get("section_motion_scores", [])),
+            "section_anchor_profiles": list(sequence.low_codec_payload.get("section_anchor_profiles", [])),
+            "section_tail_quality_scales": list(sequence.low_codec_payload.get("section_tail_quality_scales", [])),
+            "section_anchor_bytes": list(sequence.low_codec_payload.get("section_anchor_bytes", [])),
+            "section_tail_bytes": list(sequence.low_codec_payload.get("section_tail_bytes", [])),
+            "section_total_bytes": list(sequence.low_codec_payload.get("section_total_bytes", [])),
+            "section_bpp": list(sequence.low_codec_payload.get("section_bpp", [])),
         },
     }
 
@@ -2848,14 +3099,15 @@ def resolve_output_paths(
 def resolve_entropy_output_paths(
     input_path: Path,
     input_root: Path,
-    enc_dir: Path,
+    enc_dir: Optional[Path],
     entropy_metrics_dir: Path,
-) -> Tuple[Path, Path]:
-    """为外层熵编产物生成 `.bin` 与 `entropy_metrics` 路径。"""
+) -> Tuple[Optional[Path], Path]:
+    """为外层熵编产物生成可选 `.bin` 路径与 `entropy_metrics` 路径。"""
     relative_path = input_path.relative_to(input_root)
-    enc_latent_path = (enc_dir / relative_path).with_suffix(".bin")
+    enc_latent_path = (enc_dir / relative_path).with_suffix(".bin") if enc_dir is not None else None
     entropy_metrics_path = (entropy_metrics_dir / relative_path).with_suffix(".json")
-    enc_latent_path.parent.mkdir(parents=True, exist_ok=True)
+    if enc_latent_path is not None:
+        enc_latent_path.parent.mkdir(parents=True, exist_ok=True)
     entropy_metrics_path.parent.mkdir(parents=True, exist_ok=True)
     return enc_latent_path, entropy_metrics_path
 
@@ -2988,6 +3240,77 @@ def compute_boundary_transition_l1(
     return float(sum(boundary_errors) / len(boundary_errors))
 
 
+def compute_boundary_error_at_index(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    boundary_index: int,
+) -> float:
+    if boundary_index <= 0 or boundary_index >= prediction.shape[1]:
+        return 0.0
+    pred_delta = prediction[:, boundary_index] - prediction[:, boundary_index - 1]
+    target_delta = target[:, boundary_index] - target[:, boundary_index - 1]
+    return float((pred_delta - target_delta).abs().mean().item())
+
+
+def compute_section_metrics_payload(
+    low_prediction: torch.Tensor,
+    recovered_prediction: torch.Tensor,
+    target: torch.Tensor,
+    codec_payload: Dict[str, object],
+    anchor_span_latents: int,
+) -> List[Dict[str, object]]:
+    section_ranges = [tuple(int(value) for value in section_range) for section_range in codec_payload.get("section_ranges", [])]
+    motion_scores = [float(value) for value in codec_payload.get("section_motion_scores", [])]
+    anchor_profiles = list(codec_payload.get("section_anchor_profiles", []))
+    tail_quality_scales = [float(value) for value in codec_payload.get("section_tail_quality_scales", [])]
+    section_anchor_bytes = [int(value) for value in codec_payload.get("section_anchor_bytes", [])]
+    section_tail_bytes = [int(value) for value in codec_payload.get("section_tail_bytes", [])]
+    section_total_bytes = [int(value) for value in codec_payload.get("section_total_bytes", [])]
+    section_bpp = [float(value) for value in codec_payload.get("section_bpp", [])]
+    sections: List[Dict[str, object]] = []
+
+    for section_idx, (section_start, section_end) in enumerate(section_ranges):
+        anchor_end = min(section_end, section_start + anchor_span_latents)
+        direct_low_metrics = compute_tensor_metrics(
+            low_prediction[:, section_start:section_end],
+            target[:, section_start:section_end],
+        )
+        restored_metrics = compute_tensor_metrics(
+            recovered_prediction[:, section_start:section_end],
+            target[:, section_start:section_end],
+        )
+        anchor_metrics = compute_tensor_metrics(
+            recovered_prediction[:, section_start:anchor_end],
+            target[:, section_start:anchor_end],
+        ) if anchor_end > section_start else {"mse": 0.0, "l1": 0.0, "psnr": float("inf")}
+        tail_metrics = compute_tensor_metrics(
+            recovered_prediction[:, anchor_end:section_end],
+            target[:, anchor_end:section_end],
+        ) if section_end > anchor_end else {"mse": 0.0, "l1": 0.0, "psnr": float("inf")}
+        sections.append(
+            {
+                "section_idx": int(section_idx),
+                "section_range": [int(section_start), int(section_end)],
+                "motion_score": motion_scores[section_idx] if section_idx < len(motion_scores) else 0.0,
+                "anchor_profile": anchor_profiles[section_idx] if section_idx < len(anchor_profiles) else "base",
+                "tail_quality_scale": (
+                    tail_quality_scales[section_idx] if section_idx < len(tail_quality_scales) else 1.0
+                ),
+                "anchor_bytes": section_anchor_bytes[section_idx] if section_idx < len(section_anchor_bytes) else 0,
+                "tail_bytes": section_tail_bytes[section_idx] if section_idx < len(section_tail_bytes) else 0,
+                "total_bytes": section_total_bytes[section_idx] if section_idx < len(section_total_bytes) else 0,
+                "section_low_bpp": section_bpp[section_idx] if section_idx < len(section_bpp) else 0.0,
+                "direct_low_metrics": direct_low_metrics,
+                "restored_metrics": restored_metrics,
+                "boundary_in_l1": compute_boundary_error_at_index(recovered_prediction, target, section_start),
+                "boundary_out_l1": compute_boundary_error_at_index(recovered_prediction, target, section_end),
+                "anchor_metrics": anchor_metrics,
+                "tail_metrics": tail_metrics,
+            }
+        )
+    return sections
+
+
 def save_training_artifacts(
     output_dir: Path,
     transformer: torch.nn.Module,
@@ -3082,6 +3405,7 @@ def build_recover_config(
     learned_codec_config = None
     if learned_tail_codec is not None:
         learned_codec_config = unwrap_model(learned_tail_codec).codec_hyperparams()
+    dynamic_rate_policy = build_dynamic_rate_policy(codec_config)
     return {
         "format_version": RECOVER_CONFIG_VERSION,
         "base_model_path": args.base_model_path,
@@ -3104,6 +3428,7 @@ def build_recover_config(
         ),
         "learned_codec_checkpoint": LEARNED_CODEC_CHECKPOINT_NAME if learned_tail_codec is not None else None,
         "learned_codec_config": learned_codec_config,
+        "dynamic_rate_policy": dynamic_rate_policy,
         "use_current_low_target_branch": True,
         "current_low_target_mode": CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X,
         "current_low_target_init": CURRENT_LOW_TARGET_INIT_PATCH_SHORT,
@@ -3337,10 +3662,49 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     codec_config.setdefault("anchor_spatial_factor", int(config.get("anchor_spatial_factor", DEFAULT_ANCHOR_SPATIAL_FACTOR)))
     codec_config.setdefault("tail_codec_type", config.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
     learned_codec_config = dict(config.get("learned_codec_config", {}))
+    dynamic_rate_policy = dict(config.get("dynamic_rate_policy", {}))
     if "hidden_channels" in learned_codec_config and "learned_codec_hidden_channels" not in codec_config:
         codec_config["learned_codec_hidden_channels"] = int(learned_codec_config["hidden_channels"])
     if "hyper_channels" in learned_codec_config and "learned_codec_hyper_channels" not in codec_config:
         codec_config["learned_codec_hyper_channels"] = int(learned_codec_config["hyper_channels"])
+    codec_config.setdefault(
+        "dynamic_rate_enabled",
+        bool(dynamic_rate_policy.get("enabled", codec_config.get("dynamic_rate_enabled", DEFAULT_DYNAMIC_RATE_ENABLED))),
+    )
+    codec_config.setdefault(
+        "motion_score_type",
+        str(dynamic_rate_policy.get("motion_score_type", codec_config.get("motion_score_type", DEFAULT_MOTION_SCORE_TYPE))),
+    )
+    codec_config.setdefault(
+        "motion_q20",
+        dynamic_rate_policy.get("motion_q20", codec_config.get("motion_q20", DEFAULT_MOTION_Q20)),
+    )
+    codec_config.setdefault(
+        "motion_q80",
+        dynamic_rate_policy.get("motion_q80", codec_config.get("motion_q80", DEFAULT_MOTION_Q80)),
+    )
+    codec_config.setdefault(
+        "tail_quality_min",
+        float(dynamic_rate_policy.get("tail_quality_min", codec_config.get("tail_quality_min", DEFAULT_TAIL_QUALITY_MIN))),
+    )
+    codec_config.setdefault(
+        "tail_quality_max",
+        float(dynamic_rate_policy.get("tail_quality_max", codec_config.get("tail_quality_max", DEFAULT_TAIL_QUALITY_MAX))),
+    )
+    anchor_profile_table = dict(dynamic_rate_policy.get("anchor_profile_table", {}))
+    codec_config.setdefault(
+        "anchor_profile_low",
+        int(anchor_profile_table.get("low", codec_config.get("anchor_profile_low", DEFAULT_ANCHOR_PROFILE_LOW))),
+    )
+    codec_config.setdefault(
+        "anchor_profile_base",
+        int(anchor_profile_table.get("base", codec_config.get("anchor_profile_base", DEFAULT_ANCHOR_PROFILE_BASE))),
+    )
+    codec_config.setdefault(
+        "anchor_profile_high",
+        int(anchor_profile_table.get("high", codec_config.get("anchor_profile_high", DEFAULT_ANCHOR_PROFILE_HIGH))),
+    )
+    validate_codec_config(codec_config)
 
     config["format_version"] = RECOVER_CONFIG_VERSION
     config["codec_config"] = codec_config
@@ -3359,6 +3723,7 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     )
     config["learned_codec_checkpoint"] = config.get("learned_codec_checkpoint")
     config["learned_codec_config"] = learned_codec_config
+    config["dynamic_rate_policy"] = build_dynamic_rate_policy(CodecConfig(**codec_config))
     config["use_current_low_target_branch"] = True
     config["current_low_target_mode"] = CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X
     config["current_low_target_init"] = CURRENT_LOW_TARGET_INIT_PATCH_SHORT

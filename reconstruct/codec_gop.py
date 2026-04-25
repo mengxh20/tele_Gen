@@ -19,12 +19,38 @@ def _get_config_value(codec_config, key: str):
     return getattr(codec_config, key)
 
 
+def _get_optional_config_value(codec_config, key: str, default):
+    if isinstance(codec_config, dict):
+        return codec_config.get(key, default)
+    return getattr(codec_config, key, default)
+
+
 def _as_int(codec_config, key: str) -> int:
     return int(_get_config_value(codec_config, key))
 
 
 def _as_str(codec_config, key: str) -> str:
     return str(_get_config_value(codec_config, key))
+
+
+def _as_float(codec_config, key: str) -> float:
+    return float(_get_config_value(codec_config, key))
+
+
+def _as_optional_float(codec_config, key: str, default: float | None = None) -> float | None:
+    value = _get_optional_config_value(codec_config, key, default)
+    if value is None:
+        return None
+    return float(value)
+
+
+def _as_bool(codec_config, key: str, default: bool = False) -> bool:
+    value = _get_optional_config_value(codec_config, key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _tail_codec_type(codec_config) -> str:
@@ -37,6 +63,22 @@ def _keyframe_codec_mode(codec_config) -> str:
     if isinstance(codec_config, dict):
         return str(codec_config.get("keyframe_codec_mode", RAW_KEYFRAME_CODEC_MODE))
     return str(getattr(codec_config, "keyframe_codec_mode", RAW_KEYFRAME_CODEC_MODE))
+
+
+def _dynamic_rate_policy(codec_config) -> Dict[str, object]:
+    return {
+        "enabled": _as_bool(codec_config, "dynamic_rate_enabled", False),
+        "motion_score_type": str(_get_optional_config_value(codec_config, "motion_score_type", "latent_delta_l1_norm")),
+        "motion_q20": _as_optional_float(codec_config, "motion_q20"),
+        "motion_q80": _as_optional_float(codec_config, "motion_q80"),
+        "tail_quality_min": float(_get_optional_config_value(codec_config, "tail_quality_min", 0.75)),
+        "tail_quality_max": float(_get_optional_config_value(codec_config, "tail_quality_max", 1.35)),
+        "anchor_profile_table": {
+            "low": int(_get_optional_config_value(codec_config, "anchor_profile_low", 4)),
+            "base": int(_get_optional_config_value(codec_config, "anchor_profile_base", 2)),
+            "high": int(_get_optional_config_value(codec_config, "anchor_profile_high", 1)),
+        },
+    }
 
 
 def _maybe_to_cpu(tensor: torch.Tensor, move_to_cpu: bool) -> torch.Tensor:
@@ -104,6 +146,31 @@ def validate_codec_config(codec_config) -> None:
             f"Unsupported tail_codec_type={tail_codec_type}. "
             f"Expected {TRILINEAR_TAIL_CODEC_TYPE} or {LEARNED_TAIL_CODEC_TYPE}."
         )
+    dynamic_rate_enabled = _as_bool(codec_config, "dynamic_rate_enabled", False)
+    motion_score_type = str(_get_optional_config_value(codec_config, "motion_score_type", "latent_delta_l1_norm"))
+    if motion_score_type != "latent_delta_l1_norm":
+        raise ValueError(
+            f"Unsupported motion_score_type={motion_score_type}. Only latent_delta_l1_norm is implemented."
+        )
+    tail_quality_min = float(_get_optional_config_value(codec_config, "tail_quality_min", 0.75))
+    tail_quality_max = float(_get_optional_config_value(codec_config, "tail_quality_max", 1.35))
+    if tail_quality_min <= 0.0 or tail_quality_max <= 0.0:
+        raise ValueError(
+            f"tail_quality_min and tail_quality_max must both be > 0, got {tail_quality_min}, {tail_quality_max}."
+        )
+    if tail_quality_max < tail_quality_min:
+        raise ValueError(
+            f"tail_quality_max must be >= tail_quality_min, got {tail_quality_max} < {tail_quality_min}."
+        )
+    for key in ("anchor_profile_low", "anchor_profile_base", "anchor_profile_high"):
+        value = int(_get_optional_config_value(codec_config, key, {"anchor_profile_low": 4, "anchor_profile_base": 2, "anchor_profile_high": 1}[key]))
+        if value < 1:
+            raise ValueError(f"{key} must be >= 1, got {value}.")
+    if dynamic_rate_enabled:
+        motion_q20 = _as_optional_float(codec_config, "motion_q20")
+        motion_q80 = _as_optional_float(codec_config, "motion_q80")
+        if motion_q20 is not None and motion_q80 is not None and motion_q80 < motion_q20:
+            raise ValueError(f"motion_q80 must be >= motion_q20, got {motion_q80} < {motion_q20}.")
 
 
 def make_section_ranges(
@@ -123,6 +190,83 @@ def make_section_ranges(
         end = min(total_latent_frames, start + section_span_latents)
         ranges.append((start, end))
     return ranges
+
+
+def compute_section_motion_scores(
+    clean_full_latents: torch.Tensor,
+    section_ranges: Sequence[Tuple[int, int]],
+) -> List[float]:
+    if clean_full_latents.ndim != 4:
+        raise ValueError(
+            f"Expected clean_full_latents with shape [C, T, H, W], got {tuple(clean_full_latents.shape)}."
+        )
+    motion_scores: List[float] = []
+    for section_start, section_end in section_ranges:
+        if section_end <= section_start:
+            motion_scores.append(0.0)
+            continue
+        current_section = clean_full_latents[:, section_start:section_end].float()
+        previous_frame = clean_full_latents[:, section_start - 1 : section_start].float()
+        section_with_prev = torch.cat([previous_frame, current_section], dim=1)
+        delta = section_with_prev[:, 1:] - section_with_prev[:, :-1]
+        numerator = delta.abs().mean()
+        denominator = current_section.abs().mean() + EPS
+        motion_scores.append(float((numerator / denominator).detach().cpu().item()))
+    return motion_scores
+
+
+def _motion_interpolation_weight(motion_score: float, motion_q20: float, motion_q80: float) -> float:
+    if motion_q80 <= motion_q20 + EPS:
+        return 1.0 if motion_score > motion_q20 else 0.0
+    return float(min(1.0, max(0.0, (motion_score - motion_q20) / (motion_q80 - motion_q20))))
+
+
+def _resolve_section_anchor_profile(motion_score: float, codec_config) -> Tuple[str, int]:
+    profile_table = _dynamic_rate_policy(codec_config)["anchor_profile_table"]
+    motion_q20 = _as_optional_float(codec_config, "motion_q20")
+    motion_q80 = _as_optional_float(codec_config, "motion_q80")
+    if motion_q20 is None or motion_q80 is None:
+        raise ValueError("Dynamic rate allocation requires motion_q20 and motion_q80 to be calibrated.")
+    if motion_score <= motion_q20:
+        return "low", int(profile_table["low"])
+    if motion_score >= motion_q80:
+        return "high", int(profile_table["high"])
+    return "base", int(profile_table["base"])
+
+
+def _resolve_section_tail_quality_scale(motion_score: float, codec_config) -> float:
+    motion_q20 = _as_optional_float(codec_config, "motion_q20")
+    motion_q80 = _as_optional_float(codec_config, "motion_q80")
+    if motion_q20 is None or motion_q80 is None:
+        raise ValueError("Dynamic rate allocation requires motion_q20 and motion_q80 to be calibrated.")
+    quality_min = float(_get_optional_config_value(codec_config, "tail_quality_min", 0.75))
+    quality_max = float(_get_optional_config_value(codec_config, "tail_quality_max", 1.35))
+    weight = _motion_interpolation_weight(motion_score, motion_q20, motion_q80)
+    return float(quality_min + weight * (quality_max - quality_min))
+
+
+def _estimate_tensor_payload_bytes(payload: Dict[str, object]) -> int:
+    total_bytes = 0
+    for tensor_key in ("quantized", "scales"):
+        value = payload.get(tensor_key)
+        if isinstance(value, torch.Tensor):
+            total_bytes += value.numel() * value.element_size()
+    for bytes_key in ("y_string", "z_string"):
+        if bytes_key in payload:
+            total_bytes += len(bytes(payload[bytes_key]))
+    if "quality_side_data" in payload:
+        total_bytes += len(bytes(payload["quality_side_data"]))
+    elif "quality_side_bytes" in payload:
+        total_bytes += int(payload["quality_side_bytes"])
+    if "reconstructed_residual" in payload:
+        rate_bits = payload.get("rate_bits")
+        if torch.is_tensor(rate_bits):
+            total_bytes += int(math.ceil(float(rate_bits.detach().cpu().item()) / 8.0))
+        else:
+            total_bytes += int(math.ceil(float(rate_bits or 0.0) / 8.0))
+    for shape_key in ("reduced_shape", "original_shape", "y_shape", "z_shape"):
+        total_bytes += len(payload.get(shape_key, [])) * 4
+    return int(total_bytes)
 
 
 def trilinear_resize(latents: torch.Tensor, size: Tuple[int, int, int]) -> torch.Tensor:
@@ -257,6 +401,7 @@ def encode_section_tail_residual(
     decoded_anchor_latents: torch.Tensor,
     codec_config,
     learned_tail_codec=None,
+    quality_scale: float | torch.Tensor | None = None,
     use_ste_quant: bool = False,
     move_to_cpu: bool = True,
 ) -> Dict[str, object]:
@@ -279,6 +424,7 @@ def encode_section_tail_residual(
                 int(section_tail_latents.shape[3]),
             ],
             "original_shape": original_shape,
+            "quality_scale": float(1.0 if quality_scale is None else float(quality_scale)),
         }
 
     anchor_reference = (
@@ -296,14 +442,17 @@ def encode_section_tail_residual(
             payload = learned_tail_codec.encode_to_training_payload(
                 residual=residual_tail.unsqueeze(0),
                 anchor_latents=anchor_condition,
+                quality_scale=quality_scale,
             )
         else:
             payload = learned_tail_codec.encode_to_bitstream_payload(
                 residual=residual_tail.unsqueeze(0),
                 anchor_latents=anchor_condition,
+                quality_scale=quality_scale,
             )
         payload["tail_codec_type"] = LEARNED_TAIL_CODEC_TYPE
         payload["original_shape"] = original_shape
+        payload["quality_scale"] = float(1.0 if quality_scale is None else float(quality_scale))
         return payload
 
     reduced_tail = trilinear_resize(
@@ -321,6 +470,7 @@ def encode_section_tail_residual(
     )
     payload["tail_codec_type"] = TRILINEAR_TAIL_CODEC_TYPE
     payload["original_shape"] = original_shape
+    payload["quality_scale"] = float(1.0 if quality_scale is None else float(quality_scale))
     return payload
 
 
@@ -344,6 +494,7 @@ def decode_section_tail_residual(
         restored_residual = learned_tail_codec.decode_payload(
             tail_payload,
             anchor_latents=decoded_anchor_latents.unsqueeze(0),
+            quality_scale=tail_payload.get("quality_scale"),
         )
         anchor_source = decoded_anchor_latents.to(device=restored_residual.device, dtype=torch.float32)
     else:
@@ -386,6 +537,10 @@ def estimate_anchor_plus_tail_codec_bytes(codec_payload: Dict[str, object]) -> i
                 total_bytes += len(bytes(payload["y_string"]))
             if "z_string" in payload:
                 total_bytes += len(bytes(payload["z_string"]))
+            if "quality_side_data" in payload:
+                total_bytes += len(bytes(payload["quality_side_data"]))
+            elif "quality_side_bytes" in payload:
+                total_bytes += int(payload["quality_side_bytes"])
 
     metadata_values: List[int] = [len(codec_payload.get("chunk_lengths", []))]
     metadata_values.extend(int(value) for value in codec_payload.get("chunk_lengths", []))
@@ -425,30 +580,75 @@ def encode_anchor_plus_tail_latents(
         section_span_latents=_as_int(codec_config, "section_span_latents"),
         start_index=1,
     )
+    dynamic_rate_enabled = _as_bool(codec_config, "dynamic_rate_enabled", False)
+    section_motion_scores = compute_section_motion_scores(clean_full_latents, section_ranges)
 
     section_anchor_payloads: List[Dict[str, object]] = []
     section_tail_payloads: List[Dict[str, object]] = []
+    section_anchor_profiles: List[str] = []
+    section_tail_quality_scales: List[float] = []
+    section_anchor_bytes: List[int] = []
+    section_tail_bytes: List[int] = []
+    section_total_bytes: List[int] = []
     aggregated_rate_bits: List[torch.Tensor] = []
     aggregated_y_bits: List[torch.Tensor] = []
     aggregated_z_bits: List[torch.Tensor] = []
-    for section_start, section_end in section_ranges:
+    for section_idx, (section_start, section_end) in enumerate(section_ranges):
         section_latents = clean_full_latents[:, section_start:section_end]
         anchor_span = min(_as_int(codec_config, "anchor_span_latents"), section_latents.shape[1])
         section_anchor = section_latents[:, :anchor_span].contiguous()
         section_tail = section_latents[:, anchor_span:].contiguous()
-
-        anchor_payload = encode_refresh_anchor(section_anchor, codec_config, move_to_cpu=move_to_cpu)
+        section_codec_config = dict(codec_config) if isinstance(codec_config, dict) else {
+            "temporal_factor": _as_int(codec_config, "temporal_factor"),
+            "spatial_factor": _as_int(codec_config, "spatial_factor"),
+            "quant_dtype": _as_str(codec_config, "quant_dtype"),
+            "keyframe_dtype": _as_str(codec_config, "keyframe_dtype"),
+            "keyframe_codec_mode": _keyframe_codec_mode(codec_config),
+            "keyframe_quant_dtype": _as_str(codec_config, "keyframe_quant_dtype"),
+            "keyframe_spatial_factor": _as_int(codec_config, "keyframe_spatial_factor"),
+            "section_span_latents": _as_int(codec_config, "section_span_latents"),
+            "anchor_span_latents": _as_int(codec_config, "anchor_span_latents"),
+            "tail_span_latents": _as_int(codec_config, "tail_span_latents"),
+            "anchor_quant_dtype": _as_str(codec_config, "anchor_quant_dtype"),
+            "anchor_spatial_factor": _as_int(codec_config, "anchor_spatial_factor"),
+            "tail_codec_type": _tail_codec_type(codec_config),
+            "dynamic_rate_enabled": dynamic_rate_enabled,
+            "motion_score_type": str(_get_optional_config_value(codec_config, "motion_score_type", "latent_delta_l1_norm")),
+            "motion_q20": _as_optional_float(codec_config, "motion_q20"),
+            "motion_q80": _as_optional_float(codec_config, "motion_q80"),
+            "tail_quality_min": float(_get_optional_config_value(codec_config, "tail_quality_min", 0.75)),
+            "tail_quality_max": float(_get_optional_config_value(codec_config, "tail_quality_max", 1.35)),
+            "anchor_profile_low": int(_get_optional_config_value(codec_config, "anchor_profile_low", 4)),
+            "anchor_profile_base": int(_get_optional_config_value(codec_config, "anchor_profile_base", 2)),
+            "anchor_profile_high": int(_get_optional_config_value(codec_config, "anchor_profile_high", 1)),
+        }
+        motion_score = section_motion_scores[section_idx] if section_idx < len(section_motion_scores) else 0.0
+        anchor_profile_name = "base"
+        tail_quality_scale = 1.0
+        if dynamic_rate_enabled:
+            anchor_profile_name, anchor_spatial_factor = _resolve_section_anchor_profile(motion_score, codec_config)
+            section_codec_config["anchor_spatial_factor"] = int(anchor_spatial_factor)
+            tail_quality_scale = _resolve_section_tail_quality_scale(motion_score, codec_config)
+        anchor_payload = encode_refresh_anchor(section_anchor, section_codec_config, move_to_cpu=move_to_cpu)
         decoded_anchor = decode_refresh_anchor(anchor_payload)
         tail_payload = encode_section_tail_residual(
             section_tail,
             decoded_anchor,
-            codec_config,
+            section_codec_config,
             learned_tail_codec=learned_tail_codec,
+            quality_scale=tail_quality_scale,
             use_ste_quant=use_ste_quant,
             move_to_cpu=move_to_cpu,
         )
         section_anchor_payloads.append(anchor_payload)
         section_tail_payloads.append(tail_payload)
+        section_anchor_profiles.append(anchor_profile_name)
+        section_tail_quality_scales.append(float(tail_quality_scale))
+        anchor_payload_bytes = _estimate_tensor_payload_bytes(anchor_payload)
+        tail_payload_bytes = _estimate_tensor_payload_bytes(tail_payload)
+        section_anchor_bytes.append(anchor_payload_bytes)
+        section_tail_bytes.append(tail_payload_bytes)
+        section_total_bytes.append(anchor_payload_bytes + tail_payload_bytes)
         if torch.is_tensor(tail_payload.get("rate_bits")):
             aggregated_rate_bits.append(tail_payload["rate_bits"])
         if torch.is_tensor(tail_payload.get("y_bits")):
@@ -463,6 +663,13 @@ def encode_anchor_plus_tail_latents(
         "section_ranges": [(int(start), int(end)) for start, end in section_ranges],
         "section_anchor_payloads": section_anchor_payloads,
         "section_tail_payloads": section_tail_payloads,
+        "dynamic_rate_policy": _dynamic_rate_policy(codec_config),
+        "section_motion_scores": [float(value) for value in section_motion_scores],
+        "section_anchor_profiles": section_anchor_profiles,
+        "section_tail_quality_scales": [float(value) for value in section_tail_quality_scales],
+        "section_anchor_bytes": [int(value) for value in section_anchor_bytes],
+        "section_tail_bytes": [int(value) for value in section_tail_bytes],
+        "section_total_bytes": [int(value) for value in section_total_bytes],
     }
     if aggregated_rate_bits:
         codec_payload["rate_bits"] = torch.stack(aggregated_rate_bits).sum()

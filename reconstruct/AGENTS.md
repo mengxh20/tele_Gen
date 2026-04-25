@@ -33,6 +33,9 @@
   - `low_latents/`
   - `recover_latents/`
   - `metrics/`
+- `entropy_metrics/` 默认保留，用于记录外层熵编后的运输码率统计
+- `enc_latents/` 仅在显式开启 `--save_entropy_bin` 时作为外层运输码流落盘；默认不保存 `.bin`
+- 当需要更贴近真实接收端链路、但又不想落盘 `.bin` 时，优先使用 `real_decoder.py` 从 `low_latents` 在内存中模拟运输码流输入，再进入 recover
 - 若需要导出视频，应视为验证或展示环节，而不是替代上述主产物
 - 当需要更贴近真实接收端链路时，优先使用 `real_decoder.py` 走 `low_latents -> recover -> video` 路线
 
