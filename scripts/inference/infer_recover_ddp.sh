@@ -16,7 +16,7 @@ export RECOVER_OVERLAP_LATENTS="${RECOVER_OVERLAP_LATENTS:-2}"
 export VAE_DECODE_MODE="${VAE_DECODE_MODE:-auto}"
 
 
-SAVEDIR="${SAVEDIR:-reconstruct/gen2recon_runs_HE2E_quality}"
+SAVEDIR="${SAVEDIR:-reconstruct/gen2recon_runs_HE2E_Apr28}"
 INFER_ARGS=(
     reconstruct/recover.py infer
     --checkpoint_dir "${SAVEDIR}/checkpoints"

@@ -14,12 +14,13 @@ export MACHINE_RANK="${MACHINE_RANK:-${NODE_RANK}}"
 export NUM_PROCESSES_PER_MACHINE="${NUM_PROCESSES_PER_MACHINE:-${NPROC_PER_NODE}}"
 export ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE:-scripts/accelerate_configs/multi_node_example_zero3.yaml}"
 export NUM_PROCESSES="$((NUM_MACHINES * NUM_PROCESSES_PER_MACHINE))"
-export SAVEDIR="${SAVEDIR:-reconstruct/gen2recon_runs_HE2E_quality}"
+export SAVEDIR="${SAVEDIR:-reconstruct/gen2recon_runs_HE2E_Apr28}"
 
 # Quality-first defaults. Override any of these from the shell when bitrate pressure matters more.
 export TEMPORAL_FACTOR="${TEMPORAL_FACTOR:-2}"
 export SPATIAL_FACTOR="${SPATIAL_FACTOR:-4}"
 export SECTION_SPAN_LATENTS="${SECTION_SPAN_LATENTS:-4}"
+export RECOVER_OVERLAP_LATENTS="${RECOVER_OVERLAP_LATENTS:-2}"
 export ANCHOR_SPAN_LATENTS="${ANCHOR_SPAN_LATENTS:-1}"
 export ANCHOR_SPATIAL_FACTOR="${ANCHOR_SPATIAL_FACTOR:-1}"
 export KEYFRAME_CODEC_MODE="${KEYFRAME_CODEC_MODE:-raw}"
@@ -66,6 +67,7 @@ accelerate launch \
     --spatial_factor "${SPATIAL_FACTOR}" \
     --latent_window_size "${SECTION_SPAN_LATENTS}" \
     --section_span_latents "${SECTION_SPAN_LATENTS}" \
+    --recover_overlap_latents "${RECOVER_OVERLAP_LATENTS}" \
     --anchor_span_latents "${ANCHOR_SPAN_LATENTS}" \
     --anchor_spatial_factor "${ANCHOR_SPATIAL_FACTOR}" \
     --keyframe_codec_mode "${KEYFRAME_CODEC_MODE}" \

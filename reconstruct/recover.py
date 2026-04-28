@@ -86,6 +86,7 @@ DEFAULT_ANCHOR_QUANT_DTYPE = "int8"
 DEFAULT_ANCHOR_SPATIAL_FACTOR = 1
 DEFAULT_TAIL_CODEC_TYPE = LEARNED_TAIL_CODEC_TYPE
 DEFAULT_NUM_INFERENCE_STEPS = 30
+DEFAULT_RECOVER_OVERLAP_LATENTS = 0
 DEFAULT_WEIGHT_DTYPE = "bf16"
 DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_LOSS_WEIGHTING_SCHEME = "logit_normal"
@@ -103,7 +104,7 @@ DEFAULT_RATE_LOSS_WEIGHT = 1.0
 DEFAULT_RATE_LOSS_WARMUP_STEPS = 0
 DEFAULT_RATE_LOSS_RAMP_STEPS = 1000
 DEFAULT_ENTROPY_AUX_LEARNING_RATE = 1e-3
-DEFAULT_FIX_ANCHOR_DURING_DENOISE = True
+DEFAULT_FIX_ANCHOR_DURING_DENOISE = False
 DEFAULT_LOW_LATENT_FORMAT_VERSION = LOW_LATENT_FORMAT_V4
 RECOVER_CONFIG_VERSION = "helios_recover_v6_entropy"
 CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X = "full_window_1x"
@@ -304,19 +305,25 @@ class LatentWindowDataset(Dataset):
         history_sizes: Sequence[int],
         latent_window_size: int,
         anchor_span_latents: int,
+        recover_overlap_latents: int,
     ):
         self.sequences = list(sequences)
         self.history_sizes = list(history_sizes)
         self.history_window_size = sum(history_sizes)
         self.latent_window_size = latent_window_size
         self.anchor_span_latents = anchor_span_latents
+        self.recover_overlap_latents = recover_overlap_latents
         self.samples: List[Tuple[int, int]] = []
 
         for seq_idx, sequence in enumerate(self.sequences):
             total_latent_frames = sequence.clean_full_latents.shape[1]
             # section_start 从 1 开始，意味着首帧默认单独保留为 keyframe，
             # 后续所有帧都交给 recover 模块按窗口学习恢复。
-            for start in range(1, total_latent_frames, latent_window_size):
+            for start in build_recover_window_starts(
+                total_latent_frames=total_latent_frames,
+                latent_window_size=latent_window_size,
+                recover_overlap_latents=recover_overlap_latents,
+            ):
                 self.samples.append((seq_idx, start))
 
     def __len__(self) -> int:
@@ -442,6 +449,13 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
         "--fix_anchor_during_denoise",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_FIX_ANCHOR_DURING_DENOISE,
+        help="Deprecated no-op. Anchor latents are now inferred from history and current low-target conditions.",
+    )
+    parser.add_argument(
+        "--recover_overlap_latents",
+        type=int,
+        default=DEFAULT_RECOVER_OVERLAP_LATENTS,
+        help="Number of latent timesteps overlapped between adjacent recover windows during training.",
     )
 
 
@@ -469,7 +483,7 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--recover_overlap_latents",
         type=int,
-        default=0,
+        default=DEFAULT_RECOVER_OVERLAP_LATENTS,
         help="Number of latent timesteps overlapped between adjacent recover windows during inference.",
     )
     parser.add_argument(
@@ -626,6 +640,11 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError(f"aux_loss_warmup_steps must be >= 0, got {args.aux_loss_warmup_steps}.")
     if args.aux_loss_ramp_steps < 0:
         raise ValueError(f"aux_loss_ramp_steps must be >= 0, got {args.aux_loss_ramp_steps}.")
+    build_recover_window_starts(
+        total_latent_frames=2,
+        latent_window_size=int(args.section_span_latents or args.latent_window_size),
+        recover_overlap_latents=int(args.recover_overlap_latents),
+    )
 
 
 def create_train_accelerator(weight_dtype: str, gradient_accumulation_steps: int):
@@ -692,6 +711,7 @@ def init_offline_wandb_run(
             "weight_dtype": args.weight_dtype,
             "history_sizes": list(history_sizes),
             "latent_window_size": latent_window_size,
+            "recover_overlap_latents": int(args.recover_overlap_latents),
             "codec_config": asdict(codec_config),
             "checkpoint_save_interval_epochs": checkpoint_save_interval_epochs,
             "flow_loss_weight": args.flow_loss_weight,
@@ -700,7 +720,8 @@ def init_offline_wandb_run(
             "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
             "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
             "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
-            "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
+            "anchor_inference_mode": "history_low_target_overlap",
+            "fix_anchor_during_denoise": False,
         },
         reinit=True,
     )
@@ -788,6 +809,7 @@ def command_train(args: argparse.Namespace) -> None:
         history_sizes=history_sizes,
         latent_window_size=latent_window_size,
         anchor_span_latents=codec_config.anchor_span_latents,
+        recover_overlap_latents=args.recover_overlap_latents,
     )
     if len(dataset) == 0:
         raise RuntimeError("No training windows were built from the provided latent files.")
@@ -862,6 +884,7 @@ def command_train(args: argparse.Namespace) -> None:
             f"device={device} world_size={accelerator.num_processes} "
             f"effective_global_batch_size={args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps} "
             f"tail_codec_type={codec_config.tail_codec_type} "
+            f"recover_overlap_latents={args.recover_overlap_latents} "
             f"save_every_epochs={checkpoint_save_interval_epochs} "
             f"loss_weighting_scheme={args.loss_weighting_scheme} "
             f"flow/x/noise/delta=({args.flow_loss_weight:.3f}/{args.x_loss_weight:.3f}/{args.noise_loss_weight:.3f}/{args.temporal_delta_loss_weight:.3f}) "
@@ -901,7 +924,9 @@ def command_train(args: argparse.Namespace) -> None:
         "entropy_aux_learning_rate": args.entropy_aux_learning_rate,
         "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
         "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
-        "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
+        "recover_overlap_latents": int(args.recover_overlap_latents),
+        "anchor_inference_mode": "history_low_target_overlap",
+        "fix_anchor_during_denoise": False,
         "tail_codec_type": codec_config.tail_codec_type,
         "loss_definition": {
             "optimized_loss": (
@@ -1352,8 +1377,12 @@ def command_infer(args: argparse.Namespace) -> None:
         history_sizes = normalize_history_sizes(checkpoint_config["history_sizes"])
         latent_window_size = int(checkpoint_config.get("section_span_latents", checkpoint_config["latent_window_size"]))
         anchor_span_latents = int(checkpoint_config.get("anchor_span_latents", codec_config.anchor_span_latents))
-        fix_anchor_during_denoise = bool(
-            checkpoint_config.get("fix_anchor_during_denoise", DEFAULT_FIX_ANCHOR_DURING_DENOISE)
+        recover_overlap_latents = int(
+            resolve_infer_value(
+                cli_value=args.recover_overlap_latents,
+                default_value=DEFAULT_RECOVER_OVERLAP_LATENTS,
+                checkpoint_value=checkpoint_config.get("recover_overlap_latents", DEFAULT_RECOVER_OVERLAP_LATENTS),
+            )
         )
         weight_dtype = parse_weight_dtype(str(weight_dtype_name))
 
@@ -1395,7 +1424,7 @@ def command_infer(args: argparse.Namespace) -> None:
                 f"device={device} world_size={distributed_context.world_size} "
                 f"checkpoint_dir={checkpoint_dir} "
                 f"save_entropy_bin={args.save_entropy_bin} "
-                f"recover_overlap_latents={args.recover_overlap_latents}"
+                f"recover_overlap_latents={recover_overlap_latents}"
             )
             if checkpoint_dir != requested_checkpoint_dir:
                 print(f"[infer] resolved checkpoint request {requested_checkpoint_dir} -> {checkpoint_dir}")
@@ -1452,8 +1481,7 @@ def command_infer(args: argparse.Namespace) -> None:
                 anchor_span_latents=anchor_span_latents,
                 num_inference_steps=args.num_inference_steps,
                 seed=args.seed,
-                fix_anchor_during_denoise=fix_anchor_during_denoise,
-                recover_overlap_latents=args.recover_overlap_latents,
+                recover_overlap_latents=recover_overlap_latents,
                 distributed_context=distributed_context,
             )
             ensure_finite_recover_state(
@@ -1573,7 +1601,7 @@ def command_infer(args: argparse.Namespace) -> None:
                 "codec_config": asdict(codec_config),
                 "checkpoint_dir": str(checkpoint_dir),
                 "num_inference_steps": args.num_inference_steps,
-                "recover_overlap_latents": args.recover_overlap_latents,
+                "recover_overlap_latents": recover_overlap_latents,
                 "sections": section_metrics,
             }
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2178,29 +2206,6 @@ def extract_history_window(
     return history.contiguous()
 
 
-def extract_section_anchor_window(
-    low_full_latents: torch.Tensor,
-    section_start: int,
-    valid_target_frames: int,
-    anchor_span_latents: int,
-) -> torch.Tensor:
-    anchor_steps = min(anchor_span_latents, valid_target_frames)
-    anchor_latents = low_full_latents[:, section_start : section_start + anchor_steps]
-    if anchor_latents.shape[1] == anchor_span_latents:
-        return anchor_latents.contiguous()
-    if anchor_latents.shape[1] == 0:
-        return torch.zeros(
-            low_full_latents.shape[0],
-            anchor_span_latents,
-            low_full_latents.shape[2],
-            low_full_latents.shape[3],
-            device=low_full_latents.device,
-            dtype=low_full_latents.dtype,
-        ).contiguous()
-    padding = anchor_latents[:, -1:].repeat(1, anchor_span_latents - anchor_latents.shape[1], 1, 1)
-    return torch.cat([anchor_latents, padding], dim=1).contiguous()
-
-
 def build_training_batch_tensors(
     batch: Dict[str, torch.Tensor | int],
     sequences: Sequence[PreparedSequence],
@@ -2254,7 +2259,11 @@ def build_training_batch_tensors(
         codec_rate_bpp_cache[seq_idx] = codec_payload["low_bpp_loss"].to(device=device, dtype=torch.float32)
         section_ranges = [tuple(int(v) for v in section_range) for section_range in codec_payload.get("section_ranges", [])]
         num_sections = len(section_ranges)
-        section_index_cache[seq_idx] = {int(start): section_idx for section_idx, (start, _end) in enumerate(section_ranges)}
+        section_index_cache[seq_idx] = {
+            latent_idx: section_idx
+            for section_idx, (start, end) in enumerate(section_ranges)
+            for latent_idx in range(int(start), int(end))
+        }
         default_section_bpp = float(codec_payload["low_bpp_loss"].detach().cpu().item()) if num_sections > 0 else 0.0
         motion_scores = codec_payload.get("section_motion_scores", [0.0] * num_sections)
         anchor_profiles = codec_payload.get("section_anchor_profiles", ["base"] * num_sections)
@@ -2284,7 +2293,6 @@ def build_training_batch_tensors(
     history_latents: List[torch.Tensor] = []
     target_latents: List[torch.Tensor] = []
     current_low_target_latents: List[torch.Tensor] = []
-    section_anchor_latents: List[torch.Tensor] = []
     x0_latents: List[torch.Tensor] = []
     valid_target_frames: List[int] = []
     codec_rate_bpp: List[torch.Tensor] = []
@@ -2320,16 +2328,9 @@ def build_training_batch_tensors(
             section_start=section_start,
             history_window_size=history_window_size,
         )
-        anchor_latent = extract_section_anchor_window(
-            low_full_latents=low_full_latents,
-            section_start=section_start,
-            valid_target_frames=valid_frames,
-            anchor_span_latents=anchor_span_latents,
-        )
         history_latents.append(history_latent)
         target_latents.append(target_latent)
         current_low_target_latents.append(current_low_target_latent)
-        section_anchor_latents.append(anchor_latent)
         x0_latents.append(clean_full_latents[:, :1])
         valid_target_frames.append(valid_frames)
         codec_rate_bpp.append(codec_rate_bpp_cache[seq_idx])
@@ -2344,7 +2345,6 @@ def build_training_batch_tensors(
         "history_latents": torch.stack(history_latents, dim=0).contiguous(),
         "target_latents": torch.stack(target_latents, dim=0).contiguous(),
         "current_low_target_latents": torch.stack(current_low_target_latents, dim=0).contiguous(),
-        "section_anchor_latents": torch.stack(section_anchor_latents, dim=0).contiguous(),
         "x0_latents": torch.stack(x0_latents, dim=0).contiguous(),
         "valid_target_frames": torch.tensor(valid_target_frames, device=device, dtype=torch.long),
         "codec_rate_bpp": torch.stack(codec_rate_bpp, dim=0).contiguous(),
@@ -2530,7 +2530,6 @@ def training_step(
     history_latents = materialized_batch["history_latents"].to(dtype=weight_dtype)
     target_latents = materialized_batch["target_latents"].to(dtype=weight_dtype)
     current_low_target_latents = materialized_batch["current_low_target_latents"].to(dtype=weight_dtype)
-    section_anchor_latents = materialized_batch["section_anchor_latents"].to(dtype=weight_dtype)
     x0_latents = materialized_batch["x0_latents"].to(dtype=weight_dtype)
     valid_target_frames = materialized_batch["valid_target_frames"]
     codec_rate_bpp = materialized_batch["codec_rate_bpp"].to(device=device, dtype=torch.float32)
@@ -2573,7 +2572,6 @@ def training_step(
     sigma_view = sigma.to(dtype=weight_dtype).view(-1, 1, 1, 1, 1)
     noisy_model_input = (1.0 - sigma_view) * model_input + sigma_view * noise
     flow_target = noise - model_input
-    noisy_model_input = overwrite_anchor_latents(noisy_model_input, section_anchor_latents)
     timesteps = sigma * 1000.0
 
     base_transformer = unwrap_model(transformer)
@@ -2600,7 +2598,7 @@ def training_step(
         latent_window_size=latent_window_size,
         device=device,
         dtype=torch.float32,
-        valid_start=anchor_span_latents,
+        valid_start=0,
     )
     tail_position_weights = build_tail_position_weights(
         latent_window_size=latent_window_size,
@@ -2617,8 +2615,6 @@ def training_step(
     flow_pred = flow_pred.float()
     x_pred = xt - sigma_view_float * flow_pred
     noise_pred = xt + (1.0 - sigma_view_float) * flow_pred
-    x_pred_for_temporal = overwrite_anchor_latents(x_pred.clone(), section_anchor_latents.float())
-    x_target_for_temporal = overwrite_anchor_latents(x_target.clone(), section_anchor_latents.float())
 
     flow_sq_error = (flow_pred - flow_target).pow(2)
     weighting = compute_loss_weighting_for_sd3(weighting_scheme=loss_weighting_scheme, sigmas=sigma)
@@ -2643,8 +2639,8 @@ def training_step(
     x_loss = normalized_masked_mse(x_pred, x_target, weighted_mask)
     noise_loss = normalized_masked_mse(noise_pred, noise_target, weighted_mask)
     temporal_delta_loss = compute_temporal_delta_loss(
-        prediction=x_pred_for_temporal,
-        target=x_target_for_temporal,
+        prediction=x_pred,
+        target=x_target,
         valid_target_frames=valid_target_frames,
         device=device,
         position_weights=tail_position_weights,
@@ -2708,6 +2704,10 @@ def build_tail_position_weights(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     weights = torch.zeros(1, 1, latent_window_size, 1, 1, device=device, dtype=dtype)
+    anchor_frames = min(max(0, anchor_span_latents), latent_window_size)
+    if anchor_frames > 0:
+        # Anchor is now inferred, not overwritten, so it must receive direct supervision.
+        weights[:, :, :anchor_frames, :, :] = 1.0
     tail_frames = max(0, latent_window_size - anchor_span_latents)
     if tail_frames <= 0:
         return weights
@@ -2720,14 +2720,6 @@ def build_tail_position_weights(
     tail_weights = 1.0 + tail_positions / float(tail_frames - 1)
     weights[:, :, anchor_span_latents:, 0, 0] = tail_weights
     return weights
-
-
-def overwrite_anchor_latents(latents: torch.Tensor, anchor_latents: torch.Tensor) -> torch.Tensor:
-    anchor_steps = int(anchor_latents.shape[2])
-    if anchor_steps <= 0:
-        return latents
-    latents[:, :, :anchor_steps] = anchor_latents.to(device=latents.device, dtype=latents.dtype)
-    return latents
 
 
 def compute_aux_loss_scale(
@@ -2998,7 +2990,6 @@ def reconstruct_sequence(
     anchor_span_latents: int,
     num_inference_steps: int,
     seed: int,
-    fix_anchor_during_denoise: bool,
     recover_overlap_latents: int,
     distributed_context: DistributedContext,
 ) -> torch.Tensor:
@@ -3047,8 +3038,6 @@ def reconstruct_sequence(
             history_window_size=sum(history_sizes),
         ).unsqueeze(0)
         valid_target_frames = min(latent_window_size, clean_full.shape[1] - section_start)
-        anchor_steps = min(anchor_span_latents, valid_target_frames)
-        section_anchor_latents = low_full[:, section_start : section_start + anchor_steps].unsqueeze(0)
         current_low_target_latents, low_valid_frames = extract_current_low_target_window(
             low_full_latents=low_full,
             section_start=section_start,
@@ -3101,9 +3090,7 @@ def reconstruct_sequence(
             latents_history_long=latents_history_long,
             num_inference_steps=num_inference_steps,
             seed=seed + section_start,
-            anchor_latents=section_anchor_latents.to(device=device, dtype=weight_dtype),
             current_low_target_latents=current_low_target_latents.unsqueeze(0).to(device=device, dtype=weight_dtype),
-            fix_anchor_during_denoise=fix_anchor_during_denoise,
         )
         valid_section = section_latents[0, :, :valid_target_frames].contiguous()
         section_end = section_start + valid_target_frames
@@ -3144,21 +3131,17 @@ def run_stage1_denoise(
     latents_history_long: torch.Tensor,
     num_inference_steps: int,
     seed: int,
-    anchor_latents: torch.Tensor,
     current_low_target_latents: torch.Tensor,
-    fix_anchor_during_denoise: bool,
 ) -> torch.Tensor:
     """执行单个 section 的扩散式去噪恢复。
 
-    当前 section 的完整 low window 会作为额外条件分支输入 transformer，
-    但扩散主体仍保持“从噪声开始恢复 clean target”的流程，不直接把 low tail 当作目标或初始化结果。
+    当前 recover window 的完整 low window 会作为额外条件分支输入 transformer。
+    anchor 位置不再被强制写回，而是和 tail 一样由历史 low latents 与当前 low window 条件共同恢复。
     """
     base_transformer = unwrap_model(transformer)
     generator = torch.Generator(device=device).manual_seed(seed)
     # 输入 hidden_states 是当前 section 的待恢复 latent，先随机初始化为高斯噪声；当前配置下 shape 近似是 [1, 16, 9, H, W]
     latents = torch.randn(latent_shape, device=device, dtype=torch.float32, generator=generator)
-    if fix_anchor_during_denoise:
-        latents = overwrite_anchor_latents(latents, anchor_latents.float())
     prepare_stage1_inference_scheduler(
         scheduler=scheduler,
         latents=latents,
@@ -3169,8 +3152,6 @@ def run_stage1_denoise(
     supports_first_step_flag = model_supports_argument(base_transformer, "is_first_denoising_step")
 
     for step_idx, timestep in enumerate(scheduler.timesteps):
-        if fix_anchor_during_denoise:
-            latents = overwrite_anchor_latents(latents, anchor_latents.float())
         current_sigma = get_scheduler_sigma_for_step(scheduler, step_idx)
         ensure_finite_recover_state(
             stage="pre_model",
@@ -3220,8 +3201,6 @@ def run_stage1_denoise(
             latents = scheduler.step_unipc(noise_pred.float(), timestep, latents, return_dict=False)[0]
         else:
             latents = scheduler.step(noise_pred.float(), timestep, latents, return_dict=False)[0]
-        if fix_anchor_during_denoise:
-            latents = overwrite_anchor_latents(latents, anchor_latents.float())
         ensure_finite_recover_state(
             stage="post_step",
             input_path=input_path,
@@ -3835,6 +3814,7 @@ def build_recover_config(
         "weight_dtype": args.weight_dtype,
         "history_sizes": list(history_sizes),
         "latent_window_size": latent_window_size,
+        "recover_overlap_latents": int(args.recover_overlap_latents),
         "section_span_latents": codec_config.section_span_latents,
         "anchor_span_latents": codec_config.anchor_span_latents,
         "tail_span_latents": codec_config.tail_span_latents,
@@ -3855,7 +3835,8 @@ def build_recover_config(
         "use_current_low_target_branch": True,
         "current_low_target_mode": CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X,
         "current_low_target_init": CURRENT_LOW_TARGET_INIT_PATCH_SHORT,
-        "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
+        "anchor_inference_mode": "history_low_target_overlap",
+        "fix_anchor_during_denoise": False,
         "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
         "codec_config": asdict(codec_config),
         "train_loss_config": {
@@ -4150,7 +4131,14 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["use_current_low_target_branch"] = True
     config["current_low_target_mode"] = CURRENT_LOW_TARGET_MODE_FULL_WINDOW_1X
     config["current_low_target_init"] = CURRENT_LOW_TARGET_INIT_PATCH_SHORT
-    config.setdefault("fix_anchor_during_denoise", DEFAULT_FIX_ANCHOR_DURING_DENOISE)
+    config["recover_overlap_latents"] = int(config.get("recover_overlap_latents", DEFAULT_RECOVER_OVERLAP_LATENTS))
+    build_recover_window_starts(
+        total_latent_frames=2,
+        latent_window_size=latent_window_size,
+        recover_overlap_latents=config["recover_overlap_latents"],
+    )
+    config["anchor_inference_mode"] = config.get("anchor_inference_mode", "history_low_target_overlap")
+    config["fix_anchor_during_denoise"] = False
     train_loss_config = dict(config.get("train_loss_config", {}))
     train_loss_config.setdefault("temporal_delta_loss_weight", DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
     train_loss_config.setdefault("rate_loss_weight", DEFAULT_RATE_LOSS_WEIGHT)
