@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from reconstruct.decoder import (
     COMPARE_MODE_CHOICES,
+    VAE_DECODE_MODE_CHOICES,
     CompareExportConfig,
     ModelBundle,
     build_compare_export_config,
@@ -132,6 +133,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source_video_dir", type=Path, default=Path("reconstruct/videos"))
     parser.add_argument("--compare_output_dir", type=Path, default=None)
     parser.add_argument("--compare_mode", type=str, default="both", choices=COMPARE_MODE_CHOICES)
+    parser.add_argument(
+        "--vae_decode_mode",
+        type=str,
+        default="auto",
+        choices=VAE_DECODE_MODE_CHOICES,
+        help="auto/full decodes recovered latent chunks as one VAE sequence to reduce chunk-boundary flicker.",
+    )
+    parser.add_argument(
+        "--recover_overlap_latents",
+        type=int,
+        default=None,
+        help="Number of latent timesteps overlapped between adjacent recover windows. If omitted, prefer metrics[].recover_overlap_latents.",
+    )
     parser.add_argument(
         "--transport_input_mode",
         type=str,
@@ -336,6 +350,19 @@ def resolve_num_inference_steps(cli_value: Optional[int], metrics_payload: Optio
     return DEFAULT_NUM_INFERENCE_STEPS
 
 
+def resolve_recover_overlap_latents(cli_value: Optional[int], metrics_payload: Optional[Dict[str, object]]) -> int:
+    if cli_value is not None:
+        if cli_value < 0:
+            raise ValueError(f"--recover_overlap_latents must be >= 0, got {cli_value}.")
+        return int(cli_value)
+    if metrics_payload is not None and metrics_payload.get("recover_overlap_latents") is not None:
+        metrics_value = int(metrics_payload["recover_overlap_latents"])
+        if metrics_value < 0:
+            raise ValueError(f"metrics recover_overlap_latents must be >= 0, got {metrics_value}.")
+        return metrics_value
+    return 0
+
+
 def validate_low_payload_compatibility(
     low_payload: Dict[str, object],
     runtime: RecoveryRuntime,
@@ -425,6 +452,7 @@ def build_recover_payload_from_low(
     transport_file_bytes: int,
     transport_bpp: float,
     entropy_metrics_payload: Optional[Dict[str, object]],
+    recover_overlap_latents: int,
 ) -> Dict[str, object]:
     chunk_lengths = [int(value) for value in low_payload["chunk_lengths"]]
     restored_chunks = split_full_latents(recovered_full_latents, chunk_lengths)
@@ -437,6 +465,7 @@ def build_recover_payload_from_low(
         "transport_file_bytes": int(transport_file_bytes),
         "transport_bpp": float(transport_bpp),
         "checkpoint_dir": str(runtime.checkpoint_dir),
+        "recover_overlap_latents": int(recover_overlap_latents),
         "low_codec_bytes": int(low_payload.get("low_codec_bytes", latent_path.stat().st_size)),
         "low_bpp": float(low_payload.get("low_bpp", 0.0)),
         "section_ranges": [
@@ -611,9 +640,12 @@ def decode_low_latent_file_to_output_path(
     compare_config: Optional[CompareExportConfig],
     transport_mode: str,
     entropy_metrics_payload: Optional[Dict[str, object]],
+    vae_decode_mode: str,
+    cli_recover_overlap_latents: Optional[int],
 ) -> Path:
     metrics_path = resolve_metrics_path(metrics_dir=metrics_dir, relative_path=relative_path)
     metrics_payload = load_metrics_payload(metrics_path)
+    recover_overlap_latents = resolve_recover_overlap_latents(cli_recover_overlap_latents, metrics_payload)
     requested_checkpoint_dir = resolve_requested_checkpoint_dir(
         cli_checkpoint_dir=cli_checkpoint_dir,
         metrics_payload=metrics_payload,
@@ -669,6 +701,7 @@ def decode_low_latent_file_to_output_path(
         num_inference_steps=resolve_num_inference_steps(cli_num_inference_steps, metrics_payload),
         seed=seed,
         fix_anchor_during_denoise=runtime.fix_anchor_during_denoise,
+        recover_overlap_latents=recover_overlap_latents,
         distributed_context=DistributedContext(is_distributed=False),
     )
     recover_payload = build_recover_payload_from_low(
@@ -681,6 +714,7 @@ def decode_low_latent_file_to_output_path(
         transport_file_bytes=transport_file_bytes,
         transport_bpp=transport_bpp,
         entropy_metrics_payload=entropy_metrics_payload,
+        recover_overlap_latents=recover_overlap_latents,
     )
     saved_recover_path = maybe_save_recover_payload(
         recover_payload=recover_payload,
@@ -696,6 +730,7 @@ def decode_low_latent_file_to_output_path(
         model_bundle_cache=model_bundle_cache,
         device=device,
         compare_config=compare_config,
+        vae_decode_mode=vae_decode_mode,
     )
     if saved_recover_path is not None:
         print(
@@ -722,6 +757,8 @@ def decode_latent_file(
     device: torch.device,
     compare_config: Optional[CompareExportConfig],
     transport_input_mode: str,
+    vae_decode_mode: str,
+    cli_recover_overlap_latents: Optional[int],
 ) -> Path:
     relative_path = latent_path.relative_to(input_dir)
     output_path = output_dir / relative_path.with_suffix(".mp4")
@@ -759,6 +796,8 @@ def decode_latent_file(
             compare_config=compare_config,
             transport_mode="entropy_bin",
             entropy_metrics_payload=entropy_metrics_payload,
+            vae_decode_mode=vae_decode_mode,
+            cli_recover_overlap_latents=cli_recover_overlap_latents,
         )
 
     payload = load_payload(latent_path)
@@ -805,6 +844,8 @@ def decode_latent_file(
             compare_config=compare_config,
             transport_mode="simulated_entropy",
             entropy_metrics_payload=entropy_metrics_payload,
+            vae_decode_mode=vae_decode_mode,
+            cli_recover_overlap_latents=cli_recover_overlap_latents,
         )
 
     if low_payload_input:
@@ -828,6 +869,8 @@ def decode_latent_file(
             compare_config=compare_config,
             transport_mode=resolved_transport_mode,
             entropy_metrics_payload=None,
+            vae_decode_mode=vae_decode_mode,
+            cli_recover_overlap_latents=cli_recover_overlap_latents,
         )
 
     print(f"[real_decoder] input_mode=direct_decode path={latent_path}")
@@ -840,6 +883,7 @@ def decode_latent_file(
         model_bundle_cache=model_bundle_cache,
         device=device,
         compare_config=compare_config,
+        vae_decode_mode=vae_decode_mode,
     )
 
 
@@ -863,6 +907,11 @@ def main() -> None:
     print(f"[real_decoder] base_model_path={args.base_model_path or 'from-checkpoint-or-latent-metadata'}")
     print(f"[real_decoder] recover_latent_output_dir={recover_latent_output_dir or 'off'}")
     print(f"[real_decoder] transport_input_mode={args.transport_input_mode}")
+    print(f"[real_decoder] vae_decode_mode={args.vae_decode_mode}")
+    print(
+        f"[real_decoder] recover_overlap_latents="
+        f"{args.recover_overlap_latents if args.recover_overlap_latents is not None else 'auto'}"
+    )
     if compare_config is None:
         print("[real_decoder] compare_mode=off")
     else:
@@ -890,6 +939,8 @@ def main() -> None:
             device=device,
             compare_config=compare_config,
             transport_input_mode=args.transport_input_mode,
+            vae_decode_mode=args.vae_decode_mode,
+            cli_recover_overlap_latents=args.recover_overlap_latents,
         )
 
 

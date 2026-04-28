@@ -453,6 +453,12 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--num_inference_steps", type=int, default=DEFAULT_NUM_INFERENCE_STEPS)
     parser.add_argument(
+        "--recover_overlap_latents",
+        type=int,
+        default=0,
+        help="Number of latent timesteps overlapped between adjacent recover windows during inference.",
+    )
+    parser.add_argument(
         "--max_samples",
         type=int,
         default=None,
@@ -1349,7 +1355,8 @@ def command_infer(args: argparse.Namespace) -> None:
                 f"[infer] input_root={input_root} files={len(latent_paths)}/{total_input_files} "
                 f"device={device} world_size={distributed_context.world_size} "
                 f"checkpoint_dir={checkpoint_dir} "
-                f"save_entropy_bin={args.save_entropy_bin}"
+                f"save_entropy_bin={args.save_entropy_bin} "
+                f"recover_overlap_latents={args.recover_overlap_latents}"
             )
             if checkpoint_dir != requested_checkpoint_dir:
                 print(f"[infer] resolved checkpoint request {requested_checkpoint_dir} -> {checkpoint_dir}")
@@ -1391,6 +1398,7 @@ def command_infer(args: argparse.Namespace) -> None:
                 num_inference_steps=args.num_inference_steps,
                 seed=args.seed,
                 fix_anchor_during_denoise=fix_anchor_during_denoise,
+                recover_overlap_latents=args.recover_overlap_latents,
                 distributed_context=distributed_context,
             )
             low_latent_path, recover_latent_path, metrics_path = resolve_output_paths(
@@ -1519,6 +1527,7 @@ def command_infer(args: argparse.Namespace) -> None:
                 "codec_config": asdict(codec_config),
                 "checkpoint_dir": str(checkpoint_dir),
                 "num_inference_steps": args.num_inference_steps,
+                "recover_overlap_latents": args.recover_overlap_latents,
                 "sections": section_metrics,
             }
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2732,6 +2741,55 @@ def validate_stage1_inference_scheduler(scheduler: object) -> None:
         raise RuntimeError(f"Recover scheduler last sigma must be 0, got {last_sigma:.6f}.")
 
 
+def build_recover_window_starts(
+    total_latent_frames: int,
+    latent_window_size: int,
+    recover_overlap_latents: int,
+) -> List[int]:
+    if latent_window_size < 1:
+        raise ValueError(f"latent_window_size must be >= 1, got {latent_window_size}.")
+    if recover_overlap_latents < 0:
+        raise ValueError(f"recover_overlap_latents must be >= 0, got {recover_overlap_latents}.")
+    if recover_overlap_latents >= latent_window_size:
+        raise ValueError(
+            "recover_overlap_latents must be smaller than latent_window_size, "
+            f"got {recover_overlap_latents} >= {latent_window_size}."
+        )
+    if total_latent_frames <= 1:
+        return []
+    stride = latent_window_size - recover_overlap_latents
+    return list(range(1, total_latent_frames, stride))
+
+
+def build_recover_blend_weights(
+    valid_frames: int,
+    recover_overlap_latents: int,
+    is_first_window: bool,
+    reaches_sequence_end: bool,
+) -> torch.Tensor:
+    if valid_frames < 1:
+        raise ValueError(f"valid_frames must be >= 1, got {valid_frames}.")
+    weights = torch.ones(1, valid_frames, 1, 1, dtype=torch.float32)
+    if recover_overlap_latents <= 0:
+        return weights
+
+    fade_in_len = min(recover_overlap_latents, valid_frames)
+    if not is_first_window and fade_in_len > 0:
+        weights[:, :fade_in_len] = (
+            torch.arange(1, fade_in_len + 1, dtype=torch.float32).view(1, fade_in_len, 1, 1)
+            / float(fade_in_len + 1)
+        )
+
+    fade_out_len = min(recover_overlap_latents, valid_frames)
+    if not reaches_sequence_end and fade_out_len > 0:
+        fade_out = (
+            torch.arange(fade_out_len, 0, -1, dtype=torch.float32).view(1, fade_out_len, 1, 1)
+            / float(fade_out_len + 1)
+        )
+        weights[:, -fade_out_len:] = torch.minimum(weights[:, -fade_out_len:], fade_out)
+    return weights
+
+
 def prepare_stage1_inference_scheduler(
     scheduler: object,
     latents: torch.Tensor,
@@ -2782,6 +2840,7 @@ def reconstruct_sequence(
     num_inference_steps: int,
     seed: int,
     fix_anchor_during_denoise: bool,
+    recover_overlap_latents: int,
     distributed_context: DistributedContext,
 ) -> torch.Tensor:
     """把一段 low latents 重建成 recover latents。
@@ -2800,8 +2859,13 @@ def reconstruct_sequence(
 
     prepare_stage1_clean_input_from_latents = import_stage1_prepare_fn()
     history_sizes = list(history_sizes)
-    section_starts = list(range(1, clean_full.shape[1], latent_window_size))
-    recovered_sections: List[torch.Tensor] = []
+    section_starts = build_recover_window_starts(
+        total_latent_frames=int(clean_full.shape[1]),
+        latent_window_size=latent_window_size,
+        recover_overlap_latents=recover_overlap_latents,
+    )
+    recovered_sum = torch.zeros_like(clean_full.float(), device="cpu")
+    recovered_weight = torch.zeros(1, clean_full.shape[1], 1, 1, dtype=torch.float32)
     dummy_target = torch.zeros(
         1,
         clean_full.shape[0],
@@ -2815,7 +2879,7 @@ def reconstruct_sequence(
 
     for section_start in tqdm(
         section_starts,
-        desc=f"Reconstructing sections rank={distributed_context.rank}",
+        desc=f"Reconstructing sections rank={distributed_context.rank} overlap={recover_overlap_latents}",
         disable=distributed_context.is_distributed and not distributed_context.is_main_process,
     ):
         history_latents = extract_history_window(
@@ -2883,11 +2947,23 @@ def reconstruct_sequence(
             fix_anchor_during_denoise=fix_anchor_during_denoise,
         )
         valid_section = section_latents[0, :, :valid_target_frames].contiguous()
-        recovered_sections.append(valid_section)
+        section_end = section_start + valid_target_frames
+        blend_weights = build_recover_blend_weights(
+            valid_frames=valid_target_frames,
+            recover_overlap_latents=recover_overlap_latents,
+            is_first_window=section_start == section_starts[0],
+            reaches_sequence_end=section_end >= clean_full.shape[1],
+        )
+        recovered_sum[:, section_start:section_end] += valid_section.float() * blend_weights
+        recovered_weight[:, section_start:section_end] += blend_weights
 
-    recovered_remainder = torch.cat(recovered_sections, dim=1)
-    recovered_remainder = recovered_remainder[:, : clean_full.shape[1] - 1]
-    return torch.cat([clean_full[:, :1].cpu(), recovered_remainder], dim=1).contiguous()
+    missing_mask = recovered_weight[:, 1:] <= 0
+    if torch.any(missing_mask):
+        missing_count = int(missing_mask.sum().item())
+        raise RuntimeError(f"Recover overlap windows left {missing_count} latent positions uncovered.")
+    recovered_full = clean_full.float().cpu().contiguous()
+    recovered_full[:, 1:] = recovered_sum[:, 1:] / recovered_weight[:, 1:].clamp_min(EPS)
+    return recovered_full.contiguous()
 
 
 @torch.inference_mode()

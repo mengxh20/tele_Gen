@@ -30,6 +30,7 @@ DEFAULT_SOURCE_VIDEO_DIR = "reconstruct/videos"
 LATENT_FORMAT_V1 = "helios_vae_latent_v1"
 LATENT_FORMAT_V2 = "helios_vae_latent_v2"
 COMPARE_MODE_CHOICES = ("off", "full", "sections", "both")
+VAE_DECODE_MODE_CHOICES = ("auto", "full", "chunked")
 PIL_RESAMPLING_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 ModelBundle = Tuple[AutoencoderKLWan, VideoProcessor, torch.Tensor, torch.Tensor]
 
@@ -77,6 +78,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source_video_dir", type=Path, default=Path(DEFAULT_SOURCE_VIDEO_DIR))
     parser.add_argument("--compare_output_dir", type=Path, default=None)
     parser.add_argument("--compare_mode", type=str, default="both", choices=COMPARE_MODE_CHOICES)
+    parser.add_argument(
+        "--vae_decode_mode",
+        type=str,
+        default="auto",
+        choices=VAE_DECODE_MODE_CHOICES,
+        help="auto/full decodes the concatenated latent sequence first to avoid chunk-boundary flicker; chunked keeps legacy behavior.",
+    )
     return parser.parse_args()
 
 
@@ -443,6 +451,146 @@ def export_compare_outputs(
     )
 
 
+def is_out_of_memory_error(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return "out of memory" in message or "cuda error: out of memory" in message
+
+
+def decode_latent_tensor(
+    latent_tensor: torch.Tensor,
+    vae: AutoencoderKLWan,
+    video_processor: VideoProcessor,
+    latents_mean: torch.Tensor,
+    latents_std: torch.Tensor,
+    device: torch.device,
+) -> np.ndarray:
+    latent_tensor = latent_tensor.unsqueeze(0).to(device=device, dtype=vae.dtype)
+    decoded = vae.decode(latent_tensor / latents_std + latents_mean, return_dict=False)[0]
+    return video_processor.postprocess_video(decoded, output_type="np")[0]
+
+
+def decode_payload_full(
+    payload: Dict,
+    vae: AutoencoderKLWan,
+    video_processor: VideoProcessor,
+    latents_mean: torch.Tensor,
+    latents_std: torch.Tensor,
+    device: torch.device,
+) -> np.ndarray:
+    full_latents = torch.cat([chunk.float().contiguous() for chunk in payload["latent_chunks"]], dim=1)
+    return decode_latent_tensor(
+        latent_tensor=full_latents,
+        vae=vae,
+        video_processor=video_processor,
+        latents_mean=latents_mean,
+        latents_std=latents_std,
+        device=device,
+    )
+
+
+def decode_payload_chunked(
+    payload: Dict,
+    latent_path: Path,
+    format_version: str,
+    vae: AutoencoderKLWan,
+    video_processor: VideoProcessor,
+    latents_mean: torch.Tensor,
+    latents_std: torch.Tensor,
+    device: torch.device,
+) -> np.ndarray:
+    frame_chunks: List[np.ndarray] = []
+    chunk_frame_ranges = payload.get("chunk_frame_ranges")
+    for chunk_idx, latent_chunk in enumerate(payload["latent_chunks"]):
+        decoded_frames = decode_latent_tensor(
+            latent_tensor=latent_chunk.float().contiguous(),
+            vae=vae,
+            video_processor=video_processor,
+            latents_mean=latents_mean,
+            latents_std=latents_std,
+            device=device,
+        )
+
+        if chunk_frame_ranges is not None:
+            frame_range = chunk_frame_ranges[chunk_idx]
+            expected_frames = frame_range[1] - frame_range[0]
+            if decoded_frames.shape[0] != expected_frames:
+                raise RuntimeError(
+                    f"Decoded frame count mismatch for {latent_path}. "
+                    f"Expected {expected_frames}, got {decoded_frames.shape[0]}."
+                )
+        elif format_version == LATENT_FORMAT_V1:
+            raise RuntimeError(
+                f"Latent file {latent_path} is missing chunk_frame_ranges for {LATENT_FORMAT_V1}."
+            )
+        frame_chunks.append(decoded_frames)
+    return np.concatenate(frame_chunks, axis=0)
+
+
+def decode_payload_frames(
+    payload: Dict,
+    latent_path: Path,
+    format_version: str,
+    vae: AutoencoderKLWan,
+    video_processor: VideoProcessor,
+    latents_mean: torch.Tensor,
+    latents_std: torch.Tensor,
+    device: torch.device,
+    vae_decode_mode: str,
+) -> Tuple[np.ndarray, str]:
+    if vae_decode_mode not in VAE_DECODE_MODE_CHOICES:
+        raise ValueError(f"Unsupported vae_decode_mode={vae_decode_mode}. Expected one of {VAE_DECODE_MODE_CHOICES}.")
+
+    if vae_decode_mode == "chunked":
+        return (
+            decode_payload_chunked(
+                payload=payload,
+                latent_path=latent_path,
+                format_version=format_version,
+                vae=vae,
+                video_processor=video_processor,
+                latents_mean=latents_mean,
+                latents_std=latents_std,
+                device=device,
+            ),
+            "chunked",
+        )
+
+    try:
+        return (
+            decode_payload_full(
+                payload=payload,
+                vae=vae,
+                video_processor=video_processor,
+                latents_mean=latents_mean,
+                latents_std=latents_std,
+                device=device,
+            ),
+            "full",
+        )
+    except RuntimeError as exc:
+        if vae_decode_mode != "auto" or not is_out_of_memory_error(exc):
+            raise
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        print(
+            f"[decoder] warning: full-sequence VAE decode ran out of memory for {latent_path}; "
+            "falling back to chunked decode."
+        )
+        return (
+            decode_payload_chunked(
+                payload=payload,
+                latent_path=latent_path,
+                format_version=format_version,
+                vae=vae,
+                video_processor=video_processor,
+                latents_mean=latents_mean,
+                latents_std=latents_std,
+                device=device,
+            ),
+            "chunked",
+        )
+
+
 def decode_payload_to_output_path(
     payload: Dict,
     latent_path: Path,
@@ -452,6 +600,7 @@ def decode_payload_to_output_path(
     model_bundle_cache: Dict[str, ModelBundle],
     device: torch.device,
     compare_config: Optional[CompareExportConfig],
+    vae_decode_mode: str = "auto",
 ) -> Path:
     validate_payload(payload, latent_path)
     format_version = payload["format_version"]
@@ -463,29 +612,18 @@ def decode_payload_to_output_path(
         device=device,
     )
 
-    frame_chunks: List[np.ndarray] = []
     with torch.inference_mode():
-        chunk_frame_ranges = payload.get("chunk_frame_ranges")
-        for chunk_idx, latent_chunk in enumerate(payload["latent_chunks"]):
-            latent_chunk = latent_chunk.unsqueeze(0).to(device=device, dtype=vae.dtype)
-            decoded = vae.decode(latent_chunk / latents_std + latents_mean, return_dict=False)[0]
-            decoded_frames = video_processor.postprocess_video(decoded, output_type="np")[0]
-
-            if chunk_frame_ranges is not None:
-                frame_range = chunk_frame_ranges[chunk_idx]
-                expected_frames = frame_range[1] - frame_range[0]
-                if decoded_frames.shape[0] != expected_frames:
-                    raise RuntimeError(
-                        f"Decoded frame count mismatch for {latent_path}. "
-                        f"Expected {expected_frames}, got {decoded_frames.shape[0]}."
-                    )
-            elif format_version == LATENT_FORMAT_V1:
-                raise RuntimeError(
-                    f"Latent file {latent_path} is missing chunk_frame_ranges for {LATENT_FORMAT_V1}."
-                )
-            frame_chunks.append(decoded_frames)
-
-    reconstructed_video = np.concatenate(frame_chunks, axis=0)
+        reconstructed_video, resolved_decode_mode = decode_payload_frames(
+            payload=payload,
+            latent_path=latent_path,
+            format_version=format_version,
+            vae=vae,
+            video_processor=video_processor,
+            latents_mean=latents_mean,
+            latents_std=latents_std,
+            device=device,
+            vae_decode_mode=vae_decode_mode,
+        )
     source_num_frames = payload.get("source_num_frames")
     if source_num_frames is not None:
         if reconstructed_video.shape[0] < source_num_frames:
@@ -499,7 +637,8 @@ def decode_payload_to_output_path(
     print(
         f"[decoder] saved={output_path} "
         f"frames={reconstructed_video.shape[0]} "
-        f"resolution={reconstructed_video.shape[2]}x{reconstructed_video.shape[1]}"
+        f"resolution={reconstructed_video.shape[2]}x{reconstructed_video.shape[1]} "
+        f"vae_decode_mode={resolved_decode_mode}"
     )
     export_compare_outputs(
         payload=payload,
@@ -522,6 +661,7 @@ def decode_latent_file_to_output_path(
     model_bundle_cache: Dict[str, ModelBundle],
     device: torch.device,
     compare_config: Optional[CompareExportConfig],
+    vae_decode_mode: str = "auto",
 ) -> Path:
     payload = load_payload(latent_path)
     return decode_payload_to_output_path(
@@ -533,6 +673,7 @@ def decode_latent_file_to_output_path(
         model_bundle_cache=model_bundle_cache,
         device=device,
         compare_config=compare_config,
+        vae_decode_mode=vae_decode_mode,
     )
 
 
@@ -544,6 +685,7 @@ def decode_latent_file(
     model_bundle_cache: Dict[str, ModelBundle],
     device: torch.device,
     compare_config: Optional[CompareExportConfig],
+    vae_decode_mode: str = "auto",
 ) -> Path:
     relative_path = latent_path.relative_to(input_dir)
     output_path = output_dir / relative_path.with_suffix(".mp4")
@@ -555,6 +697,7 @@ def decode_latent_file(
         model_bundle_cache=model_bundle_cache,
         device=device,
         compare_config=compare_config,
+        vae_decode_mode=vae_decode_mode,
     )
 
 
@@ -570,6 +713,7 @@ def main() -> None:
     print(f"[decoder] input_dir={input_dir}")
     print(f"[decoder] output_dir={output_dir}")
     print(f"[decoder] base_model_path={args.base_model_path or 'from-latent-metadata'}")
+    print(f"[decoder] vae_decode_mode={args.vae_decode_mode}")
     if compare_config is None:
         print("[decoder] compare_mode=off")
     else:
@@ -587,6 +731,7 @@ def main() -> None:
             model_bundle_cache=model_bundle_cache,
             device=device,
             compare_config=compare_config,
+            vae_decode_mode=args.vae_decode_mode,
         )
 
 
