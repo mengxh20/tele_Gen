@@ -2,6 +2,7 @@ torch==2.7.1
 torchvision==0.22.1
 torchaudio==2.7.1
 triton==3.3.1
+lpips==0.1.4
 # Pin to compatible releases. Avoid installing from git HEAD.
 # git+https://github.com/huggingface/diffusers.git
 # git+https://github.com/huggingface/transformers.git

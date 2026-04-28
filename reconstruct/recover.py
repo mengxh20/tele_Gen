@@ -77,8 +77,8 @@ DEFAULT_KEYFRAME_DTYPE = "float16"
 DEFAULT_KEYFRAME_CODEC_MODE = RAW_KEYFRAME_CODEC_MODE
 DEFAULT_KEYFRAME_QUANT_DTYPE = "int8"
 DEFAULT_KEYFRAME_SPATIAL_FACTOR = 1
-DEFAULT_HISTORY_SIZES = [3, 1, 1]
-DEFAULT_LATENT_WINDOW_SIZE = 3  # Helios的VAE中4帧视频压缩成一个latent时间步，所以其实一个latent对应4帧,最终对应原视频的关系是 (DEFAULT_ANCHOR_SPAN_LATENTS + (DEFAULT_LATENT_WINDOW_SIZE - 1) * 4 = 原视频帧数)
+DEFAULT_HISTORY_SIZES = [1, 1, 1]
+DEFAULT_LATENT_WINDOW_SIZE = 5  # Helios的VAE中4帧视频压缩成一个latent时间步，所以其实一个latent对应4帧,最终对应原视频的关系是 (DEFAULT_ANCHOR_SPAN_LATENTS + (DEFAULT_LATENT_WINDOW_SIZE - 1) * 4 = 原视频帧数)
 DEFAULT_SECTION_SPAN_LATENTS = DEFAULT_LATENT_WINDOW_SIZE
 DEFAULT_ANCHOR_SPAN_LATENTS = 1
 DEFAULT_TAIL_SPAN_LATENTS = DEFAULT_SECTION_SPAN_LATENTS - DEFAULT_ANCHOR_SPAN_LATENTS
@@ -120,6 +120,9 @@ DEFAULT_TAIL_QUALITY_MAX = 1.35
 DEFAULT_ANCHOR_PROFILE_LOW = 4
 DEFAULT_ANCHOR_PROFILE_BASE = 2
 DEFAULT_ANCHOR_PROFILE_HIGH = 1
+DEFAULT_COMPUTE_LPIPS = True
+DEFAULT_LPIPS_NET = "alex"
+DEFAULT_LPIPS_FRAME_BATCH_SIZE = 4
 EPS = 1e-8
 
 
@@ -193,6 +196,17 @@ class PreparedSequence:
     clean_full_latents: torch.Tensor
     low_codec_payload: Optional[Dict[str, object]] = None
     low_full_latents: Optional[torch.Tensor] = None
+
+
+@dataclass
+class LpipsMetricResources:
+    """LPIPS 计算所需的 VAE 与感知网络资源。"""
+
+    vae: torch.nn.Module
+    latents_mean: torch.Tensor
+    latents_std: torch.Tensor
+    model: torch.nn.Module
+    frame_batch_size: int
 
 
 @dataclass(frozen=True)
@@ -469,6 +483,25 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Whether to persist external entropy transport bitstreams as enc_latents/*.bin.",
+    )
+    parser.add_argument(
+        "--compute_lpips",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_COMPUTE_LPIPS,
+        help="Decode clean/low/recover latents and add LPIPS to inference metrics.",
+    )
+    parser.add_argument(
+        "--lpips_net",
+        type=str,
+        default=DEFAULT_LPIPS_NET,
+        choices=["alex", "vgg", "squeeze"],
+        help="Backbone used by the LPIPS perceptual metric.",
+    )
+    parser.add_argument(
+        "--lpips_frame_batch_size",
+        type=int,
+        default=DEFAULT_LPIPS_FRAME_BATCH_SIZE,
+        help="Number of decoded frames evaluated per LPIPS forward pass.",
     )
 
 
@@ -1277,6 +1310,12 @@ def command_train(args: argparse.Namespace) -> None:
             wandb_run.finish()
 
 
+def synchronize_device_for_timing(device: torch.device) -> None:
+    """同步异步 CUDA 工作，避免推理耗时统计偏低。"""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def command_infer(args: argparse.Namespace) -> None:
     """执行压缩与恢复推理。
 
@@ -1385,6 +1424,22 @@ def command_infer(args: argparse.Namespace) -> None:
                 use_ste_quant=False,
                 move_to_cpu=True,
             )
+            low_latent_path, recover_latent_path, metrics_path = resolve_output_paths(
+                input_path=latent_path,
+                input_root=input_root,
+                low_dir=low_dir,
+                recover_dir=recover_dir,
+                metrics_dir=metrics_dir,
+            )
+            enc_latent_path, entropy_metrics_path = resolve_entropy_output_paths(
+                input_path=latent_path,
+                input_root=input_root,
+                enc_dir=enc_dir,
+                entropy_metrics_dir=entropy_metrics_dir,
+            )
+
+            synchronize_device_for_timing(device)
+            recover_inference_started_at = time.perf_counter()
             recovered_full_latents = reconstruct_sequence(
                 sequence=sequence,
                 transformer=transformer,
@@ -1401,33 +1456,6 @@ def command_infer(args: argparse.Namespace) -> None:
                 recover_overlap_latents=args.recover_overlap_latents,
                 distributed_context=distributed_context,
             )
-            low_latent_path, recover_latent_path, metrics_path = resolve_output_paths(
-                input_path=latent_path,
-                input_root=input_root,
-                low_dir=low_dir,
-                recover_dir=recover_dir,
-                metrics_dir=metrics_dir,
-            )
-            enc_latent_path, entropy_metrics_path = resolve_entropy_output_paths(
-                input_path=latent_path,
-                input_root=input_root,
-                enc_dir=enc_dir,
-                entropy_metrics_dir=entropy_metrics_dir,
-            )
-            low_payload = build_low_latent_payload(sequence)
-            torch.save(low_payload, low_latent_path)
-            relative_transport_path = str(latent_path.relative_to(input_root))
-            if enc_latent_path is not None:
-                entropy_summary = write_external_entropy_payload(
-                    low_payload,
-                    enc_latent_path,
-                    relative_path=relative_transport_path,
-                )
-            else:
-                _, entropy_summary = serialize_external_entropy_payload(
-                    low_payload,
-                    relative_path=relative_transport_path,
-                )
             ensure_finite_recover_state(
                 stage="final_output",
                 input_path=sequence.path,
@@ -1444,6 +1472,23 @@ def command_infer(args: argparse.Namespace) -> None:
                 checkpoint_dir=checkpoint_dir,
             )
             torch.save(recover_payload, recover_latent_path)
+            synchronize_device_for_timing(device)
+            recover_inference_time_sec = float(time.perf_counter() - recover_inference_started_at)
+
+            low_payload = build_low_latent_payload(sequence)
+            torch.save(low_payload, low_latent_path)
+            relative_transport_path = str(latent_path.relative_to(input_root))
+            if enc_latent_path is not None:
+                entropy_summary = write_external_entropy_payload(
+                    low_payload,
+                    enc_latent_path,
+                    relative_path=relative_transport_path,
+                )
+            else:
+                _, entropy_summary = serialize_external_entropy_payload(
+                    low_payload,
+                    relative_path=relative_transport_path,
+                )
 
             direct_low_metrics = compute_tensor_metrics(sequence.low_full_latents, sequence.clean_full_latents)
             restored_metrics = compute_tensor_metrics(recovered_full_latents, sequence.clean_full_latents)
@@ -1512,6 +1557,7 @@ def command_infer(args: argparse.Namespace) -> None:
                     sequence.low_codec_payload.get("video_mean_tail_quality_scale", 1.0)
                 ),
                 "video_section_bpp_mean": float(sequence.low_codec_payload.get("video_section_bpp_mean", 0.0)),
+                "recover_inference_time_sec": recover_inference_time_sec,
                 "direct_low_metrics": direct_low_metrics,
                 "restored_metrics": restored_metrics,
                 "low_tail_position_metrics": low_tail_position_metrics,
@@ -1575,15 +1621,128 @@ def command_infer(args: argparse.Namespace) -> None:
                 f"transport={'enc_latents/.bin' if enc_latent_path is not None else 'memory_only'} "
                 f"low_bpp={sequence.low_codec_payload['low_bpp']:.6f} "
                 f"entropy_bpp={entropy_bpp:.6f} "
+                f"recover_inference_time_sec={recover_inference_time_sec:.3f} "
                 f"direct_low_l1={direct_low_metrics['l1']:.6f} restored_l1={restored_metrics['l1']:.6f}"
             )
 
             if device.type == "cuda":
                 # 逐样本清 cache，减轻长序列推理时的显存峰值压力。
                 torch.cuda.empty_cache()
+
+        if args.compute_lpips:
+            del transformer, scheduler, prompt_embeds
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            append_decoded_lpips_metrics(
+                assigned_latent_paths=assigned_latent_paths,
+                input_root=input_root,
+                low_dir=low_dir,
+                recover_dir=recover_dir,
+                metrics_dir=metrics_dir,
+                codec_config=codec_config,
+                learned_tail_codec=learned_tail_codec,
+                base_model_path=str(base_model_path),
+                device=device,
+                lpips_net=str(args.lpips_net),
+                frame_batch_size=int(args.lpips_frame_batch_size),
+                distributed_context=distributed_context,
+            )
         distributed_barrier(distributed_context)
     finally:
         cleanup_distributed_context(distributed_context)
+
+
+def append_decoded_lpips_metrics(
+    assigned_latent_paths: Sequence[Path],
+    input_root: Path,
+    low_dir: Path,
+    recover_dir: Path,
+    metrics_dir: Path,
+    codec_config: CodecConfig,
+    learned_tail_codec: Optional[torch.nn.Module],
+    base_model_path: str,
+    device: torch.device,
+    lpips_net: str,
+    frame_batch_size: int,
+    distributed_context: DistributedContext,
+) -> None:
+    """在 recover 推理完成后补充 decoded-frame LPIPS 指标。"""
+    if not assigned_latent_paths:
+        return
+
+    resources = load_lpips_metric_resources(
+        base_model_path=base_model_path,
+        device=device,
+        lpips_net=lpips_net,
+        frame_batch_size=frame_batch_size,
+    )
+    print(
+        f"[infer][rank={distributed_context.rank}] computing decoded LPIPS "
+        f"net={lpips_net} frame_batch_size={frame_batch_size} files={len(assigned_latent_paths)}"
+    )
+
+    for sample_idx, latent_path in enumerate(assigned_latent_paths, start=1):
+        sequence = prepare_sequence(
+            latent_path,
+            codec_config,
+            learned_tail_codec=None,
+            materialize_low_latents=False,
+        )
+        low_latent_path, recover_latent_path, metrics_path = resolve_output_paths(
+            input_path=latent_path,
+            input_root=input_root,
+            low_dir=low_dir,
+            recover_dir=recover_dir,
+            metrics_dir=metrics_dir,
+        )
+        if not low_latent_path.exists():
+            raise FileNotFoundError(f"Missing low latent payload for LPIPS: {low_latent_path}")
+        if not recover_latent_path.exists():
+            raise FileNotFoundError(f"Missing recover latent payload for LPIPS: {recover_latent_path}")
+        if not metrics_path.exists():
+            raise FileNotFoundError(f"Missing metrics payload for LPIPS update: {metrics_path}")
+
+        low_payload = load_payload(low_latent_path)
+        recover_payload = load_payload(recover_latent_path)
+        low_full_latents = decode_low_latents(
+            codec_payload=low_payload,
+            learned_tail_codec=learned_tail_codec,
+        ).float().cpu().contiguous()
+        recovered_full_latents = flatten_latent_chunks(recover_payload["latent_chunks"]).float().contiguous()
+
+        lpips_metrics = compute_decoded_lpips_metrics(
+            low_prediction=low_full_latents,
+            recovered_prediction=recovered_full_latents,
+            target=sequence.clean_full_latents,
+            chunk_lengths=sequence.metadata.chunk_lengths,
+            source_num_frames=sequence.metadata.source_num_frames,
+            resources=resources,
+            device=device,
+        )
+
+        with metrics_path.open("r", encoding="utf-8") as handle:
+            metrics_payload = json.load(handle)
+        metrics_payload.setdefault("direct_low_metrics", {})["lpips"] = float(lpips_metrics["direct_low_lpips"])
+        metrics_payload.setdefault("restored_metrics", {})["lpips"] = float(lpips_metrics["restored_lpips"])
+        metrics_payload["lpips_metric"] = {
+            "net": lpips_net,
+            "vae_decode_mode": "chunked",
+            "frame_batch_size": int(frame_batch_size),
+            "frame_count": int(lpips_metrics["frame_count"]),
+        }
+        with metrics_path.open("w", encoding="utf-8") as handle:
+            json.dump(metrics_payload, handle, indent=2)
+
+        print(
+            f"[infer][rank={distributed_context.rank}] "
+            f"({sample_idx}/{len(assigned_latent_paths)}) metrics={metrics_path} "
+            f"direct_low_lpips={lpips_metrics['direct_low_lpips']:.6f} "
+            f"restored_lpips={lpips_metrics['restored_lpips']:.6f}"
+        )
+
+        del sequence, low_payload, recover_payload, low_full_latents, recovered_full_latents
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 def build_codec_config(args: argparse.Namespace) -> CodecConfig:
@@ -3198,6 +3357,194 @@ def compute_tensor_metrics(prediction: torch.Tensor, target: torch.Tensor) -> Di
         "mse": mse,
         "l1": l1,
         "psnr": psnr,
+    }
+
+
+def load_lpips_metric_resources(
+    base_model_path: str,
+    device: torch.device,
+    lpips_net: str,
+    frame_batch_size: int,
+) -> LpipsMetricResources:
+    """加载用于 decoded-frame LPIPS 的 VAE 与 LPIPS 网络。"""
+    if frame_batch_size <= 0:
+        raise ValueError(f"--lpips_frame_batch_size must be positive, got {frame_batch_size}.")
+
+    ensure_diffusers_parallel_shim()
+    try:
+        import lpips
+        from diffusers.models import AutoencoderKLWan
+    except ImportError as exc:
+        raise ImportError(
+            "LPIPS metric requires the `lpips` package and diffusers VAE support. "
+            "Please install project requirements before running recover.py infer."
+        ) from exc
+
+    vae = AutoencoderKLWan.from_pretrained(
+        base_model_path,
+        subfolder="vae",
+        torch_dtype=torch.float32,
+    )
+    if hasattr(vae, "enable_slicing"):
+        vae.enable_slicing()
+    if hasattr(vae, "enable_tiling"):
+        vae.enable_tiling()
+    vae.eval()
+    vae.requires_grad_(False)
+    vae = vae.to(device)
+
+    latents_mean = torch.tensor(vae.config.latents_mean, device=device, dtype=vae.dtype).view(1, vae.config.z_dim, 1, 1, 1)
+    latents_std = (
+        1.0 / torch.tensor(vae.config.latents_std, device=device, dtype=vae.dtype).view(1, vae.config.z_dim, 1, 1, 1)
+    )
+
+    lpips_model = lpips.LPIPS(net=lpips_net)
+    lpips_model.eval()
+    lpips_model.requires_grad_(False)
+    lpips_model = lpips_model.to(device)
+
+    return LpipsMetricResources(
+        vae=vae,
+        latents_mean=latents_mean,
+        latents_std=latents_std,
+        model=lpips_model,
+        frame_batch_size=int(frame_batch_size),
+    )
+
+
+def decode_latent_chunk_for_lpips(
+    latent_chunk: torch.Tensor,
+    resources: LpipsMetricResources,
+    device: torch.device,
+) -> torch.Tensor:
+    """把 [C, T, H, W] latent chunk 解码为 LPIPS 需要的 [F, C, H, W] RGB 张量。"""
+    latent_tensor = latent_chunk.unsqueeze(0).to(device=device, dtype=resources.vae.dtype)
+    decoded = resources.vae.decode(
+        latent_tensor / resources.latents_std + resources.latents_mean,
+        return_dict=False,
+    )[0]
+    return decoded[0].float().clamp(-1.0, 1.0).permute(1, 0, 2, 3).contiguous()
+
+
+def accumulate_lpips_score(
+    prediction_frames: torch.Tensor,
+    target_frames: torch.Tensor,
+    resources: LpipsMetricResources,
+) -> Tuple[float, int]:
+    """按小 batch 累加 per-frame LPIPS，避免一次性吃满显存。"""
+    if prediction_frames.shape != target_frames.shape:
+        raise ValueError(
+            "LPIPS decoded frame shape mismatch: "
+            f"prediction={tuple(prediction_frames.shape)} target={tuple(target_frames.shape)}"
+        )
+
+    score_sum = 0.0
+    score_count = 0
+    frame_count = int(target_frames.shape[0])
+    for start in range(0, frame_count, resources.frame_batch_size):
+        end = min(frame_count, start + resources.frame_batch_size)
+        scores = resources.model(prediction_frames[start:end], target_frames[start:end])
+        score_sum += float(scores.detach().float().sum().item())
+        score_count += int(scores.numel())
+    return score_sum, score_count
+
+
+def compute_decoded_lpips_metrics(
+    low_prediction: torch.Tensor,
+    recovered_prediction: torch.Tensor,
+    target: torch.Tensor,
+    chunk_lengths: Sequence[int],
+    source_num_frames: int,
+    resources: LpipsMetricResources,
+    device: torch.device,
+) -> Dict[str, object]:
+    """对解码后的 clean/low/recover 帧计算 LPIPS。
+
+    LPIPS 是图像感知指标，这里只用于验证恢复质量；主链路的低码率表示仍然保持在 latent 空间。
+    """
+    lpips_sums = {
+        "direct_low": 0.0,
+        "restored": 0.0,
+    }
+    lpips_counts = {
+        "direct_low": 0,
+        "restored": 0,
+    }
+    latent_start = 0
+    decoded_frame_count = 0
+
+    with torch.inference_mode():
+        for chunk_length in chunk_lengths:
+            latent_end = latent_start + int(chunk_length)
+            if (
+                latent_end > int(target.shape[1])
+                or latent_end > int(low_prediction.shape[1])
+                or latent_end > int(recovered_prediction.shape[1])
+            ):
+                raise ValueError(
+                    "LPIPS chunk length exceeds latent length: "
+                    f"latent_end={latent_end} "
+                    f"target_length={int(target.shape[1])} "
+                    f"low_length={int(low_prediction.shape[1])} "
+                    f"recovered_length={int(recovered_prediction.shape[1])}."
+                )
+
+            remaining_frames = int(source_num_frames) - decoded_frame_count
+            if remaining_frames <= 0:
+                break
+
+            target_frames = decode_latent_chunk_for_lpips(
+                target[:, latent_start:latent_end],
+                resources=resources,
+                device=device,
+            )
+            frame_count = min(int(target_frames.shape[0]), remaining_frames)
+            if frame_count <= 0:
+                latent_start = latent_end
+                continue
+            target_frames = target_frames[:frame_count]
+
+            low_frames = decode_latent_chunk_for_lpips(
+                low_prediction[:, latent_start:latent_end],
+                resources=resources,
+                device=device,
+            )[:frame_count]
+            score_sum, score_count = accumulate_lpips_score(
+                prediction_frames=low_frames,
+                target_frames=target_frames,
+                resources=resources,
+            )
+            lpips_sums["direct_low"] += score_sum
+            lpips_counts["direct_low"] += score_count
+            del low_frames
+
+            recovered_frames = decode_latent_chunk_for_lpips(
+                recovered_prediction[:, latent_start:latent_end],
+                resources=resources,
+                device=device,
+            )[:frame_count]
+            score_sum, score_count = accumulate_lpips_score(
+                prediction_frames=recovered_frames,
+                target_frames=target_frames,
+                resources=resources,
+            )
+            lpips_sums["restored"] += score_sum
+            lpips_counts["restored"] += score_count
+            del recovered_frames, target_frames
+
+            decoded_frame_count += frame_count
+            latent_start = latent_end
+
+    if decoded_frame_count < int(source_num_frames):
+        raise RuntimeError(
+            "LPIPS decoded fewer frames than expected: "
+            f"decoded={decoded_frame_count} expected={int(source_num_frames)}."
+        )
+
+    return {
+        "direct_low_lpips": lpips_sums["direct_low"] / max(lpips_counts["direct_low"], 1),
+        "restored_lpips": lpips_sums["restored"] / max(lpips_counts["restored"], 1),
+        "frame_count": int(decoded_frame_count),
     }
 
 

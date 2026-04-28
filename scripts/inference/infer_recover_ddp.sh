@@ -11,7 +11,7 @@ export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export MASTER_PORT="${MASTER_PORT:-29531}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.9}"
 export MAX_SAMPLES="${MAX_SAMPLES:-4}" # 推理4个样本看看就够了
-export NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-50}"
+export NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 export RECOVER_OVERLAP_LATENTS="${RECOVER_OVERLAP_LATENTS:-2}"
 export VAE_DECODE_MODE="${VAE_DECODE_MODE:-auto}"
 
@@ -40,17 +40,8 @@ torchrun \
     "${INFER_ARGS[@]}"
 
 
-# # 推理完之后自动进行解码恢复视频
-# python reconstruct/decoder.py -R ${SAVEDIR}/recover_outputs
-
-# 推理完之后自动走接收端链路：
-# 直接以 low_latents 作为输入，在内存中模拟真实运输码流，再 recover -> video。
-# 这样不会依赖 enc_latents/.bin，也能避免旧 .bin 残留影响当前结果。
-python reconstruct/real_decoder.py \
+# 推理已经产出 recover_latents，后处理阶段直接解码这份恢复结果用于可视化验收。
+python reconstruct/decoder.py \
     -R "${SAVEDIR}/recover_outputs" \
-    --input_dir "${SAVEDIR}/recover_outputs/low_latents" \
-    --transport_input_mode simulate_entropy \
-    --checkpoint_dir "${SAVEDIR}/checkpoints" \
-    --num_inference_steps "${NUM_INFERENCE_STEPS}" \
-    --recover_overlap_latents "${RECOVER_OVERLAP_LATENTS}" \
+    --input_dir "${SAVEDIR}/recover_outputs/recover_latents" \
     --vae_decode_mode "${VAE_DECODE_MODE}"
