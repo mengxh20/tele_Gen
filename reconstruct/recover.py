@@ -44,12 +44,19 @@ from reconstruct.codec_gop import (
     DEFAULT_DUAL_REFRESH_GAIN_THRESHOLD,
     DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS,
     DEFAULT_SINGLE_REFRESH_GAIN_THRESHOLD,
+    DEFAULT_DUAL_TAIL_CODEC_TYPE,
+    DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR,
     DUAL_REFRESH_SECTION_MODE,
+    DUAL_TAIL_ANCHOR_CODEC_TYPE,
+    DUAL_TAIL_P_DELTA_CODEC_TYPE,
+    INT8_REFRESH_LIKE_GLOBAL_KEYFRAME_CODEC_TYPE,
     PREDICT_ONLY_SECTION_MODE,
+    RAW_GLOBAL_KEYFRAME_CODEC_TYPE,
     SINGLE_REFRESH_SECTION_MODE,
     TRILINEAR_TAIL_CODEC_TYPE,
     decode_low_latents_payload,
     encode_anchor_plus_tail_latents,
+    estimate_anchor_plus_tail_codec_byte_breakdown,
     estimate_anchor_plus_tail_codec_bytes,
     make_section_ranges,
     validate_codec_config,
@@ -78,6 +85,16 @@ DEFAULT_TEMPORAL_FACTOR = 2
 DEFAULT_SPATIAL_FACTOR = 4
 DEFAULT_QUANT_DTYPE = "int8"
 DEFAULT_KEYFRAME_DTYPE = "float16"
+DEFAULT_GLOBAL_KEYFRAME_CODEC_TYPE = RAW_GLOBAL_KEYFRAME_CODEC_TYPE
+DEFAULT_GLOBAL_KEYFRAME_QUANT_DTYPE = "int8"
+DEFAULT_GLOBAL_KEYFRAME_SPATIAL_FACTOR = 1
+LOW_CODEC_BYTE_BREAKDOWN_KEYS = (
+    "global_keyframe_bytes",
+    "single_head_bytes",
+    "dual_head_bytes",
+    "dual_tail_presidual_bytes",
+    "metadata_bytes",
+)
 DEFAULT_HISTORY_SIZES = [3, 1, 1]
 DEFAULT_LATENT_WINDOW_SIZE = 3  # Helios的VAE中4帧视频压缩成一个latent时间步，所以其实一个latent对应4帧,最终对应原视频的关系是 (DEFAULT_ANCHOR_SPAN_LATENTS + (DEFAULT_LATENT_WINDOW_SIZE - 1) * 4 = 原视频帧数)
 DEFAULT_SECTION_SPAN_LATENTS = DEFAULT_LATENT_WINDOW_SIZE
@@ -142,12 +159,17 @@ class CodecConfig:
     spatial_factor: int = DEFAULT_SPATIAL_FACTOR
     quant_dtype: str = DEFAULT_QUANT_DTYPE
     keyframe_dtype: str = DEFAULT_KEYFRAME_DTYPE
+    global_keyframe_codec_type: str = DEFAULT_GLOBAL_KEYFRAME_CODEC_TYPE
+    global_keyframe_quant_dtype: str = DEFAULT_GLOBAL_KEYFRAME_QUANT_DTYPE
+    global_keyframe_spatial_factor: int = DEFAULT_GLOBAL_KEYFRAME_SPATIAL_FACTOR
     section_span_latents: int = DEFAULT_SECTION_SPAN_LATENTS
     anchor_span_latents: int = DEFAULT_ANCHOR_SPAN_LATENTS
     tail_span_latents: int = DEFAULT_TAIL_SPAN_LATENTS
     anchor_quant_dtype: str = DEFAULT_ANCHOR_QUANT_DTYPE
     anchor_spatial_factor: int = DEFAULT_ANCHOR_SPATIAL_FACTOR
     dual_tail_anchor_spatial_factor: Optional[int] = DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR
+    dual_tail_codec_type: str = DEFAULT_DUAL_TAIL_CODEC_TYPE
+    dual_tail_p_delta_spatial_factor: int = DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR
     tail_codec_type: str = DEFAULT_TAIL_CODEC_TYPE
     learned_codec_hidden_channels: Optional[int] = None
     max_predict_only_gap_sections: int = DEFAULT_MAX_PREDICT_ONLY_GAP
@@ -354,6 +376,24 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--spatial_factor", type=int, default=DEFAULT_SPATIAL_FACTOR)
     parser.add_argument("--quant_dtype", type=str, default=DEFAULT_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--keyframe_dtype", type=str, default=DEFAULT_KEYFRAME_DTYPE, choices=["float16", "float32"])
+    parser.add_argument(
+        "--global_keyframe_codec_type",
+        type=str,
+        default=DEFAULT_GLOBAL_KEYFRAME_CODEC_TYPE,
+        choices=[RAW_GLOBAL_KEYFRAME_CODEC_TYPE, INT8_REFRESH_LIKE_GLOBAL_KEYFRAME_CODEC_TYPE],
+    )
+    parser.add_argument(
+        "--global_keyframe_quant_dtype",
+        type=str,
+        default=DEFAULT_GLOBAL_KEYFRAME_QUANT_DTYPE,
+        choices=["int8"],
+    )
+    parser.add_argument(
+        "--global_keyframe_spatial_factor",
+        type=int,
+        default=DEFAULT_GLOBAL_KEYFRAME_SPATIAL_FACTOR,
+        help="Spatial downsample factor used when encoding the global keyframe payload.",
+    )
     parser.add_argument("--section_span_latents", "--section", dest="section_span_latents", type=int, default=None)
     parser.add_argument(
         "--anchor_span_latents",
@@ -370,6 +410,19 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR,
         help="Optional spatial downsample factor applied only to the tail anchor in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--dual_tail_codec_type",
+        type=str,
+        default=DEFAULT_DUAL_TAIL_CODEC_TYPE,
+        choices=[DUAL_TAIL_ANCHOR_CODEC_TYPE, DUAL_TAIL_P_DELTA_CODEC_TYPE],
+        help="Codec used for the tail condition in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--dual_tail_p_delta_spatial_factor",
+        type=int,
+        default=DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR,
+        help="Spatial downsample factor for P-delta tail payloads in dual-refresh sections.",
     )
     parser.add_argument("--max_predict_only_gap_sections", type=int, default=DEFAULT_MAX_PREDICT_ONLY_GAP)
     parser.add_argument("--single_refresh_gain_threshold", type=float, default=DEFAULT_SINGLE_REFRESH_GAIN)
@@ -479,10 +532,41 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_NUM_INFERENCE_STEPS,
     )
     parser.add_argument(
+        "--global_keyframe_codec_type",
+        type=str,
+        default=DEFAULT_GLOBAL_KEYFRAME_CODEC_TYPE,
+        choices=[RAW_GLOBAL_KEYFRAME_CODEC_TYPE, INT8_REFRESH_LIKE_GLOBAL_KEYFRAME_CODEC_TYPE],
+    )
+    parser.add_argument(
+        "--global_keyframe_quant_dtype",
+        type=str,
+        default=DEFAULT_GLOBAL_KEYFRAME_QUANT_DTYPE,
+        choices=["int8"],
+    )
+    parser.add_argument(
+        "--global_keyframe_spatial_factor",
+        type=int,
+        default=DEFAULT_GLOBAL_KEYFRAME_SPATIAL_FACTOR,
+        help="Spatial downsample factor used when encoding the global keyframe payload.",
+    )
+    parser.add_argument(
         "--dual_tail_anchor_spatial_factor",
         type=int,
         default=DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR,
         help="Optional spatial downsample factor applied only to the tail anchor in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--dual_tail_codec_type",
+        type=str,
+        default=DEFAULT_DUAL_TAIL_CODEC_TYPE,
+        choices=[DUAL_TAIL_ANCHOR_CODEC_TYPE, DUAL_TAIL_P_DELTA_CODEC_TYPE],
+        help="Codec used for the tail condition in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--dual_tail_p_delta_spatial_factor",
+        type=int,
+        default=DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR,
+        help="Spatial downsample factor for P-delta tail payloads in dual-refresh sections.",
     )
     parser.add_argument(
         "--target_low_bpp",
@@ -1494,6 +1578,36 @@ def command_infer(args: argparse.Namespace) -> None:
             raise ValueError(f"--num_inference_steps must be > 0, got {args.num_inference_steps}.")
         mode_inference_steps = resolve_mode_inference_steps(args, checkpoint_config)
         codec_config = CodecConfig(**checkpoint_config["codec_config"])
+        codec_config.global_keyframe_codec_type = str(
+            resolve_infer_value(
+                cli_value=args.global_keyframe_codec_type,
+                default_value=DEFAULT_GLOBAL_KEYFRAME_CODEC_TYPE,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "global_keyframe_codec_type",
+                    DEFAULT_GLOBAL_KEYFRAME_CODEC_TYPE,
+                ),
+            )
+        )
+        codec_config.global_keyframe_quant_dtype = str(
+            resolve_infer_value(
+                cli_value=args.global_keyframe_quant_dtype,
+                default_value=DEFAULT_GLOBAL_KEYFRAME_QUANT_DTYPE,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "global_keyframe_quant_dtype",
+                    DEFAULT_GLOBAL_KEYFRAME_QUANT_DTYPE,
+                ),
+            )
+        )
+        codec_config.global_keyframe_spatial_factor = int(
+            resolve_infer_value(
+                cli_value=args.global_keyframe_spatial_factor,
+                default_value=DEFAULT_GLOBAL_KEYFRAME_SPATIAL_FACTOR,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "global_keyframe_spatial_factor",
+                    DEFAULT_GLOBAL_KEYFRAME_SPATIAL_FACTOR,
+                ),
+            )
+        )
         resolved_dual_tail_anchor_spatial_factor = resolve_infer_value(
             cli_value=args.dual_tail_anchor_spatial_factor,
             default_value=DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR,
@@ -1512,6 +1626,23 @@ def command_infer(args: argparse.Namespace) -> None:
                 "--dual_tail_anchor_spatial_factor must be >= 1, "
                 f"got {codec_config.dual_tail_anchor_spatial_factor}."
             )
+        codec_config.dual_tail_codec_type = str(
+            resolve_infer_value(
+                cli_value=args.dual_tail_codec_type,
+                default_value=DEFAULT_DUAL_TAIL_CODEC_TYPE,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get("dual_tail_codec_type"),
+            )
+        )
+        codec_config.dual_tail_p_delta_spatial_factor = int(
+            resolve_infer_value(
+                cli_value=args.dual_tail_p_delta_spatial_factor,
+                default_value=DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "dual_tail_p_delta_spatial_factor",
+                    DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR,
+                ),
+            )
+        )
         resolved_target_low_bpp = resolve_infer_value(
             cli_value=args.target_low_bpp,
             default_value=DEFAULT_TARGET_LOW_BPP,
@@ -1522,6 +1653,7 @@ def command_infer(args: argparse.Namespace) -> None:
         )
         if codec_config.target_low_bpp is not None and codec_config.target_low_bpp <= 0.0:
             raise ValueError(f"--target_low_bpp must be > 0, got {codec_config.target_low_bpp}.")
+        validate_codec_config(asdict(codec_config))
         history_sizes = normalize_history_sizes(checkpoint_config["history_sizes"])
         latent_window_size = int(checkpoint_config.get("section_span_latents", checkpoint_config["latent_window_size"]))
         anchor_span_latents = int(checkpoint_config.get("anchor_span_latents", codec_config.anchor_span_latents))
@@ -1760,6 +1892,11 @@ def command_infer(args: argparse.Namespace) -> None:
                 "raw_file_bytes": sequence.metadata.raw_file_bytes,
                 "raw_bpp": sequence.metadata.raw_bpp,
                 "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
+                "global_keyframe_bytes": int(sequence.low_codec_payload["global_keyframe_bytes"]),
+                "single_head_bytes": int(sequence.low_codec_payload["single_head_bytes"]),
+                "dual_head_bytes": int(sequence.low_codec_payload["dual_head_bytes"]),
+                "dual_tail_presidual_bytes": int(sequence.low_codec_payload["dual_tail_presidual_bytes"]),
+                "metadata_bytes": int(sequence.low_codec_payload["metadata_bytes"]),
                 "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
                 "direct_low_metrics": direct_low_metrics,
                 "restored_metrics": restored_metrics,
@@ -1874,12 +2011,21 @@ def build_codec_config(args: argparse.Namespace) -> CodecConfig:
         spatial_factor=args.spatial_factor,
         quant_dtype=args.quant_dtype,
         keyframe_dtype=args.keyframe_dtype,
+        global_keyframe_codec_type=args.global_keyframe_codec_type,
+        global_keyframe_quant_dtype=args.global_keyframe_quant_dtype,
+        global_keyframe_spatial_factor=args.global_keyframe_spatial_factor,
         section_span_latents=section_span_latents,
         anchor_span_latents=anchor_span_latents,
         tail_span_latents=tail_span_latents,
         anchor_quant_dtype=args.anchor_quant_dtype,
         anchor_spatial_factor=args.anchor_spatial_factor,
         dual_tail_anchor_spatial_factor=getattr(args, "dual_tail_anchor_spatial_factor", DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR),
+        dual_tail_codec_type=getattr(args, "dual_tail_codec_type", DEFAULT_DUAL_TAIL_CODEC_TYPE),
+        dual_tail_p_delta_spatial_factor=getattr(
+            args,
+            "dual_tail_p_delta_spatial_factor",
+            DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR,
+        ),
         tail_codec_type=args.tail_codec_type,
         max_predict_only_gap_sections=args.max_predict_only_gap_sections,
         single_refresh_gain_threshold=args.single_refresh_gain_threshold,
@@ -2080,6 +2226,7 @@ def build_sequence_low_latents(
         else None
     )
     low_codec_payload["low_codec_bytes"] = estimate_low_codec_bytes(low_codec_payload)
+    low_codec_payload.update(estimate_low_codec_byte_breakdown(low_codec_payload))
     low_codec_payload["low_bpp"] = compute_bpp_from_total_pixels(
         int(low_codec_payload["low_codec_bytes"]),
         sequence.metadata.total_pixels,
@@ -2156,6 +2303,30 @@ def decode_low_latents(
     return decode_low_latents_payload(codec_payload, learned_tail_codec=learned_tail_codec)
 
 
+def estimate_low_codec_byte_breakdown(codec_payload: Dict[str, object]) -> Dict[str, int]:
+    if "section_payloads" in codec_payload:
+        return estimate_anchor_plus_tail_codec_byte_breakdown(codec_payload)
+    if "section_anchor_payloads" in codec_payload and "section_tail_payloads" in codec_payload:
+        return estimate_anchor_plus_tail_codec_byte_breakdown(codec_payload)
+
+    breakdown = {key: 0 for key in LOW_CODEC_BYTE_BREAKDOWN_KEYS}
+    keyframe = codec_payload.get("keyframe")
+    if isinstance(keyframe, torch.Tensor):
+        breakdown["global_keyframe_bytes"] += int(keyframe.numel() * keyframe.element_size())
+
+    for key in ("quantized_remainder", "scales"):
+        value = codec_payload.get(key)
+        if isinstance(value, torch.Tensor):
+            breakdown["single_head_bytes"] += int(value.numel() * value.element_size())
+
+    metadata_values: List[int] = [len(codec_payload["chunk_lengths"])]
+    metadata_values.extend(int(value) for value in codec_payload["chunk_lengths"])
+    metadata_values.extend(int(value) for value in codec_payload["reduced_shape"])
+    metadata_values.extend(int(value) for value in codec_payload["original_remainder_shape"])
+    breakdown["metadata_bytes"] += len(metadata_values) * 4
+    return {key: int(value) for key, value in breakdown.items()}
+
+
 def estimate_low_codec_bytes(codec_payload: Dict[str, object]) -> int:
     """估算低码率载荷的字节数。
 
@@ -2166,20 +2337,8 @@ def estimate_low_codec_bytes(codec_payload: Dict[str, object]) -> int:
         return estimate_anchor_plus_tail_codec_bytes(codec_payload)
     if "section_anchor_payloads" in codec_payload and "section_tail_payloads" in codec_payload:
         return estimate_anchor_plus_tail_codec_bytes(codec_payload)
-
-    total_bytes = 0
-    for key in ("keyframe", "quantized_remainder", "scales"):
-        value = codec_payload[key]
-        if isinstance(value, torch.Tensor):
-            total_bytes += value.numel() * value.element_size()
-
-    # Count only the minimal integer shape metadata needed to decode the payload.
-    metadata_values: List[int] = [len(codec_payload["chunk_lengths"])]
-    metadata_values.extend(int(value) for value in codec_payload["chunk_lengths"])
-    metadata_values.extend(int(value) for value in codec_payload["reduced_shape"])
-    metadata_values.extend(int(value) for value in codec_payload["original_remainder_shape"])
-    total_bytes += len(metadata_values) * 4
-    return int(total_bytes)
+    breakdown = estimate_low_codec_byte_breakdown(codec_payload)
+    return int(sum(int(value) for value in breakdown.values()))
 
 
 def synchronize_device_for_timing(device: Optional[torch.device]) -> None:
@@ -2692,7 +2851,7 @@ def build_training_batch_tensors(
         hard_anchor_masks.append(hard_anchor_mask)
         soft_tail_canvases.append(soft_tail_canvas)
         soft_tail_masks.append(soft_tail_mask)
-        x0_latents.append(clean_full_latents[:, :1])
+        x0_latents.append(low_full_latents[:, :1])
         valid_target_frames.append(valid_frames)
 
     return {
@@ -3303,7 +3462,9 @@ def reconstruct_sequence(
     clean_full = sequence.clean_full_latents
     low_full = sequence.low_full_latents
     if clean_full.shape[1] == 1:
-        output = clean_full.clone().cpu().contiguous()
+        if low_full is None:
+            raise ValueError("sequence.low_full_latents is missing. Please materialize low latents first.")
+        output = low_full[:, :1].clone().cpu().contiguous()
         if timing is not None:
             timing.clear()
             timing.update(
@@ -3332,7 +3493,7 @@ def reconstruct_sequence(
     history_sizes = list(history_sizes)
     section_starts = list(range(1, clean_full.shape[1], latent_window_size))
     recovered_sections: List[torch.Tensor] = []
-    recovered_prefix = clean_full[:, :1].float().cpu().contiguous()
+    recovered_prefix = low_full[:, :1].float().cpu().contiguous()
     section_payload_lookup = build_section_payload_lookup(sequence.low_codec_payload)
     dummy_target = torch.zeros(
         1,
@@ -3343,7 +3504,7 @@ def reconstruct_sequence(
         device=device,
         dtype=weight_dtype,
     )
-    x0_latents = clean_full[:, :1].unsqueeze(0).to(device=device, dtype=weight_dtype)
+    x0_latents = low_full[:, :1].unsqueeze(0).to(device=device, dtype=weight_dtype)
     validate_mode_inference_steps(mode_inference_steps)
 
     for section_start in tqdm(
@@ -3480,7 +3641,7 @@ def reconstruct_sequence(
     assemble_start_time = start_synced_timer(device) if timing is not None else None
     recovered_remainder = torch.cat(recovered_sections, dim=1)
     recovered_remainder = recovered_remainder[:, : clean_full.shape[1] - 1]
-    output = torch.cat([clean_full[:, :1].cpu(), recovered_remainder], dim=1).contiguous()
+    output = torch.cat([low_full[:, :1].cpu(), recovered_remainder], dim=1).contiguous()
     if timing is not None:
         assemble_output_seconds = stop_synced_timer(assemble_start_time, device)
         timing.clear()
@@ -3710,7 +3871,15 @@ def build_low_latent_payload(sequence: PreparedSequence) -> Dict[str, object]:
         "codec_config_v2": sequence.low_codec_payload["codec_config"],
         "codec_config": sequence.low_codec_payload["codec_config"],
         "tail_codec_type": sequence.low_codec_payload["codec_config"].get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE),
-        "global_keyframe": sequence.low_codec_payload["global_keyframe"],
+        "global_keyframe_codec_type": sequence.low_codec_payload.get(
+            "global_keyframe_codec_type",
+            sequence.low_codec_payload["codec_config"].get(
+                "global_keyframe_codec_type",
+                DEFAULT_GLOBAL_KEYFRAME_CODEC_TYPE,
+            ),
+        ),
+        "global_keyframe": sequence.low_codec_payload.get("global_keyframe"),
+        "global_keyframe_payload": sequence.low_codec_payload.get("global_keyframe_payload"),
         "section_ranges": [list(section_range) for section_range in sequence.low_codec_payload["section_ranges"]],
         "section_payloads": sequence.low_codec_payload.get("section_payloads"),
         "section_anchor_payloads": sequence.low_codec_payload.get("section_anchor_payloads"),
@@ -3721,6 +3890,11 @@ def build_low_latent_payload(sequence: PreparedSequence) -> Dict[str, object]:
         "estimated_selected_bytes": sequence.low_codec_payload.get("estimated_selected_bytes"),
         "estimated_fixed_bytes": sequence.low_codec_payload.get("estimated_fixed_bytes"),
         "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
+        "global_keyframe_bytes": int(sequence.low_codec_payload["global_keyframe_bytes"]),
+        "single_head_bytes": int(sequence.low_codec_payload["single_head_bytes"]),
+        "dual_head_bytes": int(sequence.low_codec_payload["dual_head_bytes"]),
+        "dual_tail_presidual_bytes": int(sequence.low_codec_payload["dual_tail_presidual_bytes"]),
+        "metadata_bytes": int(sequence.low_codec_payload["metadata_bytes"]),
         "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
     }
 
@@ -3750,6 +3924,11 @@ def build_recover_latent_payload(
             "checkpoint_dir": str(checkpoint_dir),
             "raw_bpp": sequence.metadata.raw_bpp,
             "low_codec_bytes": int(sequence.low_codec_payload["low_codec_bytes"]),
+            "global_keyframe_bytes": int(sequence.low_codec_payload["global_keyframe_bytes"]),
+            "single_head_bytes": int(sequence.low_codec_payload["single_head_bytes"]),
+            "dual_head_bytes": int(sequence.low_codec_payload["dual_head_bytes"]),
+            "dual_tail_presidual_bytes": int(sequence.low_codec_payload["dual_tail_presidual_bytes"]),
+            "metadata_bytes": int(sequence.low_codec_payload["metadata_bytes"]),
             "low_bpp": float(sequence.low_codec_payload["low_bpp"]),
             "section_ranges": [list(section_range) for section_range in sequence.low_codec_payload["section_ranges"]],
         },
@@ -4007,7 +4186,12 @@ def build_recover_config(
         "tail_span_latents": codec_config.tail_span_latents,
         "anchor_quant_dtype": codec_config.anchor_quant_dtype,
         "anchor_spatial_factor": codec_config.anchor_spatial_factor,
+        "global_keyframe_codec_type": codec_config.global_keyframe_codec_type,
+        "global_keyframe_quant_dtype": codec_config.global_keyframe_quant_dtype,
+        "global_keyframe_spatial_factor": codec_config.global_keyframe_spatial_factor,
         "dual_tail_anchor_spatial_factor": codec_config.dual_tail_anchor_spatial_factor,
+        "dual_tail_codec_type": codec_config.dual_tail_codec_type,
+        "dual_tail_p_delta_spatial_factor": codec_config.dual_tail_p_delta_spatial_factor,
         "tail_codec_type": codec_config.tail_codec_type,
         "num_inference_steps": args.num_inference_steps,
         "low_latent_format_version": DEFAULT_LOW_LATENT_FORMAT_VERSION,
@@ -4209,10 +4393,30 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     )
     codec_config.setdefault("anchor_quant_dtype", config.get("anchor_quant_dtype", DEFAULT_ANCHOR_QUANT_DTYPE))
     codec_config.setdefault("anchor_spatial_factor", int(config.get("anchor_spatial_factor", DEFAULT_ANCHOR_SPATIAL_FACTOR)))
+    codec_config.setdefault(
+        "global_keyframe_codec_type",
+        str(config.get("global_keyframe_codec_type", DEFAULT_GLOBAL_KEYFRAME_CODEC_TYPE)),
+    )
+    codec_config.setdefault(
+        "global_keyframe_quant_dtype",
+        str(config.get("global_keyframe_quant_dtype", DEFAULT_GLOBAL_KEYFRAME_QUANT_DTYPE)),
+    )
+    codec_config.setdefault(
+        "global_keyframe_spatial_factor",
+        int(config.get("global_keyframe_spatial_factor", DEFAULT_GLOBAL_KEYFRAME_SPATIAL_FACTOR)),
+    )
     dual_tail_anchor_spatial_factor = config.get("dual_tail_anchor_spatial_factor")
     codec_config.setdefault(
         "dual_tail_anchor_spatial_factor",
         None if dual_tail_anchor_spatial_factor is None else int(dual_tail_anchor_spatial_factor),
+    )
+    codec_config.setdefault(
+        "dual_tail_codec_type",
+        str(config.get("dual_tail_codec_type", DEFAULT_DUAL_TAIL_CODEC_TYPE)),
+    )
+    codec_config.setdefault(
+        "dual_tail_p_delta_spatial_factor",
+        int(config.get("dual_tail_p_delta_spatial_factor", DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR)),
     )
     codec_config.setdefault("tail_codec_type", config.get("tail_codec_type", TRILINEAR_TAIL_CODEC_TYPE))
     learned_codec_config = dict(config.get("learned_codec_config") or {})
@@ -4226,7 +4430,12 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["tail_span_latents"] = int(codec_config["tail_span_latents"])
     config["anchor_quant_dtype"] = codec_config["anchor_quant_dtype"]
     config["anchor_spatial_factor"] = int(codec_config["anchor_spatial_factor"])
+    config["global_keyframe_codec_type"] = str(codec_config["global_keyframe_codec_type"])
+    config["global_keyframe_quant_dtype"] = str(codec_config["global_keyframe_quant_dtype"])
+    config["global_keyframe_spatial_factor"] = int(codec_config["global_keyframe_spatial_factor"])
     config["dual_tail_anchor_spatial_factor"] = codec_config["dual_tail_anchor_spatial_factor"]
+    config["dual_tail_codec_type"] = str(codec_config["dual_tail_codec_type"])
+    config["dual_tail_p_delta_spatial_factor"] = int(codec_config["dual_tail_p_delta_spatial_factor"])
     config["tail_codec_type"] = str(codec_config["tail_codec_type"])
     config["num_inference_steps"] = int(config.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS))
     config["low_latent_format_version"] = config.get(
