@@ -39,11 +39,19 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, UMT5EncoderModel
 
 from reconstruct.codec_gop import (
+    DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO,
+    DEFAULT_DUAL_HEAD_CODEC_TYPE,
     DEFAULT_BOUNDARY_JUMP_THRESHOLD,
     DEFAULT_CUT_DETECTION_THRESHOLD,
     DEFAULT_DUAL_REFRESH_GAIN_THRESHOLD,
+    DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR,
+    DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR,
+    DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR,
     DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS,
     DEFAULT_SINGLE_REFRESH_GAIN_THRESHOLD,
+    DUAL_HEAD_ANCHOR_CODEC_TYPE,
+    DUAL_HEAD_P_DELTA_CODEC_TYPE,
+    DUAL_HEAD_SOFT_POOL_CODEC_TYPE,
     DEFAULT_DUAL_TAIL_CODEC_TYPE,
     DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR,
     DUAL_REFRESH_SECTION_MODE,
@@ -102,6 +110,11 @@ DEFAULT_ANCHOR_SPAN_LATENTS = 1
 DEFAULT_TAIL_SPAN_LATENTS = DEFAULT_SECTION_SPAN_LATENTS - DEFAULT_ANCHOR_SPAN_LATENTS
 DEFAULT_ANCHOR_QUANT_DTYPE = "int8"
 DEFAULT_ANCHOR_SPATIAL_FACTOR = 1
+DEFAULT_DUAL_HEAD_CODEC_TYPE = DEFAULT_DUAL_HEAD_CODEC_TYPE
+DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR: Optional[int] = DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR
+DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR = DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR
+DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR = DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR
+DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO = DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO
 DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR: Optional[int] = None
 DEFAULT_TAIL_CODEC_TYPE = TRILINEAR_TAIL_CODEC_TYPE
 DEFAULT_MAX_PREDICT_ONLY_GAP = DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS
@@ -167,6 +180,11 @@ class CodecConfig:
     tail_span_latents: int = DEFAULT_TAIL_SPAN_LATENTS
     anchor_quant_dtype: str = DEFAULT_ANCHOR_QUANT_DTYPE
     anchor_spatial_factor: int = DEFAULT_ANCHOR_SPATIAL_FACTOR
+    dual_head_codec_type: str = DEFAULT_DUAL_HEAD_CODEC_TYPE
+    dual_head_anchor_spatial_factor: Optional[int] = DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR
+    dual_head_p_delta_spatial_factor: int = DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR
+    dual_head_soft_pool_spatial_factor: int = DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR
+    adaptive_dual_head_full_ratio: float = DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO
     dual_tail_anchor_spatial_factor: Optional[int] = DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR
     dual_tail_codec_type: str = DEFAULT_DUAL_TAIL_CODEC_TYPE
     dual_tail_p_delta_spatial_factor: int = DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR
@@ -406,6 +424,37 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--anchor_quant_dtype", type=str, default=DEFAULT_ANCHOR_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--anchor_spatial_factor", type=int, default=DEFAULT_ANCHOR_SPATIAL_FACTOR)
     parser.add_argument(
+        "--dual_head_codec_type",
+        type=str,
+        default=DEFAULT_DUAL_HEAD_CODEC_TYPE,
+        choices=[DUAL_HEAD_ANCHOR_CODEC_TYPE, DUAL_HEAD_P_DELTA_CODEC_TYPE, DUAL_HEAD_SOFT_POOL_CODEC_TYPE],
+        help="Codec used for the head condition in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--dual_head_anchor_spatial_factor",
+        type=int,
+        default=DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR,
+        help="Optional spatial downsample factor applied only to the head anchor in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--dual_head_p_delta_spatial_factor",
+        type=int,
+        default=DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR,
+        help="Spatial downsample factor for P-delta head payloads in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--dual_head_soft_pool_spatial_factor",
+        type=int,
+        default=DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+        help="Spatial downsample factor for soft pooled head payloads in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--adaptive_dual_head_full_ratio",
+        type=float,
+        default=DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO,
+        help="Fraction of dual-refresh sections that keep full-resolution head anchors instead of the cheap dual-head variant.",
+    )
+    parser.add_argument(
         "--dual_tail_anchor_spatial_factor",
         type=int,
         default=DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR,
@@ -548,6 +597,37 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_GLOBAL_KEYFRAME_SPATIAL_FACTOR,
         help="Spatial downsample factor used when encoding the global keyframe payload.",
+    )
+    parser.add_argument(
+        "--dual_head_codec_type",
+        type=str,
+        default=DEFAULT_DUAL_HEAD_CODEC_TYPE,
+        choices=[DUAL_HEAD_ANCHOR_CODEC_TYPE, DUAL_HEAD_P_DELTA_CODEC_TYPE, DUAL_HEAD_SOFT_POOL_CODEC_TYPE],
+        help="Codec used for the head condition in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--dual_head_anchor_spatial_factor",
+        type=int,
+        default=DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR,
+        help="Optional spatial downsample factor applied only to the head anchor in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--dual_head_p_delta_spatial_factor",
+        type=int,
+        default=DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR,
+        help="Spatial downsample factor for P-delta head payloads in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--dual_head_soft_pool_spatial_factor",
+        type=int,
+        default=DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+        help="Spatial downsample factor for soft pooled head payloads in dual-refresh sections.",
+    )
+    parser.add_argument(
+        "--adaptive_dual_head_full_ratio",
+        type=float,
+        default=DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO,
+        help="Fraction of dual-refresh sections that keep full-resolution head anchors instead of the cheap dual-head variant.",
     )
     parser.add_argument(
         "--dual_tail_anchor_spatial_factor",
@@ -754,6 +834,51 @@ def validate_train_args(args: argparse.Namespace) -> None:
         "dual_tail_anchor_spatial_factor",
         DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR,
     )
+    dual_head_anchor_spatial_factor = getattr(
+        args,
+        "dual_head_anchor_spatial_factor",
+        DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR,
+    )
+    dual_head_codec_type = str(getattr(args, "dual_head_codec_type", DEFAULT_DUAL_HEAD_CODEC_TYPE))
+    if dual_head_codec_type not in {
+        DUAL_HEAD_ANCHOR_CODEC_TYPE,
+        DUAL_HEAD_P_DELTA_CODEC_TYPE,
+        DUAL_HEAD_SOFT_POOL_CODEC_TYPE,
+    }:
+        raise ValueError(
+            f"dual_head_codec_type must be one of "
+            f"{DUAL_HEAD_ANCHOR_CODEC_TYPE}, {DUAL_HEAD_P_DELTA_CODEC_TYPE}, "
+            f"{DUAL_HEAD_SOFT_POOL_CODEC_TYPE}; got {dual_head_codec_type}."
+        )
+    if dual_head_anchor_spatial_factor is not None and int(dual_head_anchor_spatial_factor) < 1:
+        raise ValueError(
+            "dual_head_anchor_spatial_factor must be >= 1 when set, "
+            f"got {dual_head_anchor_spatial_factor}."
+        )
+    dual_head_p_delta_spatial_factor = int(
+        getattr(args, "dual_head_p_delta_spatial_factor", DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR)
+    )
+    if dual_head_p_delta_spatial_factor < 1:
+        raise ValueError(
+            "dual_head_p_delta_spatial_factor must be >= 1, "
+            f"got {dual_head_p_delta_spatial_factor}."
+        )
+    dual_head_soft_pool_spatial_factor = int(
+        getattr(args, "dual_head_soft_pool_spatial_factor", DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR)
+    )
+    if dual_head_soft_pool_spatial_factor < 1:
+        raise ValueError(
+            "dual_head_soft_pool_spatial_factor must be >= 1, "
+            f"got {dual_head_soft_pool_spatial_factor}."
+        )
+    adaptive_dual_head_full_ratio = float(
+        getattr(args, "adaptive_dual_head_full_ratio", DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO)
+    )
+    if not 0.0 <= adaptive_dual_head_full_ratio <= 1.0:
+        raise ValueError(
+            "adaptive_dual_head_full_ratio must be in [0, 1], "
+            f"got {adaptive_dual_head_full_ratio}."
+        )
     if dual_tail_anchor_spatial_factor is not None and int(dual_tail_anchor_spatial_factor) < 1:
         raise ValueError(
             "dual_tail_anchor_spatial_factor must be >= 1 when set, "
@@ -1578,6 +1703,90 @@ def command_infer(args: argparse.Namespace) -> None:
             raise ValueError(f"--num_inference_steps must be > 0, got {args.num_inference_steps}.")
         mode_inference_steps = resolve_mode_inference_steps(args, checkpoint_config)
         codec_config = CodecConfig(**checkpoint_config["codec_config"])
+        codec_config.dual_head_codec_type = str(
+            resolve_infer_value(
+                cli_value=args.dual_head_codec_type,
+                default_value=DEFAULT_DUAL_HEAD_CODEC_TYPE,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "dual_head_codec_type",
+                    DEFAULT_DUAL_HEAD_CODEC_TYPE,
+                ),
+            )
+        )
+        if codec_config.dual_head_codec_type not in {
+            DUAL_HEAD_ANCHOR_CODEC_TYPE,
+            DUAL_HEAD_P_DELTA_CODEC_TYPE,
+            DUAL_HEAD_SOFT_POOL_CODEC_TYPE,
+        }:
+            raise ValueError(
+                "--dual_head_codec_type must be one of "
+                f"{DUAL_HEAD_ANCHOR_CODEC_TYPE}, {DUAL_HEAD_P_DELTA_CODEC_TYPE}, "
+                f"{DUAL_HEAD_SOFT_POOL_CODEC_TYPE}; "
+                f"got {codec_config.dual_head_codec_type}."
+            )
+        resolved_dual_head_anchor_spatial_factor = resolve_infer_value(
+            cli_value=args.dual_head_anchor_spatial_factor,
+            default_value=DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR,
+            checkpoint_value=checkpoint_config.get("codec_config", {}).get("dual_head_anchor_spatial_factor"),
+        )
+        codec_config.dual_head_anchor_spatial_factor = (
+            None
+            if resolved_dual_head_anchor_spatial_factor is None
+            else int(resolved_dual_head_anchor_spatial_factor)
+        )
+        if (
+            codec_config.dual_head_anchor_spatial_factor is not None
+            and codec_config.dual_head_anchor_spatial_factor < 1
+        ):
+            raise ValueError(
+                "--dual_head_anchor_spatial_factor must be >= 1, "
+                f"got {codec_config.dual_head_anchor_spatial_factor}."
+            )
+        codec_config.dual_head_p_delta_spatial_factor = int(
+            resolve_infer_value(
+                cli_value=args.dual_head_p_delta_spatial_factor,
+                default_value=DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "dual_head_p_delta_spatial_factor",
+                    DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR,
+                ),
+            )
+        )
+        if codec_config.dual_head_p_delta_spatial_factor < 1:
+            raise ValueError(
+                "--dual_head_p_delta_spatial_factor must be >= 1, "
+                f"got {codec_config.dual_head_p_delta_spatial_factor}."
+            )
+        codec_config.dual_head_soft_pool_spatial_factor = int(
+            resolve_infer_value(
+                cli_value=args.dual_head_soft_pool_spatial_factor,
+                default_value=DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "dual_head_soft_pool_spatial_factor",
+                    DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+                ),
+            )
+        )
+        if codec_config.dual_head_soft_pool_spatial_factor < 1:
+            raise ValueError(
+                "--dual_head_soft_pool_spatial_factor must be >= 1, "
+                f"got {codec_config.dual_head_soft_pool_spatial_factor}."
+            )
+        codec_config.adaptive_dual_head_full_ratio = float(
+            resolve_infer_value(
+                cli_value=args.adaptive_dual_head_full_ratio,
+                default_value=DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "adaptive_dual_head_full_ratio",
+                    DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO,
+                ),
+            )
+        )
+        if not 0.0 <= codec_config.adaptive_dual_head_full_ratio <= 1.0:
+            raise ValueError(
+                "--adaptive_dual_head_full_ratio must be in [0, 1], "
+                f"got {codec_config.adaptive_dual_head_full_ratio}."
+            )
         codec_config.global_keyframe_codec_type = str(
             resolve_infer_value(
                 cli_value=args.global_keyframe_codec_type,
@@ -2019,6 +2228,23 @@ def build_codec_config(args: argparse.Namespace) -> CodecConfig:
         tail_span_latents=tail_span_latents,
         anchor_quant_dtype=args.anchor_quant_dtype,
         anchor_spatial_factor=args.anchor_spatial_factor,
+        dual_head_codec_type=getattr(args, "dual_head_codec_type", DEFAULT_DUAL_HEAD_CODEC_TYPE),
+        dual_head_anchor_spatial_factor=getattr(args, "dual_head_anchor_spatial_factor", DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR),
+        dual_head_p_delta_spatial_factor=getattr(
+            args,
+            "dual_head_p_delta_spatial_factor",
+            DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR,
+        ),
+        dual_head_soft_pool_spatial_factor=getattr(
+            args,
+            "dual_head_soft_pool_spatial_factor",
+            DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+        ),
+        adaptive_dual_head_full_ratio=getattr(
+            args,
+            "adaptive_dual_head_full_ratio",
+            DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO,
+        ),
         dual_tail_anchor_spatial_factor=getattr(args, "dual_tail_anchor_spatial_factor", DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR),
         dual_tail_codec_type=getattr(args, "dual_tail_codec_type", DEFAULT_DUAL_TAIL_CODEC_TYPE),
         dual_tail_p_delta_spatial_factor=getattr(
@@ -2631,8 +2857,10 @@ def build_section_condition_canvases_and_masks(
             anchor_values = low_full_latents[:, source_start:source_end]
             if anchor_values.shape[1] == 0:
                 continue
-            target_canvas = hard_anchor_canvas if block_start == 0 else soft_tail_canvas
-            target_mask = hard_anchor_mask if block_start == 0 else soft_tail_mask
+            head_codec_type = str(anchor_block.get("head_codec_type", DUAL_HEAD_ANCHOR_CODEC_TYPE))
+            use_soft_condition = block_start != 0 or head_codec_type == DUAL_HEAD_SOFT_POOL_CODEC_TYPE
+            target_canvas = soft_tail_canvas if use_soft_condition else hard_anchor_canvas
+            target_mask = soft_tail_mask if use_soft_condition else hard_anchor_mask
             target_canvas[:, block_start:block_end] = anchor_values[:, : block_end - block_start]
             target_mask[:, block_start:block_end] = 1
         return (
@@ -4186,6 +4414,11 @@ def build_recover_config(
         "tail_span_latents": codec_config.tail_span_latents,
         "anchor_quant_dtype": codec_config.anchor_quant_dtype,
         "anchor_spatial_factor": codec_config.anchor_spatial_factor,
+        "dual_head_codec_type": codec_config.dual_head_codec_type,
+        "dual_head_anchor_spatial_factor": codec_config.dual_head_anchor_spatial_factor,
+        "dual_head_p_delta_spatial_factor": codec_config.dual_head_p_delta_spatial_factor,
+        "dual_head_soft_pool_spatial_factor": codec_config.dual_head_soft_pool_spatial_factor,
+        "adaptive_dual_head_full_ratio": codec_config.adaptive_dual_head_full_ratio,
         "global_keyframe_codec_type": codec_config.global_keyframe_codec_type,
         "global_keyframe_quant_dtype": codec_config.global_keyframe_quant_dtype,
         "global_keyframe_spatial_factor": codec_config.global_keyframe_spatial_factor,
@@ -4393,6 +4626,27 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     )
     codec_config.setdefault("anchor_quant_dtype", config.get("anchor_quant_dtype", DEFAULT_ANCHOR_QUANT_DTYPE))
     codec_config.setdefault("anchor_spatial_factor", int(config.get("anchor_spatial_factor", DEFAULT_ANCHOR_SPATIAL_FACTOR)))
+    dual_head_anchor_spatial_factor = config.get("dual_head_anchor_spatial_factor")
+    codec_config.setdefault(
+        "dual_head_codec_type",
+        str(config.get("dual_head_codec_type", DEFAULT_DUAL_HEAD_CODEC_TYPE)),
+    )
+    codec_config.setdefault(
+        "dual_head_anchor_spatial_factor",
+        None if dual_head_anchor_spatial_factor is None else int(dual_head_anchor_spatial_factor),
+    )
+    codec_config.setdefault(
+        "dual_head_p_delta_spatial_factor",
+        int(config.get("dual_head_p_delta_spatial_factor", DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR)),
+    )
+    codec_config.setdefault(
+        "dual_head_soft_pool_spatial_factor",
+        int(config.get("dual_head_soft_pool_spatial_factor", DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR)),
+    )
+    codec_config.setdefault(
+        "adaptive_dual_head_full_ratio",
+        float(config.get("adaptive_dual_head_full_ratio", DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO)),
+    )
     codec_config.setdefault(
         "global_keyframe_codec_type",
         str(config.get("global_keyframe_codec_type", DEFAULT_GLOBAL_KEYFRAME_CODEC_TYPE)),
@@ -4430,6 +4684,11 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["tail_span_latents"] = int(codec_config["tail_span_latents"])
     config["anchor_quant_dtype"] = codec_config["anchor_quant_dtype"]
     config["anchor_spatial_factor"] = int(codec_config["anchor_spatial_factor"])
+    config["dual_head_codec_type"] = str(codec_config["dual_head_codec_type"])
+    config["dual_head_anchor_spatial_factor"] = codec_config["dual_head_anchor_spatial_factor"]
+    config["dual_head_p_delta_spatial_factor"] = int(codec_config["dual_head_p_delta_spatial_factor"])
+    config["dual_head_soft_pool_spatial_factor"] = int(codec_config["dual_head_soft_pool_spatial_factor"])
+    config["adaptive_dual_head_full_ratio"] = float(codec_config["adaptive_dual_head_full_ratio"])
     config["global_keyframe_codec_type"] = str(codec_config["global_keyframe_codec_type"])
     config["global_keyframe_quant_dtype"] = str(codec_config["global_keyframe_quant_dtype"])
     config["global_keyframe_spatial_factor"] = int(codec_config["global_keyframe_spatial_factor"])
