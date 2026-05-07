@@ -36,6 +36,10 @@ from reconstruct.latent_io import (
     split_full_latents,
 )
 from reconstruct.recover import (
+    DEFAULT_RECOVER_HISTORY_SOURCE,
+    DEFAULT_RECOVER_INIT_MODE,
+    DEFAULT_RECOVER_LOW_GUIDANCE_SCALE,
+    DEFAULT_RECOVER_START_SIGMA,
     DEFAULT_NUM_INFERENCE_STEPS,
     DEFAULT_WEIGHT_DTYPE,
     CodecConfig,
@@ -48,6 +52,11 @@ from reconstruct.recover import (
     load_transformer_bundle,
     normalize_history_sizes,
     parse_weight_dtype,
+    RECOVER_HISTORY_SOURCE_LOW,
+    RECOVER_HISTORY_SOURCE_RECOVERED,
+    RECOVER_INIT_MODE_LOW,
+    RECOVER_INIT_MODE_LOW_NOISE,
+    RECOVER_INIT_MODE_NOISE,
     reconstruct_sequence,
     resolve_checkpoint_dir_for_inference,
     resolve_infer_value,
@@ -65,7 +74,7 @@ class RecoveryRuntime:
     checkpoint_dir: Path
     base_model_path: str
     codec_config: CodecConfig
-    history_sizes: List[int]
+    history_sizes: List[Optional[int]]
     latent_window_size: int
     anchor_span_latents: int
     weight_dtype: torch.dtype
@@ -145,6 +154,32 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Number of latent timesteps overlapped between adjacent recover windows. If omitted, prefer metrics[].recover_overlap_latents.",
+    )
+    parser.add_argument(
+        "--recover_history_source",
+        type=str,
+        default=None,
+        choices=[RECOVER_HISTORY_SOURCE_LOW, RECOVER_HISTORY_SOURCE_RECOVERED],
+        help="If omitted, prefer metrics[].recover_history_source and then fall back to the recover default.",
+    )
+    parser.add_argument(
+        "--recover_init_mode",
+        type=str,
+        default=None,
+        choices=[RECOVER_INIT_MODE_NOISE, RECOVER_INIT_MODE_LOW_NOISE, RECOVER_INIT_MODE_LOW],
+        help="If omitted, prefer metrics[].recover_init_mode and then fall back to the recover default.",
+    )
+    parser.add_argument(
+        "--recover_start_sigma",
+        type=float,
+        default=None,
+        help="If omitted, prefer metrics[].recover_start_sigma and then fall back to the recover default.",
+    )
+    parser.add_argument(
+        "--recover_low_guidance_scale",
+        type=float,
+        default=None,
+        help="If omitted, prefer metrics[].recover_low_guidance_scale and then fall back to the recover default.",
     )
     parser.add_argument(
         "--transport_input_mode",
@@ -363,6 +398,60 @@ def resolve_recover_overlap_latents(cli_value: Optional[int], metrics_payload: O
     return 0
 
 
+def resolve_recover_history_source(cli_value: Optional[str], metrics_payload: Optional[Dict[str, object]]) -> str:
+    value = cli_value
+    if value is None and metrics_payload is not None:
+        value = metrics_payload.get("recover_history_source")
+    if value is None:
+        value = DEFAULT_RECOVER_HISTORY_SOURCE
+    value = str(value)
+    if value not in {RECOVER_HISTORY_SOURCE_LOW, RECOVER_HISTORY_SOURCE_RECOVERED}:
+        raise ValueError(f"Unsupported recover_history_source={value}.")
+    return value
+
+
+def resolve_recover_init_mode(cli_value: Optional[str], metrics_payload: Optional[Dict[str, object]]) -> str:
+    value = cli_value
+    if value is None and metrics_payload is not None:
+        value = metrics_payload.get("recover_init_mode")
+    if value is None:
+        value = DEFAULT_RECOVER_INIT_MODE
+    value = str(value)
+    if value not in {RECOVER_INIT_MODE_NOISE, RECOVER_INIT_MODE_LOW_NOISE, RECOVER_INIT_MODE_LOW}:
+        raise ValueError(f"Unsupported recover_init_mode={value}.")
+    return value
+
+
+def resolve_recover_start_sigma(
+    cli_value: Optional[float],
+    metrics_payload: Optional[Dict[str, object]],
+) -> Optional[float]:
+    value = cli_value
+    if value is None and metrics_payload is not None:
+        value = metrics_payload.get("recover_start_sigma", DEFAULT_RECOVER_START_SIGMA)
+    if value is None:
+        return DEFAULT_RECOVER_START_SIGMA
+    value = float(value)
+    if value <= 0.0 or value > 0.999:
+        raise ValueError(f"recover_start_sigma must satisfy 0 < sigma <= 0.999, got {value}.")
+    return value
+
+
+def resolve_recover_low_guidance_scale(
+    cli_value: Optional[float],
+    metrics_payload: Optional[Dict[str, object]],
+) -> float:
+    value = cli_value
+    if value is None and metrics_payload is not None:
+        value = metrics_payload.get("recover_low_guidance_scale", DEFAULT_RECOVER_LOW_GUIDANCE_SCALE)
+    if value is None:
+        value = DEFAULT_RECOVER_LOW_GUIDANCE_SCALE
+    value = float(value)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"recover_low_guidance_scale must be in [0, 1], got {value}.")
+    return value
+
+
 def validate_low_payload_compatibility(
     low_payload: Dict[str, object],
     runtime: RecoveryRuntime,
@@ -453,6 +542,10 @@ def build_recover_payload_from_low(
     transport_bpp: float,
     entropy_metrics_payload: Optional[Dict[str, object]],
     recover_overlap_latents: int,
+    recover_history_source: str,
+    recover_init_mode: str,
+    recover_start_sigma: Optional[float],
+    recover_low_guidance_scale: float,
 ) -> Dict[str, object]:
     chunk_lengths = [int(value) for value in low_payload["chunk_lengths"]]
     restored_chunks = split_full_latents(recovered_full_latents, chunk_lengths)
@@ -466,6 +559,10 @@ def build_recover_payload_from_low(
         "transport_bpp": float(transport_bpp),
         "checkpoint_dir": str(runtime.checkpoint_dir),
         "recover_overlap_latents": int(recover_overlap_latents),
+        "recover_history_source": str(recover_history_source),
+        "recover_init_mode": str(recover_init_mode),
+        "recover_start_sigma": recover_start_sigma,
+        "recover_low_guidance_scale": float(recover_low_guidance_scale),
         "low_codec_bytes": int(low_payload.get("low_codec_bytes", latent_path.stat().st_size)),
         "low_bpp": float(low_payload.get("low_bpp", 0.0)),
         "section_ranges": [
@@ -642,10 +739,21 @@ def decode_low_latent_file_to_output_path(
     entropy_metrics_payload: Optional[Dict[str, object]],
     vae_decode_mode: str,
     cli_recover_overlap_latents: Optional[int],
+    cli_recover_history_source: Optional[str],
+    cli_recover_init_mode: Optional[str],
+    cli_recover_start_sigma: Optional[float],
+    cli_recover_low_guidance_scale: Optional[float],
 ) -> Path:
     metrics_path = resolve_metrics_path(metrics_dir=metrics_dir, relative_path=relative_path)
     metrics_payload = load_metrics_payload(metrics_path)
     recover_overlap_latents = resolve_recover_overlap_latents(cli_recover_overlap_latents, metrics_payload)
+    recover_history_source = resolve_recover_history_source(cli_recover_history_source, metrics_payload)
+    recover_init_mode = resolve_recover_init_mode(cli_recover_init_mode, metrics_payload)
+    recover_start_sigma = resolve_recover_start_sigma(cli_recover_start_sigma, metrics_payload)
+    recover_low_guidance_scale = resolve_recover_low_guidance_scale(
+        cli_recover_low_guidance_scale,
+        metrics_payload,
+    )
     requested_checkpoint_dir = resolve_requested_checkpoint_dir(
         cli_checkpoint_dir=cli_checkpoint_dir,
         metrics_payload=metrics_payload,
@@ -703,6 +811,10 @@ def decode_low_latent_file_to_output_path(
         fix_anchor_during_denoise=runtime.fix_anchor_during_denoise,
         recover_overlap_latents=recover_overlap_latents,
         distributed_context=DistributedContext(is_distributed=False),
+        recover_history_source=recover_history_source,
+        recover_init_mode=recover_init_mode,
+        recover_start_sigma=recover_start_sigma,
+        recover_low_guidance_scale=recover_low_guidance_scale,
     )
     recover_payload = build_recover_payload_from_low(
         latent_path=latent_path,
@@ -715,6 +827,10 @@ def decode_low_latent_file_to_output_path(
         transport_bpp=transport_bpp,
         entropy_metrics_payload=entropy_metrics_payload,
         recover_overlap_latents=recover_overlap_latents,
+        recover_history_source=recover_history_source,
+        recover_init_mode=recover_init_mode,
+        recover_start_sigma=recover_start_sigma,
+        recover_low_guidance_scale=recover_low_guidance_scale,
     )
     saved_recover_path = maybe_save_recover_payload(
         recover_payload=recover_payload,
@@ -759,6 +875,10 @@ def decode_latent_file(
     transport_input_mode: str,
     vae_decode_mode: str,
     cli_recover_overlap_latents: Optional[int],
+    cli_recover_history_source: Optional[str],
+    cli_recover_init_mode: Optional[str],
+    cli_recover_start_sigma: Optional[float],
+    cli_recover_low_guidance_scale: Optional[float],
 ) -> Path:
     relative_path = latent_path.relative_to(input_dir)
     output_path = output_dir / relative_path.with_suffix(".mp4")
@@ -798,6 +918,10 @@ def decode_latent_file(
             entropy_metrics_payload=entropy_metrics_payload,
             vae_decode_mode=vae_decode_mode,
             cli_recover_overlap_latents=cli_recover_overlap_latents,
+            cli_recover_history_source=cli_recover_history_source,
+            cli_recover_init_mode=cli_recover_init_mode,
+            cli_recover_start_sigma=cli_recover_start_sigma,
+            cli_recover_low_guidance_scale=cli_recover_low_guidance_scale,
         )
 
     payload = load_payload(latent_path)
@@ -846,6 +970,10 @@ def decode_latent_file(
             entropy_metrics_payload=entropy_metrics_payload,
             vae_decode_mode=vae_decode_mode,
             cli_recover_overlap_latents=cli_recover_overlap_latents,
+            cli_recover_history_source=cli_recover_history_source,
+            cli_recover_init_mode=cli_recover_init_mode,
+            cli_recover_start_sigma=cli_recover_start_sigma,
+            cli_recover_low_guidance_scale=cli_recover_low_guidance_scale,
         )
 
     if low_payload_input:
@@ -871,6 +999,10 @@ def decode_latent_file(
             entropy_metrics_payload=None,
             vae_decode_mode=vae_decode_mode,
             cli_recover_overlap_latents=cli_recover_overlap_latents,
+            cli_recover_history_source=cli_recover_history_source,
+            cli_recover_init_mode=cli_recover_init_mode,
+            cli_recover_start_sigma=cli_recover_start_sigma,
+            cli_recover_low_guidance_scale=cli_recover_low_guidance_scale,
         )
 
     print(f"[real_decoder] input_mode=direct_decode path={latent_path}")
@@ -912,6 +1044,13 @@ def main() -> None:
         f"[real_decoder] recover_overlap_latents="
         f"{args.recover_overlap_latents if args.recover_overlap_latents is not None else 'auto'}"
     )
+    print(
+        f"[real_decoder] recover_stabilization="
+        f"history_source={args.recover_history_source if args.recover_history_source is not None else 'auto'} "
+        f"init_mode={args.recover_init_mode if args.recover_init_mode is not None else 'auto'} "
+        f"start_sigma={args.recover_start_sigma if args.recover_start_sigma is not None else 'auto'} "
+        f"low_guidance={args.recover_low_guidance_scale if args.recover_low_guidance_scale is not None else 'auto'}"
+    )
     if compare_config is None:
         print("[real_decoder] compare_mode=off")
     else:
@@ -941,6 +1080,10 @@ def main() -> None:
             transport_input_mode=args.transport_input_mode,
             vae_decode_mode=args.vae_decode_mode,
             cli_recover_overlap_latents=args.recover_overlap_latents,
+            cli_recover_history_source=args.recover_history_source,
+            cli_recover_init_mode=args.recover_init_mode,
+            cli_recover_start_sigma=args.recover_start_sigma,
+            cli_recover_low_guidance_scale=args.recover_low_guidance_scale,
         )
 
 

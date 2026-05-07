@@ -69,7 +69,7 @@ from reconstruct.latent_io import (
 )
 
 
-DEFAULT_INPUT_PATH = Path("reconstruct/latents")
+DEFAULT_INPUT_PATH = Path("train_dataset")
 DEFAULT_TEMPORAL_FACTOR = 2
 DEFAULT_SPATIAL_FACTOR = 4
 DEFAULT_QUANT_DTYPE = "int8"
@@ -77,7 +77,7 @@ DEFAULT_KEYFRAME_DTYPE = "float16"
 DEFAULT_KEYFRAME_CODEC_MODE = RAW_KEYFRAME_CODEC_MODE
 DEFAULT_KEYFRAME_QUANT_DTYPE = "int8"
 DEFAULT_KEYFRAME_SPATIAL_FACTOR = 1
-DEFAULT_HISTORY_SIZES = [1, 1, 1]
+DEFAULT_HISTORY_SIZES = [None, None, 1]
 DEFAULT_LATENT_WINDOW_SIZE = 5  # Helios的VAE中4帧视频压缩成一个latent时间步，所以其实一个latent对应4帧,最终对应原视频的关系是 (DEFAULT_ANCHOR_SPAN_LATENTS + (DEFAULT_LATENT_WINDOW_SIZE - 1) * 4 = 原视频帧数)
 DEFAULT_SECTION_SPAN_LATENTS = DEFAULT_LATENT_WINDOW_SIZE
 DEFAULT_ANCHOR_SPAN_LATENTS = 1
@@ -100,6 +100,8 @@ DEFAULT_NOISE_LOSS_WEIGHT = 0.25
 DEFAULT_AUX_LOSS_WARMUP_STEPS = 500
 DEFAULT_AUX_LOSS_RAMP_STEPS = 1000
 DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT = 0.1
+DEFAULT_MOTION_LOSS_MAX_WEIGHT = 1.0
+DEFAULT_MOTION_LOSS_GAMMA = 1.0
 DEFAULT_RATE_LOSS_WEIGHT = 1.0
 DEFAULT_RATE_LOSS_WARMUP_STEPS = 0
 DEFAULT_RATE_LOSS_RAMP_STEPS = 1000
@@ -124,6 +126,15 @@ DEFAULT_ANCHOR_PROFILE_HIGH = 1
 DEFAULT_COMPUTE_LPIPS = True
 DEFAULT_LPIPS_NET = "alex"
 DEFAULT_LPIPS_FRAME_BATCH_SIZE = 4
+RECOVER_HISTORY_SOURCE_LOW = "low"
+RECOVER_HISTORY_SOURCE_RECOVERED = "recovered"
+DEFAULT_RECOVER_HISTORY_SOURCE = RECOVER_HISTORY_SOURCE_LOW
+RECOVER_INIT_MODE_NOISE = "noise"
+RECOVER_INIT_MODE_LOW_NOISE = "low_noise"
+RECOVER_INIT_MODE_LOW = "low"
+DEFAULT_RECOVER_INIT_MODE = RECOVER_INIT_MODE_NOISE
+DEFAULT_RECOVER_START_SIGMA = None
+DEFAULT_RECOVER_LOW_GUIDANCE_SCALE = 0.0
 EPS = 1e-8
 
 
@@ -302,14 +313,14 @@ class LatentWindowDataset(Dataset):
     def __init__(
         self,
         sequences: Sequence[PreparedSequence],
-        history_sizes: Sequence[int],
+        history_sizes: Sequence[Optional[int]],
         latent_window_size: int,
         anchor_span_latents: int,
         recover_overlap_latents: int,
     ):
         self.sequences = list(sequences)
         self.history_sizes = list(history_sizes)
-        self.history_window_size = sum(history_sizes)
+        self.history_window_size = history_window_size_from_history_sizes(history_sizes)
         self.latent_window_size = latent_window_size
         self.anchor_span_latents = anchor_span_latents
         self.recover_overlap_latents = recover_overlap_latents
@@ -349,6 +360,19 @@ def parse_args() -> argparse.Namespace:
     add_common_infer_args(infer_parser)
 
     return parser.parse_args()
+
+
+def parse_history_size_arg(value: str) -> Optional[int]:
+    """解析 long/mid/short history 配置，允许用 None 关闭前两档历史。"""
+    if value.lower() in {"none", "null"}:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"history size must be a positive integer or None, got {value!r}.") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"history size must be > 0 when enabled, got {parsed}.")
+    return parsed
 
 
 def add_common_train_args(parser: argparse.ArgumentParser) -> None:
@@ -399,7 +423,14 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_TAIL_CODEC_TYPE,
         choices=[TRILINEAR_TAIL_CODEC_TYPE, LEARNED_TAIL_CODEC_TYPE],
     )
-    parser.add_argument("--history_sizes", type=int, nargs="+", default=DEFAULT_HISTORY_SIZES)
+    parser.add_argument(
+        "--history_sizes",
+        type=parse_history_size_arg,
+        nargs=3,
+        default=DEFAULT_HISTORY_SIZES,
+        metavar=("LONG", "MID", "SHORT"),
+        help="History sizes as long mid short. Use `None None N` to enable short-only history.",
+    )
     parser.add_argument("--latent_window_size", type=int, default=DEFAULT_LATENT_WINDOW_SIZE)
     parser.add_argument(
         "--loss_weighting_scheme",
@@ -421,6 +452,21 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--x_loss_weight", type=float, default=DEFAULT_X_LOSS_WEIGHT)
     parser.add_argument("--noise_loss_weight", type=float, default=DEFAULT_NOISE_LOSS_WEIGHT)
     parser.add_argument("--temporal_delta_loss_weight", type=float, default=DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
+    parser.add_argument(
+        "--motion_loss_max_weight",
+        type=float,
+        default=DEFAULT_MOTION_LOSS_MAX_WEIGHT,
+        help=(
+            "Maximum loss multiplier for high-motion sections. A value of 1.0 keeps the old uniform loss; "
+            "larger values bias recovery training toward motion-heavy windows."
+        ),
+    )
+    parser.add_argument(
+        "--motion_loss_gamma",
+        type=float,
+        default=DEFAULT_MOTION_LOSS_GAMMA,
+        help="Gamma applied to the normalized motion score before computing the motion loss multiplier.",
+    )
     parser.add_argument("--rate_loss_weight", type=float, default=DEFAULT_RATE_LOSS_WEIGHT)
     parser.add_argument("--rate_loss_warmup_steps", type=int, default=DEFAULT_RATE_LOSS_WARMUP_STEPS)
     parser.add_argument("--rate_loss_ramp_steps", type=int, default=DEFAULT_RATE_LOSS_RAMP_STEPS)
@@ -485,6 +531,41 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_RECOVER_OVERLAP_LATENTS,
         help="Number of latent timesteps overlapped between adjacent recover windows during inference.",
+    )
+    parser.add_argument(
+        "--recover_history_source",
+        type=str,
+        default=DEFAULT_RECOVER_HISTORY_SOURCE,
+        choices=[RECOVER_HISTORY_SOURCE_LOW, RECOVER_HISTORY_SOURCE_RECOVERED],
+        help=(
+            "History condition source during inference. `low` matches the original behavior; "
+            "`recovered` reuses already restored frames to reduce section-to-section flicker."
+        ),
+    )
+    parser.add_argument(
+        "--recover_init_mode",
+        type=str,
+        default=DEFAULT_RECOVER_INIT_MODE,
+        choices=[RECOVER_INIT_MODE_NOISE, RECOVER_INIT_MODE_LOW_NOISE, RECOVER_INIT_MODE_LOW],
+        help=(
+            "Initial latent state for each recover window. `noise` keeps the original pure sampling path; "
+            "`low_noise` starts from the transmitted low latent mixed with schedule noise."
+        ),
+    )
+    parser.add_argument(
+        "--recover_start_sigma",
+        type=float,
+        default=DEFAULT_RECOVER_START_SIGMA,
+        help=(
+            "Optional first sigma for restoration-style denoising. Values below 1 keep more low-latent structure "
+            "and reduce stochastic high-motion drift."
+        ),
+    )
+    parser.add_argument(
+        "--recover_low_guidance_scale",
+        type=float,
+        default=DEFAULT_RECOVER_LOW_GUIDANCE_SCALE,
+        help="Small per-step pull toward the transmitted low latent. Keep near 0 to avoid over-smoothing.",
     )
     parser.add_argument(
         "--max_samples",
@@ -581,12 +662,7 @@ def import_helios_inference_stack():
 def import_stage1_prepare_fn():
     """导入 Helios 的 stage1 条件拼装函数。
 
-    recover 模块复用它来组织：
-    - 当前目标 latent
-    - 首帧 x0
-    - 多尺度历史 latent
-
-    这样可以最大程度复用 Helios 现有输入格式，而不是重写底层拼接逻辑。
+    recover 模块复用它来组织当前目标、首帧 x0，以及 long / mid / short 三档历史 latent。
     """
     from helios.utils.utils_helios_base import prepare_stage1_clean_input_from_latents
 
@@ -636,15 +712,37 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"temporal_delta_loss_weight must be >= 0, got {args.temporal_delta_loss_weight}."
         )
+    if args.motion_loss_max_weight < 1.0:
+        raise ValueError(f"motion_loss_max_weight must be >= 1.0, got {args.motion_loss_max_weight}.")
+    if args.motion_loss_gamma <= 0.0:
+        raise ValueError(f"motion_loss_gamma must be > 0, got {args.motion_loss_gamma}.")
+    if args.rate_loss_weight < 0.0:
+        raise ValueError(f"rate_loss_weight must be >= 0, got {args.rate_loss_weight}.")
     if args.aux_loss_warmup_steps < 0:
         raise ValueError(f"aux_loss_warmup_steps must be >= 0, got {args.aux_loss_warmup_steps}.")
     if args.aux_loss_ramp_steps < 0:
         raise ValueError(f"aux_loss_ramp_steps must be >= 0, got {args.aux_loss_ramp_steps}.")
+    normalize_history_sizes(args.history_sizes)
     build_recover_window_starts(
         total_latent_frames=2,
         latent_window_size=int(args.section_span_latents or args.latent_window_size),
         recover_overlap_latents=int(args.recover_overlap_latents),
     )
+
+
+def validate_infer_args(args: argparse.Namespace) -> None:
+    if args.num_inference_steps <= 0:
+        raise ValueError(f"num_inference_steps must be > 0, got {args.num_inference_steps}.")
+    if args.recover_start_sigma is not None:
+        if args.recover_start_sigma <= 0.0 or args.recover_start_sigma > 0.999:
+            raise ValueError(
+                f"recover_start_sigma must satisfy 0 < sigma <= 0.999, got {args.recover_start_sigma}."
+            )
+    if args.recover_low_guidance_scale < 0.0 or args.recover_low_guidance_scale > 1.0:
+        raise ValueError(
+            "recover_low_guidance_scale must be in [0, 1], "
+            f"got {args.recover_low_guidance_scale}."
+        )
 
 
 def create_train_accelerator(weight_dtype: str, gradient_accumulation_steps: int):
@@ -676,7 +774,7 @@ def init_offline_wandb_run(
     output_dir: Path,
     args: argparse.Namespace,
     codec_config: CodecConfig,
-    history_sizes: Sequence[int],
+    history_sizes: Sequence[Optional[int]],
     latent_window_size: int,
     checkpoint_save_interval_epochs: int,
 ):
@@ -718,6 +816,8 @@ def init_offline_wandb_run(
             "x_loss_weight": args.x_loss_weight,
             "noise_loss_weight": args.noise_loss_weight,
             "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
+            "motion_loss_max_weight": args.motion_loss_max_weight,
+            "motion_loss_gamma": args.motion_loss_gamma,
             "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
             "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
             "anchor_inference_mode": "history_low_target_overlap",
@@ -888,6 +988,7 @@ def command_train(args: argparse.Namespace) -> None:
             f"save_every_epochs={checkpoint_save_interval_epochs} "
             f"loss_weighting_scheme={args.loss_weighting_scheme} "
             f"flow/x/noise/delta=({args.flow_loss_weight:.3f}/{args.x_loss_weight:.3f}/{args.noise_loss_weight:.3f}/{args.temporal_delta_loss_weight:.3f}) "
+            f"motion_loss_max_weight={args.motion_loss_max_weight:.3f} "
             f"rate_weight={args.rate_loss_weight:.3f} "
             f"rate_warmup={args.rate_loss_warmup_steps} rate_ramp={args.rate_loss_ramp_steps} "
             f"aux_warmup={args.aux_loss_warmup_steps} aux_ramp={args.aux_loss_ramp_steps}"
@@ -918,6 +1019,8 @@ def command_train(args: argparse.Namespace) -> None:
         "x_loss_weight": args.x_loss_weight,
         "noise_loss_weight": args.noise_loss_weight,
         "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
+        "motion_loss_max_weight": args.motion_loss_max_weight,
+        "motion_loss_gamma": args.motion_loss_gamma,
         "rate_loss_weight": args.rate_loss_weight,
         "rate_loss_warmup_steps": args.rate_loss_warmup_steps,
         "rate_loss_ramp_steps": args.rate_loss_ramp_steps,
@@ -930,10 +1033,10 @@ def command_train(args: argparse.Namespace) -> None:
         "tail_codec_type": codec_config.tail_codec_type,
         "loss_definition": {
             "optimized_loss": (
-                "flow_loss_weight * tail_position_weighted_mse(flow_pred, noise-latent) + "
-                "aux_scale * (x_loss_weight * tail_position_weighted_normalized_mse(x_pred, latent) + "
-                "noise_loss_weight * tail_position_weighted_normalized_mse(noise_pred, noise) + "
-                "temporal_delta_loss_weight * tail_position_weighted_l1(delta(x_pred), delta(latent))) + "
+                "flow_loss_weight * motion_weighted_tail_position_mse(flow_pred, noise-latent) + "
+                "aux_scale * (x_loss_weight * motion_weighted_tail_position_normalized_mse(x_pred, latent) + "
+                "noise_loss_weight * motion_weighted_tail_position_normalized_mse(noise_pred, noise) + "
+                "temporal_delta_loss_weight * motion_weighted_tail_position_l1(delta(x_pred), delta(latent))) + "
                 "rate_scale * rate_loss_weight * entropy_tail_bpp"
             ),
             "raw_loss": "masked_mse(flow_pred, noise-latent)",
@@ -1036,6 +1139,8 @@ def command_train(args: argparse.Namespace) -> None:
                         x_loss_weight=args.x_loss_weight,
                         noise_loss_weight=args.noise_loss_weight,
                         temporal_delta_loss_weight=args.temporal_delta_loss_weight,
+                        motion_loss_max_weight=args.motion_loss_max_weight,
+                        motion_loss_gamma=args.motion_loss_gamma,
                         rate_loss_weight=args.rate_loss_weight,
                         rate_loss_warmup_steps=args.rate_loss_warmup_steps,
                         rate_loss_ramp_steps=args.rate_loss_ramp_steps,
@@ -1352,6 +1457,7 @@ def command_infer(args: argparse.Namespace) -> None:
 
     默认不直接生成视频，避免偏离“压缩-传输-恢复”验证主线。
     """
+    validate_infer_args(args)
     distributed_context, device = init_distributed_context(args.device)
     try:
         set_seed(args.seed)
@@ -1424,7 +1530,11 @@ def command_infer(args: argparse.Namespace) -> None:
                 f"device={device} world_size={distributed_context.world_size} "
                 f"checkpoint_dir={checkpoint_dir} "
                 f"save_entropy_bin={args.save_entropy_bin} "
-                f"recover_overlap_latents={recover_overlap_latents}"
+                f"recover_overlap_latents={recover_overlap_latents} "
+                f"recover_history_source={args.recover_history_source} "
+                f"recover_init_mode={args.recover_init_mode} "
+                f"recover_start_sigma={args.recover_start_sigma} "
+                f"recover_low_guidance_scale={args.recover_low_guidance_scale}"
             )
             if checkpoint_dir != requested_checkpoint_dir:
                 print(f"[infer] resolved checkpoint request {requested_checkpoint_dir} -> {checkpoint_dir}")
@@ -1483,6 +1593,10 @@ def command_infer(args: argparse.Namespace) -> None:
                 seed=args.seed,
                 recover_overlap_latents=recover_overlap_latents,
                 distributed_context=distributed_context,
+                recover_history_source=str(args.recover_history_source),
+                recover_init_mode=str(args.recover_init_mode),
+                recover_start_sigma=args.recover_start_sigma,
+                recover_low_guidance_scale=float(args.recover_low_guidance_scale),
             )
             ensure_finite_recover_state(
                 stage="final_output",
@@ -1602,6 +1716,10 @@ def command_infer(args: argparse.Namespace) -> None:
                 "checkpoint_dir": str(checkpoint_dir),
                 "num_inference_steps": args.num_inference_steps,
                 "recover_overlap_latents": recover_overlap_latents,
+                "recover_history_source": str(args.recover_history_source),
+                "recover_init_mode": str(args.recover_init_mode),
+                "recover_start_sigma": args.recover_start_sigma,
+                "recover_low_guidance_scale": float(args.recover_low_guidance_scale),
                 "sections": section_metrics,
             }
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1863,16 +1981,50 @@ def calibrate_motion_thresholds(
     return codec_config.motion_q20, codec_config.motion_q80
 
 
-def normalize_history_sizes(history_sizes: Sequence[int]) -> List[int]:
-    """把 history_sizes 规范化为从大到小的列表。
+def _normalize_optional_history_value(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.lower() in {"none", "null"}:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"Enabled history sizes must be > 0, got {parsed}.")
+    return parsed
 
-    Helios 的 stage1 输入里会区分 long / mid / short 三档历史，
-    这里统一排序，保证后续传参顺序稳定。
+
+def normalize_history_sizes(history_sizes: Sequence[Optional[int]]) -> List[Optional[int]]:
+    """规范化 long/mid/short history 配置。
+
+    支持两种合法模式：
+    - `[long, mid, short]`：启用 Helios 原生三档历史。
+    - `[None, None, short]`：只启用 short history，mid/long 显式关闭。
     """
-    normalized = sorted([int(value) for value in history_sizes], reverse=True)
-    if sum(normalized) <= 0:
-        raise ValueError("history_sizes must sum to a positive value.")
-    return normalized
+    normalized = [_normalize_optional_history_value(value) for value in history_sizes]
+    if len(normalized) != 3:
+        raise ValueError(
+            "history_sizes must contain exactly three entries ordered as [long, mid, short], "
+            f"got {normalized}."
+        )
+    long_size, mid_size, short_size = normalized
+    if short_size is None:
+        raise ValueError(f"history_sizes must keep short history enabled, got {normalized}.")
+    if long_size is None and mid_size is None:
+        return normalized
+    if long_size is not None and mid_size is not None:
+        return normalized
+    raise ValueError(
+        "history_sizes supports only full long/mid/short history or short-only history. "
+        f"Use [long, mid, short] or [None, None, short], got {normalized}."
+    )
+
+
+def is_short_only_history(history_sizes: Sequence[Optional[int]]) -> bool:
+    normalized = normalize_history_sizes(history_sizes)
+    return normalized[0] is None and normalized[1] is None
+
+
+def history_window_size_from_history_sizes(history_sizes: Sequence[Optional[int]]) -> int:
+    return sum(int(value) for value in normalize_history_sizes(history_sizes) if value is not None)
 
 
 def discover_input_latent_paths(input_path: Path) -> Tuple[Path, List[Path]]:
@@ -2206,17 +2358,136 @@ def extract_history_window(
     return history.contiguous()
 
 
+def prepare_stage1_short_only_input_from_latents(
+    history_latents: torch.Tensor,
+    target_latents: torch.Tensor,
+    x0_latents: Optional[torch.Tensor],
+    latent_window_size: int,
+    short_history_size: int,
+    is_keep_x0: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    target_latents = target_latents.to(device=device, dtype=dtype)
+    history_latents = history_latents.to(device=device, dtype=dtype)
+    if int(history_latents.shape[2]) != int(short_history_size):
+        raise ValueError(
+            f"short-only history expects {short_history_size} latent frames, got {history_latents.shape[2]}."
+        )
+    if int(target_latents.shape[2]) != int(latent_window_size):
+        raise ValueError(
+            f"target_latents temporal size must equal latent_window_size: "
+            f"got {target_latents.shape[2]}, expected {latent_window_size}."
+        )
+
+    batch_size = target_latents.shape[0]
+    if is_keep_x0:
+        if x0_latents is None:
+            raise ValueError("x0_latents must be provided when is_keep_x0=True.")
+        latents_prefix = x0_latents.to(device=device, dtype=dtype)
+        indices = torch.arange(
+            0,
+            1 + short_history_size + latent_window_size,
+            device=device,
+            dtype=torch.long,
+        ).unsqueeze(0).expand(batch_size, -1)
+        indices_prefix = indices[:, :1]
+        indices_latents_history_1x = indices[:, 1 : 1 + short_history_size]
+        indices_hidden_states = indices[:, 1 + short_history_size :]
+        indices_latents_history_short = torch.cat([indices_prefix, indices_latents_history_1x], dim=1)
+        latents_history_short = torch.cat([latents_prefix, history_latents], dim=2)
+    else:
+        indices = torch.arange(
+            0,
+            short_history_size + latent_window_size,
+            device=device,
+            dtype=torch.long,
+        ).unsqueeze(0).expand(batch_size, -1)
+        indices_latents_history_short = indices[:, :short_history_size]
+        indices_hidden_states = indices[:, short_history_size:]
+        latents_history_short = history_latents
+
+    return (
+        target_latents,
+        indices_hidden_states,
+        indices_latents_history_short,
+        None,
+        None,
+        latents_history_short,
+        None,
+        None,
+    )
+
+
+def prepare_stage1_recover_input_from_latents(
+    history_latents: torch.Tensor,
+    target_latents: torch.Tensor,
+    x0_latents: Optional[torch.Tensor],
+    latent_window_size: int,
+    history_sizes: Sequence[Optional[int]],
+    is_keep_x0: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    normalized_history_sizes = normalize_history_sizes(history_sizes)
+    if is_short_only_history(normalized_history_sizes):
+        short_history_size = int(normalized_history_sizes[2])
+        return prepare_stage1_short_only_input_from_latents(
+            history_latents=history_latents,
+            target_latents=target_latents,
+            x0_latents=x0_latents,
+            latent_window_size=latent_window_size,
+            short_history_size=short_history_size,
+            is_keep_x0=is_keep_x0,
+            dtype=dtype,
+            device=device,
+        )
+
+    prepare_stage1_clean_input_from_latents = import_stage1_prepare_fn()
+    return prepare_stage1_clean_input_from_latents(
+        history_latents=history_latents,
+        target_latents=target_latents,
+        x0_latents=x0_latents,
+        latent_window_size=latent_window_size,
+        history_sizes=[int(value) for value in normalized_history_sizes],
+        is_random_drop=False,
+        random_drop_v2v_ratio=0.0,
+        random_drop_t2v_ratio=0.0,
+        is_keep_x0=is_keep_x0,
+        dtype=dtype,
+        device=device,
+    )
+
+
 def build_training_batch_tensors(
     batch: Dict[str, torch.Tensor | int],
     sequences: Sequence[PreparedSequence],
     codec_config: CodecConfig,
     learned_tail_codec: Optional[torch.nn.Module],
     device: torch.device,
-    history_sizes: Sequence[int],
+    history_sizes: Sequence[Optional[int]],
     latent_window_size: int,
     anchor_span_latents: int,
 ) -> Dict[str, torch.Tensor]:
-    history_window_size = sum(int(value) for value in history_sizes)
+    history_window_size = history_window_size_from_history_sizes(history_sizes)
     seq_indices_value = batch["seq_idx"]
     section_starts_value = batch["section_start"]
     if torch.is_tensor(seq_indices_value):
@@ -2293,6 +2564,8 @@ def build_training_batch_tensors(
     history_latents: List[torch.Tensor] = []
     target_latents: List[torch.Tensor] = []
     current_low_target_latents: List[torch.Tensor] = []
+    previous_condition_latents: List[torch.Tensor] = []
+    previous_target_latents: List[torch.Tensor] = []
     x0_latents: List[torch.Tensor] = []
     valid_target_frames: List[int] = []
     codec_rate_bpp: List[torch.Tensor] = []
@@ -2328,9 +2601,13 @@ def build_training_batch_tensors(
             section_start=section_start,
             history_window_size=history_window_size,
         )
+        previous_condition_latent = low_full_latents[:, section_start - 1 : section_start].contiguous()
+        previous_target_latent = clean_full_latents[:, section_start - 1 : section_start].contiguous()
         history_latents.append(history_latent)
         target_latents.append(target_latent)
         current_low_target_latents.append(current_low_target_latent)
+        previous_condition_latents.append(previous_condition_latent)
+        previous_target_latents.append(previous_target_latent)
         x0_latents.append(clean_full_latents[:, :1])
         valid_target_frames.append(valid_frames)
         codec_rate_bpp.append(codec_rate_bpp_cache[seq_idx])
@@ -2345,6 +2622,8 @@ def build_training_batch_tensors(
         "history_latents": torch.stack(history_latents, dim=0).contiguous(),
         "target_latents": torch.stack(target_latents, dim=0).contiguous(),
         "current_low_target_latents": torch.stack(current_low_target_latents, dim=0).contiguous(),
+        "previous_condition_latents": torch.stack(previous_condition_latents, dim=0).contiguous(),
+        "previous_target_latents": torch.stack(previous_target_latents, dim=0).contiguous(),
         "x0_latents": torch.stack(x0_latents, dim=0).contiguous(),
         "valid_target_frames": torch.tensor(valid_target_frames, device=device, dtype=torch.long),
         "codec_rate_bpp": torch.stack(codec_rate_bpp, dim=0).contiguous(),
@@ -2487,7 +2766,7 @@ def training_step(
     prompt_embeds: torch.Tensor,
     device: torch.device,
     weight_dtype: torch.dtype,
-    history_sizes: Sequence[int],
+    history_sizes: Sequence[Optional[int]],
     latent_window_size: int,
     anchor_span_latents: int,
     loss_weighting_scheme: str,
@@ -2498,6 +2777,8 @@ def training_step(
     x_loss_weight: float,
     noise_loss_weight: float,
     temporal_delta_loss_weight: float,
+    motion_loss_max_weight: float,
+    motion_loss_gamma: float,
     rate_loss_weight: float,
     rate_loss_warmup_steps: int,
     rate_loss_ramp_steps: int,
@@ -2515,7 +2796,6 @@ def training_step(
 
     其中历史条件来自 low latents，因此模型学到的是“如何从低码率上下文恢复高保真细节”。
     """
-    prepare_stage1_clean_input_from_latents = import_stage1_prepare_fn()
     compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3 = import_diffusers_training_utils()
     materialized_batch = build_training_batch_tensors(
         batch=batch,
@@ -2530,12 +2810,15 @@ def training_step(
     history_latents = materialized_batch["history_latents"].to(dtype=weight_dtype)
     target_latents = materialized_batch["target_latents"].to(dtype=weight_dtype)
     current_low_target_latents = materialized_batch["current_low_target_latents"].to(dtype=weight_dtype)
+    previous_condition_latents = materialized_batch["previous_condition_latents"].to(dtype=weight_dtype)
+    previous_target_latents = materialized_batch["previous_target_latents"].to(dtype=weight_dtype)
     x0_latents = materialized_batch["x0_latents"].to(dtype=weight_dtype)
     valid_target_frames = materialized_batch["valid_target_frames"]
     codec_rate_bpp = materialized_batch["codec_rate_bpp"].to(device=device, dtype=torch.float32)
-    section_total_bpp = materialized_batch["section_total_bpp"].to(device=device, dtype=torch.float32)
+    section_motion_score = materialized_batch["section_motion_score"].to(device=device, dtype=torch.float32)
 
-    # 这段代码讲short,mid,long三档历史和target一起拼成 transformer 输入，后续 transformer 内部会区分处理。
+    # 使用配置指定的 history 条件。当前 anchor 前的 previous condition
+    # 对正常 section 等价于 short history 的最后一个 latent；首个 section 则回退到 x0。
     (
         model_input,
         indices_hidden_states,
@@ -2545,15 +2828,12 @@ def training_step(
         latents_history_short,
         latents_history_mid,
         latents_history_long,
-    ) = prepare_stage1_clean_input_from_latents(
+    ) = prepare_stage1_recover_input_from_latents(
         history_latents=history_latents,
         target_latents=target_latents,
         x0_latents=x0_latents,
         latent_window_size=latent_window_size,
         history_sizes=list(history_sizes),
-        is_random_drop=False,
-        random_drop_v2v_ratio=0.0,
-        random_drop_t2v_ratio=0.0,
         is_keep_x0=True,
         dtype=weight_dtype,
         device=device,
@@ -2606,7 +2886,15 @@ def training_step(
         device=device,
         dtype=torch.float32,
     )
-    weighted_mask = mask * tail_position_weights
+    motion_loss_weights = build_motion_loss_weights(
+        section_motion_score=section_motion_score,
+        codec_config=codec_config,
+        max_weight=motion_loss_max_weight,
+        gamma=motion_loss_gamma,
+        device=device,
+        dtype=torch.float32,
+    )
+    weighted_mask = mask * tail_position_weights * motion_loss_weights
     sigma_view_float = sigma.view(-1, 1, 1, 1, 1)
     xt = noisy_model_input.float()
     x_target = model_input.float()
@@ -2643,9 +2931,11 @@ def training_step(
         target=x_target,
         valid_target_frames=valid_target_frames,
         device=device,
-        position_weights=tail_position_weights,
+        position_weights=tail_position_weights * motion_loss_weights,
+        previous_prediction_context=previous_condition_latents.float(),
+        previous_target_context=previous_target_latents.float(),
     )
-    rate_bpp_value = section_total_bpp.mean()
+    rate_bpp_value = codec_rate_bpp.mean()
     rate_loss = rate_bpp_value if learned_tail_codec is not None else torch.zeros((), device=device, dtype=torch.float32)
     codec_aux_loss = (
         learned_tail_codec.aux_loss().float()
@@ -2722,6 +3012,36 @@ def build_tail_position_weights(
     return weights
 
 
+def build_motion_loss_weights(
+    section_motion_score: torch.Tensor,
+    codec_config: CodecConfig,
+    max_weight: float,
+    gamma: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """把 section 运动强度映射成样本级 loss 权重。
+
+    q20 以下保持 1x，q80 及以上达到 `max_weight`，中间区间平滑插值。
+    这样高运动视频会在重建误差和 temporal delta 上获得更强监督，同时不改变低码率载荷格式。
+    """
+    batch_size = int(section_motion_score.shape[0])
+    if max_weight <= 1.0:
+        return torch.ones(batch_size, 1, 1, 1, 1, device=device, dtype=dtype)
+
+    motion_q20 = codec_config.motion_q20
+    motion_q80 = codec_config.motion_q80
+    if motion_q20 is None or motion_q80 is None or motion_q80 <= motion_q20 + EPS:
+        normalized_motion = torch.zeros(batch_size, device=device, dtype=torch.float32)
+    else:
+        normalized_motion = (
+            (section_motion_score.float() - float(motion_q20)) / float(motion_q80 - motion_q20)
+        ).clamp(0.0, 1.0)
+    normalized_motion = normalized_motion.pow(float(gamma))
+    weights = 1.0 + (float(max_weight) - 1.0) * normalized_motion
+    return weights.to(device=device, dtype=dtype).view(batch_size, 1, 1, 1, 1)
+
+
 def compute_aux_loss_scale(
     global_step: int,
     warmup_steps: int,
@@ -2759,7 +3079,32 @@ def compute_temporal_delta_loss(
     valid_target_frames: torch.Tensor,
     device: torch.device,
     position_weights: Optional[torch.Tensor] = None,
+    previous_prediction_context: Optional[torch.Tensor] = None,
+    previous_target_context: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    has_previous_context = previous_prediction_context is not None or previous_target_context is not None
+    if has_previous_context:
+        if previous_prediction_context is None or previous_target_context is None:
+            raise ValueError("previous_prediction_context and previous_target_context must be provided together.")
+        if previous_prediction_context.shape[2] != 1 or previous_target_context.shape[2] != 1:
+            raise ValueError(
+                "previous_prediction_context and previous_target_context must each contain exactly one latent frame."
+            )
+        prediction_for_delta = torch.cat([previous_prediction_context.to(prediction), prediction], dim=2)
+        target_for_delta = torch.cat([previous_target_context.to(target), target], dim=2)
+        delta_prediction = prediction_for_delta[:, :, 1:] - prediction_for_delta[:, :, :-1]
+        delta_target = target_for_delta[:, :, 1:] - target_for_delta[:, :, :-1]
+        delta_mask = build_valid_mask(
+            valid_target_frames=valid_target_frames,
+            latent_window_size=prediction.shape[2],
+            device=device,
+            dtype=torch.float32,
+            valid_start=0,
+        )
+        if position_weights is not None:
+            delta_mask = delta_mask * position_weights
+        return masked_mean((delta_prediction - delta_target).abs(), delta_mask)
+
     if prediction.shape[2] <= 1:
         return torch.tensor(0.0, device=device, dtype=torch.float32)
 
@@ -2946,6 +3291,7 @@ def prepare_stage1_inference_scheduler(
     latents: torch.Tensor,
     num_inference_steps: int,
     device: torch.device,
+    start_sigma: Optional[float] = None,
 ) -> None:
     """把 recover 推理调度对齐到 Helios stage1 的时序设置。"""
     use_dynamic_shifting = bool(get_scheduler_config_value(scheduler, "use_dynamic_shifting", False))
@@ -2974,6 +3320,20 @@ def prepare_stage1_inference_scheduler(
         if hasattr(scheduler, "reset_scheduler_history"):
             scheduler.reset_scheduler_history()
 
+    if start_sigma is not None:
+        sigmas = torch.linspace(
+            float(start_sigma),
+            0.0,
+            steps=num_inference_steps + 1,
+            dtype=torch.float32,
+            device=device,
+        )[:-1]
+        num_train_timesteps = float(get_scheduler_config_value(scheduler, "num_train_timesteps", 1000))
+        scheduler.timesteps = sigmas * num_train_timesteps
+        scheduler.sigmas = torch.cat([sigmas, torch.zeros(1, dtype=sigmas.dtype, device=sigmas.device)])
+        if hasattr(scheduler, "reset_scheduler_history"):
+            scheduler.reset_scheduler_history()
+
     validate_stage1_inference_scheduler(scheduler)
 
 
@@ -2985,13 +3345,18 @@ def reconstruct_sequence(
     prompt_embeds: torch.Tensor,
     device: torch.device,
     weight_dtype: torch.dtype,
-    history_sizes: Sequence[int],
+    history_sizes: Sequence[Optional[int]],
     latent_window_size: int,
     anchor_span_latents: int,
     num_inference_steps: int,
     seed: int,
     recover_overlap_latents: int,
     distributed_context: DistributedContext,
+    recover_history_source: str = DEFAULT_RECOVER_HISTORY_SOURCE,
+    recover_init_mode: str = DEFAULT_RECOVER_INIT_MODE,
+    recover_start_sigma: Optional[float] = DEFAULT_RECOVER_START_SIGMA,
+    recover_low_guidance_scale: float = DEFAULT_RECOVER_LOW_GUIDANCE_SCALE,
+    fix_anchor_during_denoise: Optional[bool] = None,
 ) -> torch.Tensor:
     """把一段 low latents 重建成 recover latents。
 
@@ -3004,11 +3369,12 @@ def reconstruct_sequence(
     """
     clean_full = sequence.clean_full_latents
     low_full = sequence.low_full_latents
+    if recover_history_source not in {RECOVER_HISTORY_SOURCE_LOW, RECOVER_HISTORY_SOURCE_RECOVERED}:
+        raise ValueError(f"Unsupported recover_history_source={recover_history_source}.")
     if clean_full.shape[1] == 1:
         return clean_full.clone().cpu().contiguous()
 
-    prepare_stage1_clean_input_from_latents = import_stage1_prepare_fn()
-    history_sizes = list(history_sizes)
+    history_sizes = normalize_history_sizes(history_sizes)
     section_starts = build_recover_window_starts(
         total_latent_frames=int(clean_full.shape[1]),
         latent_window_size=latent_window_size,
@@ -3029,13 +3395,23 @@ def reconstruct_sequence(
 
     for section_start in tqdm(
         section_starts,
-        desc=f"Reconstructing sections rank={distributed_context.rank} overlap={recover_overlap_latents}",
+        desc=(
+            f"Reconstructing sections rank={distributed_context.rank} overlap={recover_overlap_latents} "
+            f"history={recover_history_source} init={recover_init_mode}"
+        ),
         disable=distributed_context.is_distributed and not distributed_context.is_main_process,
     ):
+        history_source_full = low_full
+        if recover_history_source == RECOVER_HISTORY_SOURCE_RECOVERED:
+            known_mask = recovered_weight[0, :, 0, 0] > 0
+            if torch.any(known_mask):
+                history_source_full = low_full.float().cpu().clone().contiguous()
+                known_values = recovered_sum[:, known_mask] / recovered_weight[:, known_mask].clamp_min(EPS)
+                history_source_full[:, known_mask] = known_values
         history_latents = extract_history_window(
-            low_full_latents=low_full,
+            low_full_latents=history_source_full,
             section_start=section_start,
-            history_window_size=sum(history_sizes),
+            history_window_size=history_window_size_from_history_sizes(history_sizes),
         ).unsqueeze(0)
         valid_target_frames = min(latent_window_size, clean_full.shape[1] - section_start)
         current_low_target_latents, low_valid_frames = extract_current_low_target_window(
@@ -3058,15 +3434,12 @@ def reconstruct_sequence(
             latents_history_short,
             latents_history_mid,
             latents_history_long,
-        ) = prepare_stage1_clean_input_from_latents(
+        ) = prepare_stage1_recover_input_from_latents(
             history_latents=history_latents.to(device=device, dtype=weight_dtype),
             target_latents=dummy_target,
             x0_latents=x0_latents,
             latent_window_size=latent_window_size,
             history_sizes=history_sizes,
-            is_random_drop=False,
-            random_drop_v2v_ratio=0.0,
-            random_drop_t2v_ratio=0.0,
             is_keep_x0=True,
             dtype=weight_dtype,
             device=device,
@@ -3091,6 +3464,9 @@ def reconstruct_sequence(
             num_inference_steps=num_inference_steps,
             seed=seed + section_start,
             current_low_target_latents=current_low_target_latents.unsqueeze(0).to(device=device, dtype=weight_dtype),
+            recover_init_mode=recover_init_mode,
+            recover_start_sigma=recover_start_sigma,
+            recover_low_guidance_scale=recover_low_guidance_scale,
         )
         valid_section = section_latents[0, :, :valid_target_frames].contiguous()
         section_end = section_start + valid_target_frames
@@ -3107,7 +3483,7 @@ def reconstruct_sequence(
     if torch.any(missing_mask):
         missing_count = int(missing_mask.sum().item())
         raise RuntimeError(f"Recover overlap windows left {missing_count} latent positions uncovered.")
-    recovered_full = clean_full.float().cpu().contiguous()
+    recovered_full = clean_full.float().cpu().clone().contiguous()
     recovered_full[:, 1:] = recovered_sum[:, 1:] / recovered_weight[:, 1:].clamp_min(EPS)
     return recovered_full.contiguous()
 
@@ -3124,14 +3500,17 @@ def run_stage1_denoise(
     latent_shape: Tuple[int, int, int, int, int],
     indices_hidden_states: torch.Tensor,
     indices_latents_history_short: torch.Tensor,
-    indices_latents_history_mid: torch.Tensor,
-    indices_latents_history_long: torch.Tensor,
+    indices_latents_history_mid: Optional[torch.Tensor],
+    indices_latents_history_long: Optional[torch.Tensor],
     latents_history_short: torch.Tensor,
-    latents_history_mid: torch.Tensor,
-    latents_history_long: torch.Tensor,
+    latents_history_mid: Optional[torch.Tensor],
+    latents_history_long: Optional[torch.Tensor],
     num_inference_steps: int,
     seed: int,
     current_low_target_latents: torch.Tensor,
+    recover_init_mode: str = DEFAULT_RECOVER_INIT_MODE,
+    recover_start_sigma: Optional[float] = DEFAULT_RECOVER_START_SIGMA,
+    recover_low_guidance_scale: float = DEFAULT_RECOVER_LOW_GUIDANCE_SCALE,
 ) -> torch.Tensor:
     """执行单个 section 的扩散式去噪恢复。
 
@@ -3140,14 +3519,25 @@ def run_stage1_denoise(
     """
     base_transformer = unwrap_model(transformer)
     generator = torch.Generator(device=device).manual_seed(seed)
-    # 输入 hidden_states 是当前 section 的待恢复 latent，先随机初始化为高斯噪声；当前配置下 shape 近似是 [1, 16, 9, H, W]
-    latents = torch.randn(latent_shape, device=device, dtype=torch.float32, generator=generator)
+    # 输入 hidden_states 是当前 section 的待恢复 latent。纯噪声初始化保留为兼容路径；
+    # 恢复任务也可以从 low target 加噪开始，减少高运动 section 的随机漂移。
+    noise = torch.randn(latent_shape, device=device, dtype=torch.float32, generator=generator)
+    latents = noise
     prepare_stage1_inference_scheduler(
         scheduler=scheduler,
         latents=latents,
         num_inference_steps=num_inference_steps,
         device=device,
+        start_sigma=recover_start_sigma,
     )
+    first_sigma = float(get_scheduler_sigma_for_step(scheduler, 0))
+    low_target_float = current_low_target_latents.float()
+    if recover_init_mode == RECOVER_INIT_MODE_LOW_NOISE:
+        latents = (1.0 - first_sigma) * low_target_float + first_sigma * noise
+    elif recover_init_mode == RECOVER_INIT_MODE_LOW:
+        latents = low_target_float.clone()
+    elif recover_init_mode != RECOVER_INIT_MODE_NOISE:
+        raise ValueError(f"Unsupported recover_init_mode={recover_init_mode}.")
     scheduler_type = str(get_scheduler_config_value(scheduler, "scheduler_type", "")).lower()
     supports_first_step_flag = model_supports_argument(base_transformer, "is_first_denoising_step")
 
@@ -3173,8 +3563,8 @@ def run_stage1_denoise(
             "indices_latents_history_mid": indices_latents_history_mid,
             "indices_latents_history_long": indices_latents_history_long,
             "latents_history_short": latents_history_short.to(weight_dtype),
-            "latents_history_mid": latents_history_mid.to(weight_dtype),
-            "latents_history_long": latents_history_long.to(weight_dtype),
+            "latents_history_mid": None if latents_history_mid is None else latents_history_mid.to(weight_dtype),
+            "latents_history_long": None if latents_history_long is None else latents_history_long.to(weight_dtype),
             "latents_current_low_target": current_low_target_latents.to(weight_dtype),
             "return_dict": False,
         }
@@ -3201,6 +3591,12 @@ def run_stage1_denoise(
             latents = scheduler.step_unipc(noise_pred.float(), timestep, latents, return_dict=False)[0]
         else:
             latents = scheduler.step(noise_pred.float(), timestep, latents, return_dict=False)[0]
+        if recover_low_guidance_scale > 0.0:
+            next_sigma_index = min(step_idx + 1, int(scheduler.sigmas.shape[0]) - 1)
+            next_sigma = float(scheduler.sigmas[next_sigma_index].detach().float().item())
+            guidance_alpha = float(recover_low_guidance_scale) * max(0.0, min(1.0, 1.0 - next_sigma))
+            if guidance_alpha > 0.0:
+                latents = torch.lerp(latents.float(), low_target_float, guidance_alpha).to(dtype=latents.dtype)
         ensure_finite_recover_state(
             stage="post_step",
             input_path=input_path,
@@ -3719,7 +4115,7 @@ def save_training_artifacts(
     learned_tail_codec: Optional[torch.nn.Module],
     training_model: Optional[torch.nn.Module],
     codec_config: CodecConfig,
-    history_sizes: Sequence[int],
+    history_sizes: Sequence[Optional[int]],
     latent_window_size: int,
     args: argparse.Namespace,
     train_metrics: Dict[str, object],
@@ -3798,7 +4194,7 @@ def save_training_artifacts(
 
 def build_recover_config(
     codec_config: CodecConfig,
-    history_sizes: Sequence[int],
+    history_sizes: Sequence[Optional[int]],
     latent_window_size: int,
     args: argparse.Namespace,
     learned_tail_codec: Optional[torch.nn.Module],
@@ -3838,6 +4234,8 @@ def build_recover_config(
         "anchor_inference_mode": "history_low_target_overlap",
         "fix_anchor_during_denoise": False,
         "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
+        "motion_loss_max_weight": args.motion_loss_max_weight,
+        "motion_loss_gamma": args.motion_loss_gamma,
         "codec_config": asdict(codec_config),
         "train_loss_config": {
             "loss_weighting_scheme": args.loss_weighting_scheme,
@@ -3848,6 +4246,8 @@ def build_recover_config(
             "x_loss_weight": args.x_loss_weight,
             "noise_loss_weight": args.noise_loss_weight,
             "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
+            "motion_loss_max_weight": args.motion_loss_max_weight,
+            "motion_loss_gamma": args.motion_loss_gamma,
             "rate_loss_weight": args.rate_loss_weight,
             "rate_loss_warmup_steps": args.rate_loss_warmup_steps,
             "rate_loss_ramp_steps": args.rate_loss_ramp_steps,
@@ -4111,6 +4511,7 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     validate_codec_config(codec_config)
 
     config["format_version"] = RECOVER_CONFIG_VERSION
+    config["history_sizes"] = normalize_history_sizes(config["history_sizes"])
     config["codec_config"] = codec_config
     config["section_span_latents"] = int(codec_config["section_span_latents"])
     config["anchor_span_latents"] = int(codec_config["anchor_span_latents"])
@@ -4141,11 +4542,15 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["fix_anchor_during_denoise"] = False
     train_loss_config = dict(config.get("train_loss_config", {}))
     train_loss_config.setdefault("temporal_delta_loss_weight", DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
+    train_loss_config.setdefault("motion_loss_max_weight", DEFAULT_MOTION_LOSS_MAX_WEIGHT)
+    train_loss_config.setdefault("motion_loss_gamma", DEFAULT_MOTION_LOSS_GAMMA)
     train_loss_config.setdefault("rate_loss_weight", DEFAULT_RATE_LOSS_WEIGHT)
     train_loss_config.setdefault("rate_loss_warmup_steps", DEFAULT_RATE_LOSS_WARMUP_STEPS)
     train_loss_config.setdefault("rate_loss_ramp_steps", DEFAULT_RATE_LOSS_RAMP_STEPS)
     train_loss_config.setdefault("entropy_aux_learning_rate", DEFAULT_ENTROPY_AUX_LEARNING_RATE)
     config["temporal_delta_loss_weight"] = train_loss_config["temporal_delta_loss_weight"]
+    config["motion_loss_max_weight"] = train_loss_config["motion_loss_max_weight"]
+    config["motion_loss_gamma"] = train_loss_config["motion_loss_gamma"]
     config["train_loss_config"] = train_loss_config
     return config
 

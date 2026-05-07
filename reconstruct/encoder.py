@@ -16,12 +16,15 @@ from tqdm import tqdm
 
 DEFAULT_BASE_MODEL_PATH = "/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base"
 DEFAULT_INPUT_DIR = "example/toy_data/videos"
-DEFAULT_OUTPUT_DIR = "reconstruct/latents"
+DEFAULT_OUTPUT_DIR = "reconstruct/latents2"
 DEFAULT_HEIGHT = 384
 DEFAULT_WIDTH = 640
 DEFAULT_MAX_CHUNK_FRAMES = 81
+DEFAULT_CHUNK_MODE = "padded_single"
+DEFAULT_SINGLE_CHUNK_MAX_FRAMES = 153
 LATENT_FORMAT_VERSION = "helios_vae_latent_v2"
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".gif"}
+CHUNK_MODE_CHOICES = ("padded_single", "balanced")
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max_chunk_frames", type=int, default=DEFAULT_MAX_CHUNK_FRAMES)
+    parser.add_argument(
+        "--chunk_mode",
+        type=str,
+        default=DEFAULT_CHUNK_MODE,
+        choices=CHUNK_MODE_CHOICES,
+        help=(
+            "padded_single pads short videos to one legal 4n+1 VAE chunk to avoid chunk-boundary flicker; "
+            "balanced keeps the legacy non-overlap chunk split."
+        ),
+    )
+    parser.add_argument(
+        "--single_chunk_max_frames",
+        type=int,
+        default=DEFAULT_SINGLE_CHUNK_MAX_FRAMES,
+        help="Maximum padded frame count allowed for padded_single before falling back to balanced chunking.",
+    )
     parser.add_argument("--skip_missing", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args()
@@ -293,6 +312,13 @@ def split_frame_counts(total_frames: int, max_chunk_frames: int) -> List[int]:
     return chunk_lengths
 
 
+def pad_to_legal_chunk_frame_count(frame_count: int) -> int:
+    """Pad frame count to the next legal Wan/Helios VAE temporal length, 4n+1."""
+    if frame_count <= 0:
+        raise ValueError(f"frame_count must be positive, got {frame_count}")
+    return frame_count + ((1 - frame_count) % 4)
+
+
 def build_frame_ranges(total_frames: int, max_chunk_frames: int) -> List[Tuple[int, int]]:
     chunk_lengths = split_frame_counts(total_frames, max_chunk_frames)
     frame_ranges: List[Tuple[int, int]] = []
@@ -302,6 +328,42 @@ def build_frame_ranges(total_frames: int, max_chunk_frames: int) -> List[Tuple[i
         frame_ranges.append((start, end))
         start = end
     return frame_ranges
+
+
+def build_chunk_frame_ranges_from_counts(frame_counts: Sequence[int]) -> List[Tuple[int, int]]:
+    frame_ranges: List[Tuple[int, int]] = []
+    start = 0
+    for frame_count in frame_counts:
+        end = start + int(frame_count)
+        frame_ranges.append((start, end))
+        start = end
+    return frame_ranges
+
+
+def build_encoding_chunk_plan(
+    total_frames: int,
+    max_chunk_frames: int,
+    chunk_mode: str,
+    single_chunk_max_frames: int,
+) -> Tuple[List[Tuple[int, int]], List[int], str]:
+    """Build source read ranges and encoded chunk frame counts.
+
+    `padded_single` keeps short videos in one VAE temporal context by repeating the
+    last frame up to a legal 4n+1 count. Downstream decode trims padding by
+    `source_num_frames`.
+    """
+    if chunk_mode not in CHUNK_MODE_CHOICES:
+        raise ValueError(f"Unsupported chunk_mode={chunk_mode}. Expected one of {CHUNK_MODE_CHOICES}.")
+    if single_chunk_max_frames < 1:
+        raise ValueError(f"single_chunk_max_frames must be >= 1, got {single_chunk_max_frames}")
+
+    padded_total_frames = pad_to_legal_chunk_frame_count(total_frames)
+    if chunk_mode == "padded_single" and padded_total_frames <= single_chunk_max_frames:
+        return [(0, total_frames)], [padded_total_frames], "padded_single"
+
+    source_ranges = build_frame_ranges(total_frames, max_chunk_frames)
+    encoded_counts = [end - start for start, end in source_ranges]
+    return source_ranges, encoded_counts, "balanced"
 
 
 def get_video_metadata(video_path: Path) -> Tuple[int, float, int, int]:
@@ -411,10 +473,18 @@ def encode_video(
     height: int,
     width: int,
     max_chunk_frames: int,
+    chunk_mode: str,
+    single_chunk_max_frames: int,
     device: torch.device,
 ) -> Dict[str, float]:
     total_frames, fps, source_height, source_width = get_video_metadata(video_path)
-    frame_ranges = build_frame_ranges(total_frames, max_chunk_frames)
+    source_frame_ranges, encoded_frame_counts, resolved_chunk_mode = build_encoding_chunk_plan(
+        total_frames=total_frames,
+        max_chunk_frames=max_chunk_frames,
+        chunk_mode=chunk_mode,
+        single_chunk_max_frames=single_chunk_max_frames,
+    )
+    chunk_frame_ranges = build_chunk_frame_ranges_from_counts(encoded_frame_counts)
     relative_path = video_path.relative_to(input_root)
     output_path = output_dir / relative_path.with_suffix(".pt")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -423,7 +493,19 @@ def encode_video(
     decoded_frame_count = 0
 
     with torch.inference_mode():
-        for chunk_frames, _, decoded_frame_count in iter_video_chunks(video_path, frame_ranges):
+        for chunk_idx, (chunk_frames, _, decoded_frame_count) in enumerate(
+            iter_video_chunks(video_path, source_frame_ranges)
+        ):
+            encoded_frame_count = int(encoded_frame_counts[chunk_idx])
+            if chunk_frames.shape[0] > encoded_frame_count:
+                raise RuntimeError(
+                    f"Chunk source frame count exceeds encoded frame count for {video_path}: "
+                    f"source={chunk_frames.shape[0]} encoded={encoded_frame_count}."
+                )
+            if chunk_frames.shape[0] < encoded_frame_count:
+                pad_count = encoded_frame_count - int(chunk_frames.shape[0])
+                pad_frames = np.repeat(chunk_frames[-1:], pad_count, axis=0)
+                chunk_frames = np.concatenate([chunk_frames, pad_frames], axis=0)
             chunk_images = [Image.fromarray(frame) for frame in chunk_frames]
             processed_video = video_processor.preprocess_video(chunk_images, height=height, width=width)
             processed_video = processed_video.to(device=device, dtype=vae.dtype)
@@ -449,7 +531,14 @@ def encode_video(
         "source_width": source_width,
         "processed_height": height,
         "processed_width": width,
-        "chunk_frame_ranges": frame_ranges,
+        "chunk_mode": resolved_chunk_mode,
+        "source_chunk_frame_ranges": source_frame_ranges,
+        "chunk_frame_ranges": chunk_frame_ranges,
+        "chunk_encoded_frame_counts": encoded_frame_counts,
+        "chunk_padding_frames": [
+            int(encoded_count - (source_end - source_start))
+            for encoded_count, (source_start, source_end) in zip(encoded_frame_counts, source_frame_ranges)
+        ],
         "latent_chunks": latent_chunks,
     }
     torch.save(payload, output_path)
@@ -457,6 +546,7 @@ def encode_video(
     bpp = compute_bpp(file_bytes=file_bytes, num_frames=total_frames, width=source_width, height=source_height)
     print(
         f"[encoder] saved={output_path} "
+        f"chunk_mode={resolved_chunk_mode} "
         f"chunks={len(latent_chunks)} "
         f"latent_shapes={chunk_shapes} "
         f"file_bytes={file_bytes} "
@@ -552,6 +642,8 @@ def main() -> None:
                 height=args.height,
                 width=args.width,
                 max_chunk_frames=args.max_chunk_frames,
+                chunk_mode=args.chunk_mode,
+                single_chunk_max_frames=args.single_chunk_max_frames,
                 device=device,
             )
             total_file_bytes += int(stats["file_bytes"])

@@ -14,7 +14,7 @@ export MACHINE_RANK="${MACHINE_RANK:-${NODE_RANK}}"
 export NUM_PROCESSES_PER_MACHINE="${NUM_PROCESSES_PER_MACHINE:-${NPROC_PER_NODE}}"
 export ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE:-scripts/accelerate_configs/multi_node_example_zero3.yaml}"
 export NUM_PROCESSES="$((NUM_MACHINES * NUM_PROCESSES_PER_MACHINE))"
-export SAVEDIR="${SAVEDIR:-reconstruct/gen2recon_runs_HE2E_Apr28}"
+export SAVEDIR="${SAVEDIR:-reconstruct/gen2recon_runs_HE2E_May06}"
 
 # Quality-first defaults. Override any of these from the shell when bitrate pressure matters more.
 export TEMPORAL_FACTOR="${TEMPORAL_FACTOR:-2}"
@@ -23,21 +23,23 @@ export SECTION_SPAN_LATENTS="${SECTION_SPAN_LATENTS:-4}"
 export RECOVER_OVERLAP_LATENTS="${RECOVER_OVERLAP_LATENTS:-2}"
 export ANCHOR_SPAN_LATENTS="${ANCHOR_SPAN_LATENTS:-1}"
 export ANCHOR_SPATIAL_FACTOR="${ANCHOR_SPATIAL_FACTOR:-1}"
-export KEYFRAME_CODEC_MODE="${KEYFRAME_CODEC_MODE:-raw}"
+export KEYFRAME_CODEC_MODE="${KEYFRAME_CODEC_MODE:-quantized_int8}"
 export KEYFRAME_QUANT_DTYPE="${KEYFRAME_QUANT_DTYPE:-int8}"
-export KEYFRAME_SPATIAL_FACTOR="${KEYFRAME_SPATIAL_FACTOR:-1}"
-export RATE_LOSS_WEIGHT="${RATE_LOSS_WEIGHT:-0.25}"
+export KEYFRAME_SPATIAL_FACTOR="${KEYFRAME_SPATIAL_FACTOR:-2}"
+export RATE_LOSS_WEIGHT="${RATE_LOSS_WEIGHT:-0.5}"
 export RATE_LOSS_WARMUP_STEPS="${RATE_LOSS_WARMUP_STEPS:-0}"
-export RATE_LOSS_RAMP_STEPS="${RATE_LOSS_RAMP_STEPS:-0}"
+export RATE_LOSS_RAMP_STEPS="${RATE_LOSS_RAMP_STEPS:-1000}"
 export ENTROPY_AUX_LEARNING_RATE="${ENTROPY_AUX_LEARNING_RATE:-1e-3}"
-export TEMPORAL_DELTA_LOSS_WEIGHT="${TEMPORAL_DELTA_LOSS_WEIGHT:-0.4}"
+export TEMPORAL_DELTA_LOSS_WEIGHT="${TEMPORAL_DELTA_LOSS_WEIGHT:-1.0}"
+export MOTION_LOSS_MAX_WEIGHT="${MOTION_LOSS_MAX_WEIGHT:-2.0}"
+export MOTION_LOSS_GAMMA="${MOTION_LOSS_GAMMA:-1.0}"
 export DYNAMIC_RATE_ENABLED="${DYNAMIC_RATE_ENABLED:-true}"
 export MOTION_SCORE_TYPE="${MOTION_SCORE_TYPE:-latent_delta_l1_norm}"
-export TAIL_QUALITY_MIN="${TAIL_QUALITY_MIN:-1.2}"
-export TAIL_QUALITY_MAX="${TAIL_QUALITY_MAX:-2.2}"
-export ANCHOR_PROFILE_LOW="${ANCHOR_PROFILE_LOW:-2}"
-export ANCHOR_PROFILE_BASE="${ANCHOR_PROFILE_BASE:-1}"
-export ANCHOR_PROFILE_HIGH="${ANCHOR_PROFILE_HIGH:-1}"
+export TAIL_QUALITY_MIN="${TAIL_QUALITY_MIN:-0.9}"
+export TAIL_QUALITY_MAX="${TAIL_QUALITY_MAX:-1.4}"
+export ANCHOR_PROFILE_LOW="${ANCHOR_PROFILE_LOW:-3}"
+export ANCHOR_PROFILE_BASE="${ANCHOR_PROFILE_BASE:-2}"
+export ANCHOR_PROFILE_HIGH="${ANCHOR_PROFILE_HIGH:-2}"
 
 DYNAMIC_RATE_FLAG="--dynamic_rate_enabled"
 if [[ "${DYNAMIC_RATE_ENABLED}" == "0" || "${DYNAMIC_RATE_ENABLED}" == "false" || "${DYNAMIC_RATE_ENABLED}" == "False" ]]; then
@@ -61,12 +63,14 @@ accelerate launch \
     reconstruct/recover.py train \
     --output_dir "${SAVEDIR}" \
     --batch_size 2 \
-    --gradient_accumulation_steps 4 \
-    --epochs 500 \
+    --gradient_accumulation_steps 2 \
+    --epochs 2 \
+    --max_steps 100000\
     --temporal_factor "${TEMPORAL_FACTOR}" \
     --spatial_factor "${SPATIAL_FACTOR}" \
     --latent_window_size "${SECTION_SPAN_LATENTS}" \
     --section_span_latents "${SECTION_SPAN_LATENTS}" \
+    --history_sizes None None 3 \
     --recover_overlap_latents "${RECOVER_OVERLAP_LATENTS}" \
     --anchor_span_latents "${ANCHOR_SPAN_LATENTS}" \
     --anchor_spatial_factor "${ANCHOR_SPATIAL_FACTOR}" \
@@ -78,6 +82,8 @@ accelerate launch \
     --rate_loss_ramp_steps "${RATE_LOSS_RAMP_STEPS}" \
     --entropy_aux_learning_rate "${ENTROPY_AUX_LEARNING_RATE}" \
     --temporal_delta_loss_weight "${TEMPORAL_DELTA_LOSS_WEIGHT}" \
+    --motion_loss_max_weight "${MOTION_LOSS_MAX_WEIGHT}" \
+    --motion_loss_gamma "${MOTION_LOSS_GAMMA}" \
     "${DYNAMIC_RATE_FLAG}" \
     --motion_score_type "${MOTION_SCORE_TYPE}" \
     --tail_quality_min "${TAIL_QUALITY_MIN}" \
