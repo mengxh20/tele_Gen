@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv)",
+      "Bash(dmesg -T)"
+    ]
+  }
+}

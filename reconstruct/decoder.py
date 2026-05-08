@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--base_model_path",
         type=str,
-        default="/gemini/platform/public/luojx/team/mengxh/MODELS/BestWishYSH/Helios-Base",
+        default="/app1/gemini/gemini-sharedata/platform/public/luojx/team/mengxh/MODELS/Helios-Base",
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--source_video_dir", type=Path, default=Path(DEFAULT_SOURCE_VIDEO_DIR))

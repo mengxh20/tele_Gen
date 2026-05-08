@@ -23,7 +23,7 @@ import sys
 import time
 import types
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -69,7 +69,7 @@ from reconstruct.latent_io import (
 )
 
 
-DEFAULT_INPUT_PATH = Path("train_dataset")
+DEFAULT_INPUT_PATH = Path("/app1/gemini/gemini-sharedata/platform/public/luojx/team/mengxh/codes/tele_Gen/train_dataset2")
 DEFAULT_TEMPORAL_FACTOR = 2
 DEFAULT_SPATIAL_FACTOR = 4
 DEFAULT_QUANT_DTYPE = "int8"
@@ -191,6 +191,8 @@ class SequenceMetadata:
     raw_bpp: float
     chunk_lengths: List[int]
     chunk_frame_ranges: List[Tuple[int, int]]
+    total_latent_frames: int
+    latent_channels: int
 
 
 @dataclass
@@ -201,13 +203,34 @@ class PreparedSequence:
     - `clean_full_latents`: 原始高保真 latent，作为训练监督和推理对照真值。
     - `low_codec_payload`: 低码率编码后的中间载荷，可视为传输结果。
     - `low_full_latents`: 从低码率载荷直接解码出的粗恢复 latent，用于构造历史条件。
+
+    `clean_full_latents` 支持懒加载：初始化时可以为 None，首次访问时从磁盘加载。
+    调用 `release_clean_latents()` 可以释放显存/内存，训练时按需加载即可。
     """
 
     path: Path
     metadata: SequenceMetadata
-    clean_full_latents: torch.Tensor
+    _clean_full_latents: Optional[torch.Tensor] = field(default=None, repr=False)
     low_codec_payload: Optional[Dict[str, object]] = None
     low_full_latents: Optional[torch.Tensor] = None
+
+    @property
+    def clean_full_latents(self) -> torch.Tensor:
+        if self._clean_full_latents is None:
+            self._load_clean_latents()
+        return self._clean_full_latents
+
+    @clean_full_latents.setter
+    def clean_full_latents(self, value: torch.Tensor) -> None:
+        self._clean_full_latents = value
+
+    def _load_clean_latents(self) -> None:
+        payload = load_payload(self.path)
+        validate_payload(payload, self.path)
+        self._clean_full_latents = flatten_latent_chunks(payload["latent_chunks"]).float().contiguous()
+
+    def release_clean_latents(self) -> None:
+        self._clean_full_latents = None
 
 
 @dataclass
@@ -327,7 +350,7 @@ class LatentWindowDataset(Dataset):
         self.samples: List[Tuple[int, int]] = []
 
         for seq_idx, sequence in enumerate(self.sequences):
-            total_latent_frames = sequence.clean_full_latents.shape[1]
+            total_latent_frames = sequence.metadata.total_latent_frames
             # section_start 从 1 开始，意味着首帧默认单独保留为 keyframe，
             # 后续所有帧都交给 recover 模块按窗口学习恢复。
             for start in build_recover_window_starts(
@@ -390,7 +413,7 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--max_steps", type=int, default=None)
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -1507,7 +1530,7 @@ def command_infer(args: argparse.Namespace) -> None:
         learned_tail_codec = load_learned_tail_codec(
             checkpoint_dir=checkpoint_dir,
             codec_config=codec_config,
-            latent_channels=int(prototype_sequence.clean_full_latents.shape[0]),
+            latent_channels=prototype_sequence.metadata.latent_channels,
             device=device,
         )
         assigned_latent_paths = latent_paths[distributed_context.rank :: distributed_context.world_size]
@@ -1960,7 +1983,7 @@ def calibrate_motion_thresholds(
     motion_values: List[float] = []
     for sequence in sequences:
         section_ranges = make_section_ranges(
-            total_latent_frames=int(sequence.clean_full_latents.shape[1]),
+            total_latent_frames=sequence.metadata.total_latent_frames,
             section_span_latents=int(codec_config.section_span_latents),
             start_index=1,
         )
@@ -1970,6 +1993,7 @@ def calibrate_motion_thresholds(
                 section_ranges=section_ranges,
             )
         )
+        sequence.release_clean_latents()
     if not motion_values:
         codec_config.motion_q20 = 0.0
         codec_config.motion_q80 = 0.0
@@ -2070,11 +2094,12 @@ def prepare_sequence(
     """
     payload = load_payload(path)
     validate_payload(payload, path)
-    clean_full_latents = flatten_latent_chunks(payload["latent_chunks"]).float().contiguous()
     chunk_lengths = [int(chunk.shape[1]) for chunk in payload["latent_chunks"]]
     chunk_frame_ranges = build_chunk_frame_ranges(
         [int((chunk.shape[1] - 1) * 4 + 1) for chunk in payload["latent_chunks"]]
     )
+    latent_channels = int(payload["latent_chunks"][0].shape[0])
+    total_latent_frames = sum(chunk_lengths)
     source_num_frames = infer_source_num_frames(payload["latent_chunks"], payload)
     source_width, source_height = resolve_source_resolution(payload, path)
     total_pixels = source_num_frames * source_width * source_height
@@ -2090,14 +2115,17 @@ def prepare_sequence(
         raw_bpp=raw_bpp,
         chunk_lengths=chunk_lengths,
         chunk_frame_ranges=chunk_frame_ranges,
+        total_latent_frames=total_latent_frames,
+        latent_channels=latent_channels,
     )
     sequence = PreparedSequence(
         path=path.resolve(),
         metadata=metadata,
-        clean_full_latents=clean_full_latents,
     )
     if not materialize_low_latents:
         return sequence
+    # 触发懒加载，后续 build_sequence_low_latents 需要用到
+    _ = sequence.clean_full_latents
 
     low_codec_payload, low_full_latents = build_sequence_low_latents(
         sequence=sequence,
@@ -2115,9 +2143,9 @@ def prepare_sequence(
 def infer_latent_channels(sequences: Sequence[PreparedSequence]) -> int:
     if not sequences:
         raise ValueError("Expected at least one sequence to infer latent channels.")
-    latent_channels = int(sequences[0].clean_full_latents.shape[0])
+    latent_channels = sequences[0].metadata.latent_channels
     for sequence in sequences[1:]:
-        current_channels = int(sequence.clean_full_latents.shape[0])
+        current_channels = sequence.metadata.latent_channels
         if current_channels != latent_channels:
             raise ValueError(
                 "All sequences must share the same latent channel count for a shared learned codec, "
@@ -2560,6 +2588,7 @@ def build_training_batch_tensors(
             dtype=torch.float32,
         )
         section_total_bpp_cache[seq_idx] = torch.tensor(section_bpp, device=device, dtype=torch.float32)
+        sequence.release_clean_latents()
 
     history_latents: List[torch.Tensor] = []
     target_latents: List[torch.Tensor] = []
