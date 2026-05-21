@@ -1,0 +1,159 @@
+{
+  "checkpoint_format_version": "helios_recover_v4",
+  "losses": [
+    1.6111533641815186,
+    1.0183699131011963,
+    0.8759918808937073,
+    0.8666704297065735
+  ],
+  "steps": 4,
+  "trainable_params": 14312427584,
+  "learned_codec_trainable_params": 0,
+  "world_size": 8,
+  "per_device_batch_size": 1,
+  "global_batch_size": 8,
+  "gradient_accumulation_steps": 1,
+  "effective_global_batch_size": 8,
+  "gradient_checkpointing": true,
+  "learning_rate": 2e-06,
+  "input_path": "/tmp/recover_smoke_latents_root_2",
+  "num_sequences": 2,
+  "loss_weighting_scheme": "logit_normal",
+  "logit_mean": 0.0,
+  "logit_std": 1.0,
+  "mode_scale": 1.29,
+  "loss_ema_decay": 0.95,
+  "num_inference_steps": 24,
+  "flow_loss_weight": 1.0,
+  "x_loss_weight": 0.25,
+  "noise_loss_weight": 0.25,
+  "temporal_delta_loss_weight": 0.1,
+  "aux_loss_warmup_steps": 500,
+  "aux_loss_ramp_steps": 1000,
+  "fix_anchor_during_denoise": true,
+  "soft_tail_hint_strength": 0.35,
+  "soft_tail_hint_step_fraction": 0.5,
+  "tail_codec_type": "trilinear",
+  "init_checkpoint_dir": "/data/heli/code/tele_Gen/reconstruct/experiments/recover_sparse_refresh_headsoft_tailp_section7_anchor1_steps24/checkpoints/epoch_0120_step_00002520",
+  "train_mixed_dual_tail_spatial_factor": null,
+  "train_mixed_dual_tail_ratio": 0.0,
+  "loss_definition": {
+    "optimized_loss": "flow_loss_weight * tail_position_weighted_mse(flow_pred, noise-latent) + aux_scale * (x_loss_weight * tail_position_weighted_normalized_mse(x_pred, latent) + noise_loss_weight * tail_position_weighted_normalized_mse(noise_pred, noise) + temporal_delta_loss_weight * tail_position_weighted_l1(delta(x_pred), delta(latent)))",
+    "raw_loss": "masked_mse(flow_pred, noise-latent)",
+    "x_prediction": "x_pred = x_t - sigma * flow_pred",
+    "noise_prediction": "noise_pred = x_t + (1 - sigma) * flow_pred"
+  },
+  "raw_losses": [
+    1.262082576751709,
+    0.8143035173416138,
+    0.6877778172492981,
+    0.6789789795875549
+  ],
+  "losses_ema": [
+    1.6111533641815186,
+    1.5815141916275024,
+    1.5462380760908125,
+    1.5122596937716006
+  ],
+  "flow_losses": [
+    1.6111533641815186,
+    1.0183699131011963,
+    0.8759918808937073,
+    0.8666704297065735
+  ],
+  "x_losses": [
+    59071040.0,
+    628863104.0,
+    661.3851928710938,
+    415149.90625
+  ],
+  "noise_losses": [
+    66860320.0,
+    805179456.0,
+    852.488037109375,
+    528639.75
+  ],
+  "temporal_delta_losses": [
+    1748.7843017578125,
+    4051.097900390625,
+    5.830577373504639,
+    108.71654510498047
+  ],
+  "aux_scales": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "sigma_means": [
+    0.5308822393417358,
+    0.41286152601242065,
+    0.5444216132164001,
+    0.5991605520248413
+  ],
+  "flow_target_rms": [
+    1.4772107601165771,
+    1.5014668703079224,
+    1.507416009902954,
+    1.3041150569915771
+  ],
+  "flow_pred_rms": [
+    1.5835355520248413,
+    1.5317524671554565,
+    1.5037617683410645,
+    1.3429557085037231
+  ],
+  "x_target_rms": [
+    1.0864207744598389,
+    1.1194674968719482,
+    1.1274265050888062,
+    0.9666910767555237
+  ],
+  "x_pred_rms": [
+    4269.6904296875,
+    9028.162109375,
+    14.32745361328125,
+    265.61798095703125
+  ],
+  "noise_target_rms": [
+    0.9999110698699951,
+    0.9997669458389282,
+    0.999642014503479,
+    0.8756800889968872
+  ],
+  "noise_pred_rms": [
+    4270.12158203125,
+    9028.3837890625,
+    14.596208572387695,
+    265.8698425292969
+  ],
+  "epoch_summaries": [
+    {
+      "epoch": 1,
+      "steps": 4,
+      "loss_mean": 1.093046396970749,
+      "raw_loss_mean": 0.860785722732544,
+      "flow_loss_mean": 1.093046396970749,
+      "x_loss_mean": 172087488.82286072,
+      "noise_loss_mean": 218142317.05950928,
+      "temporal_delta_loss_mean": 1478.6073311567307,
+      "aux_scale_mean": 0.0,
+      "loss_ema_last": 1.5122596937716006,
+      "sigma_mean": 0.5218314826488495,
+      "flow_target_rms_mean": 1.4475521743297577,
+      "flow_pred_rms_mean": 1.4905013740062714,
+      "x_target_rms_mean": 1.0750014632940292,
+      "x_pred_rms_mean": 3394.449493408203,
+      "noise_target_rms_mean": 0.9687500298023224,
+      "noise_pred_rms_mean": 3394.7428555488586
+    }
+  ],
+  "checkpoint_save_interval_epochs": 1,
+  "saved_checkpoints": [
+    {
+      "epoch": 1,
+      "global_step": 4,
+      "checkpoint_dir": "/data/heli/code/tele_Gen/reconstruct/experiments/recover_sparse_refresh_smoke_single_node_section7_anchor1_steps24/checkpoints/epoch_0001_step_00000004"
+    }
+  ]
+}

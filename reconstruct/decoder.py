@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,7 @@ LATENT_FORMAT_V2 = "helios_vae_latent_v2"
 COMPARE_MODE_CHOICES = ("off", "full", "sections", "both")
 PIL_RESAMPLING_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 ModelBundle = Tuple[AutoencoderKLWan, VideoProcessor, torch.Tensor, torch.Tensor]
+_LPIPS_MODEL_CACHE: Dict[Tuple[str, str], torch.nn.Module] = {}
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,9 @@ class CompareExportConfig:
     metrics_dir: Path
     compare_mode: str
     source_video_index: Dict[str, List[Path]]
+    compute_lpips: bool
+    lpips_model: str
+    lpips_batch_size: int
 
     @property
     def export_full(self) -> bool:
@@ -76,6 +81,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source_video_dir", type=Path, default=Path(DEFAULT_SOURCE_VIDEO_DIR))
     parser.add_argument("--compare_output_dir", type=Path, default=None)
     parser.add_argument("--compare_mode", type=str, default="both", choices=COMPARE_MODE_CHOICES)
+    parser.add_argument(
+        "--compute_lpips",
+        action="store_true",
+        help="Compute RGB LPIPS against source_video_dir and append it to metrics JSON.",
+    )
+    parser.add_argument("--lpips_model", type=str, default="alex", choices=["alex", "vgg", "squeeze"])
+    parser.add_argument("--lpips_batch_size", type=int, default=4)
     return parser.parse_args()
 
 
@@ -232,7 +244,11 @@ def build_source_video_index(source_video_dir: Path) -> Dict[str, List[Path]]:
 
 def build_compare_export_config(args: argparse.Namespace, root_dir: Path) -> Optional[CompareExportConfig]:
     if args.compare_mode == "off":
+        if args.compute_lpips:
+            print("[decoder] warning: --compute_lpips ignored because --compare_mode=off.")
         return None
+    if args.lpips_batch_size <= 0:
+        raise ValueError(f"--lpips_batch_size must be positive, got {args.lpips_batch_size}.")
     source_video_dir = args.source_video_dir.resolve()
     compare_output_dir = (args.compare_output_dir.resolve() if args.compare_output_dir else (root_dir / "duibi_Videos").resolve())
     metrics_dir = (root_dir / "metrics").resolve()
@@ -244,6 +260,9 @@ def build_compare_export_config(args: argparse.Namespace, root_dir: Path) -> Opt
         metrics_dir=metrics_dir,
         compare_mode=args.compare_mode,
         source_video_index=build_source_video_index(source_video_dir),
+        compute_lpips=bool(args.compute_lpips),
+        lpips_model=str(args.lpips_model),
+        lpips_batch_size=int(args.lpips_batch_size),
     )
 
 
@@ -321,6 +340,141 @@ def build_compare_frames(source_frames: np.ndarray, reconstructed_frames: np.nda
     return np.concatenate([source_frames, reconstructed_frames], axis=2)
 
 
+def prepare_aligned_metric_frames(source_frames: np.ndarray, reconstructed_frames: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    source_frames = to_uint8_frames(source_frames)
+    reconstructed_frames = to_uint8_frames(reconstructed_frames)
+    reconstructed_frames = resize_video_frames(
+        reconstructed_frames,
+        target_height=source_frames.shape[1],
+        target_width=source_frames.shape[2],
+    )
+    return source_frames, reconstructed_frames
+
+
+def compute_rgb_frame_metrics(source_frames: np.ndarray, reconstructed_frames: np.ndarray, batch_size: int = 16) -> Dict[str, float]:
+    if source_frames.shape != reconstructed_frames.shape:
+        raise ValueError(
+            f"RGB metric frame shape mismatch: source={source_frames.shape} recover={reconstructed_frames.shape}"
+        )
+    sum_squared_error = 0.0
+    sum_absolute_error = 0.0
+    total_values = 0
+    for start in range(0, source_frames.shape[0], batch_size):
+        source_batch = source_frames[start : start + batch_size].astype(np.float32) / 255.0
+        recover_batch = reconstructed_frames[start : start + batch_size].astype(np.float32) / 255.0
+        diff = recover_batch - source_batch
+        sum_squared_error += float(np.square(diff).sum())
+        sum_absolute_error += float(np.abs(diff).sum())
+        total_values += int(diff.size)
+    mse = sum_squared_error / float(total_values) if total_values > 0 else 0.0
+    l1 = sum_absolute_error / float(total_values) if total_values > 0 else 0.0
+    psnr = float("inf") if mse <= 0.0 else -10.0 * math.log10(mse)
+    return {
+        "mse": float(mse),
+        "l1": float(l1),
+        "psnr": float(psnr),
+        "rgb_psnr": float(psnr),
+    }
+
+
+def load_lpips_model(model_name: str, device: torch.device) -> torch.nn.Module:
+    cache_key = (str(device), model_name)
+    cached = _LPIPS_MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        import lpips
+    except ImportError as exc:
+        raise RuntimeError(
+            "LPIPS metric requested but the `lpips` package is not installed. "
+            "Install it in the teleai environment, for example: "
+            "/data/heli/miniconda3/envs/teleai/bin/pip install lpips==0.1.4"
+        ) from exc
+
+    model = lpips.LPIPS(net=model_name).to(device)
+    model.eval()
+    model.requires_grad_(False)
+    _LPIPS_MODEL_CACHE[cache_key] = model
+    return model
+
+
+def frames_to_lpips_tensor(frames: np.ndarray, device: torch.device) -> torch.Tensor:
+    frames_float = frames.astype(np.float32) / 127.5 - 1.0
+    tensor = torch.from_numpy(frames_float).permute(0, 3, 1, 2).contiguous()
+    return tensor.to(device=device, dtype=torch.float32)
+
+
+def compute_lpips_frame_metrics(
+    source_frames: np.ndarray,
+    reconstructed_frames: np.ndarray,
+    device: torch.device,
+    model_name: str,
+    batch_size: int,
+) -> Dict[str, object]:
+    if source_frames.shape != reconstructed_frames.shape:
+        raise ValueError(
+            f"LPIPS frame shape mismatch: source={source_frames.shape} recover={reconstructed_frames.shape}"
+        )
+    model = load_lpips_model(model_name=model_name, device=device)
+    per_frame_values: List[float] = []
+    with torch.inference_mode():
+        for start in range(0, source_frames.shape[0], batch_size):
+            source_tensor = frames_to_lpips_tensor(source_frames[start : start + batch_size], device=device)
+            recover_tensor = frames_to_lpips_tensor(reconstructed_frames[start : start + batch_size], device=device)
+            values = model(source_tensor, recover_tensor).flatten().detach().cpu().float().tolist()
+            per_frame_values.extend(float(value) for value in values)
+    mean_value = float(np.mean(per_frame_values)) if per_frame_values else None
+    return {
+        "lpips": mean_value,
+        "lpips_model": model_name,
+        "lpips_per_frame": per_frame_values,
+    }
+
+
+def update_decoded_metrics_json(
+    metrics_path: Path,
+    source_video_path: Path,
+    source_frames: np.ndarray,
+    reconstructed_frames: np.ndarray,
+    compare_config: CompareExportConfig,
+    device: torch.device,
+) -> None:
+    decoded_metrics: Dict[str, object] = {
+        "source_video_path": str(source_video_path),
+        "frame_count": int(source_frames.shape[0]),
+        **compute_rgb_frame_metrics(
+            source_frames=source_frames,
+            reconstructed_frames=reconstructed_frames,
+        ),
+    }
+    if compare_config.compute_lpips:
+        decoded_metrics.update(
+            compute_lpips_frame_metrics(
+                source_frames=source_frames,
+                reconstructed_frames=reconstructed_frames,
+                device=device,
+                model_name=compare_config.lpips_model,
+                batch_size=compare_config.lpips_batch_size,
+            )
+        )
+
+    metrics_payload: Dict[str, object] = {}
+    if metrics_path.exists():
+        with metrics_path.open("r", encoding="utf-8") as fp:
+            metrics_payload = json.load(fp)
+    metrics_payload["decoded_metrics"] = decoded_metrics
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with metrics_path.open("w", encoding="utf-8") as fp:
+        json.dump(metrics_payload, fp, indent=2)
+
+    lpips_text = decoded_metrics.get("lpips")
+    lpips_suffix = "" if lpips_text is None else f" lpips={float(lpips_text):.6f}"
+    print(
+        f"[decoder] updated_metrics={metrics_path} "
+        f"psnr={float(decoded_metrics['psnr']):.4f}{lpips_suffix}"
+    )
+
+
 def resolve_section_ranges(payload: Dict, latent_path: Path, metrics_path: Path) -> List[Tuple[int, int]]:
     recovery_metadata = payload.get("recovery_metadata") or {}
     section_ranges = recovery_metadata.get("section_ranges")
@@ -368,6 +522,7 @@ def export_compare_outputs(
     relative_path: Path,
     reconstructed_video: np.ndarray,
     compare_config: Optional[CompareExportConfig],
+    device: torch.device,
 ) -> None:
     if compare_config is None:
         return
@@ -389,7 +544,21 @@ def export_compare_outputs(
         latent_path=latent_path,
         source_video_path=source_video_path,
     )
-    compare_frames = build_compare_frames(source_frames, reconstructed_frames)
+    metrics_source_frames, metrics_reconstructed_frames = prepare_aligned_metric_frames(
+        source_frames=source_frames,
+        reconstructed_frames=reconstructed_frames,
+    )
+    metrics_path = compare_config.metrics_dir / relative_path.with_suffix(".json")
+    update_decoded_metrics_json(
+        metrics_path=metrics_path,
+        source_video_path=source_video_path,
+        source_frames=metrics_source_frames,
+        reconstructed_frames=metrics_reconstructed_frames,
+        compare_config=compare_config,
+        device=device,
+    )
+
+    compare_frames = np.concatenate([metrics_source_frames, metrics_reconstructed_frames], axis=2)
     compare_fps = float(payload["source_fps"])
 
     if compare_config.export_full:
@@ -404,7 +573,6 @@ def export_compare_outputs(
     if not compare_config.export_sections:
         return
 
-    metrics_path = compare_config.metrics_dir / relative_path.with_suffix(".json")
     section_ranges = resolve_section_ranges(payload=payload, latent_path=latent_path, metrics_path=metrics_path)
     if not section_ranges:
         return
@@ -496,6 +664,7 @@ def decode_payload_to_output_path(
         relative_path=relative_path,
         reconstructed_video=reconstructed_video,
         compare_config=compare_config,
+        device=device,
     )
 
     if device.type == "cuda":

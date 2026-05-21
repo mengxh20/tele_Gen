@@ -33,11 +33,19 @@ export RECOVER_INPUT_PATH="${RECOVER_INPUT_PATH:-${PROJECT_ROOT}/reconstruct/lat
 export RECOVER_OUTPUT_DIR="${RECOVER_OUTPUT_DIR:-${PROJECT_ROOT}/reconstruct/gen2recon_runs_CNN_3}"
 export HELIOS_BASE_MODEL_PATH="${HELIOS_BASE_MODEL_PATH:-/data/gemini/gemini-sharedata/platform/public/luojx/team/mengxh/MODELS/Helios-Base}"
 
-# NCCL knobs for multi-node stability/tuning.
+# NCCL knobs for multi-node stability/tuning. Leave NIC/HCA unset by default
+# so NCCL can choose the usable interface on each node. Override these envs
+# before launching only when the platform needs explicit routing.
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
-export NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_1}"
-export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
+export NCCL_IB_ADDR_FAMILY="${NCCL_IB_ADDR_FAMILY:-AF_INET}"
+export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-AF_INET}"
+export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-0}"
+export NCCL_CUMEM_HOST_ENABLE="${NCCL_CUMEM_HOST_ENABLE:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-1}"
 
 if [[ ! -f "${ACCELERATE_CONFIG_FILE}" ]]; then
     echo "[ERROR] Accelerate config not found: ${ACCELERATE_CONFIG_FILE}" >&2
@@ -64,6 +72,8 @@ mkdir -p "${RECOVER_OUTPUT_DIR}"
 
 echo "[INFO] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT} NNODES=${NNODES} NODE_RANK=${NODE_RANK} NPROC_PER_NODE=${NPROC_PER_NODE}" >&2
 echo "[INFO] INPUT=${RECOVER_INPUT_PATH} OUTPUT=${RECOVER_OUTPUT_DIR}" >&2
+echo "[INFO] NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-auto} NCCL_SOCKET_FAMILY=${NCCL_SOCKET_FAMILY} NCCL_IB_DISABLE=${NCCL_IB_DISABLE} NCCL_IB_HCA=${NCCL_IB_HCA:-auto} NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-auto} NCCL_IB_ADDR_FAMILY=${NCCL_IB_ADDR_FAMILY} NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE} NCCL_CUMEM_HOST_ENABLE=${NCCL_CUMEM_HOST_ENABLE} NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS}" >&2
+df -h /dev/shm >&2 || true
 
 accelerate launch \
     --config_file "${ACCELERATE_CONFIG_FILE}" \

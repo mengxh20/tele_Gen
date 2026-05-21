@@ -1,0 +1,236 @@
+{
+  "input_path": "/data/heli/code/tele_Gen/reconstruct/latents/videoSRC02_1280x720_30.pt",
+  "low_latent_path": "/data/heli/code/tele_Gen/reconstruct/experiments/recover_sparse_refresh_1w_x0int8_headsoft5_tailp4_from_ep120_section7_anchor1_steps24/recover_outputs_step2000_x0int8sf1_headsoft5_tailp4/low_latents/videoSRC02_1280x720_30.pt",
+  "recover_latent_path": "/data/heli/code/tele_Gen/reconstruct/experiments/recover_sparse_refresh_1w_x0int8_headsoft5_tailp4_from_ep120_section7_anchor1_steps24/recover_outputs_step2000_x0int8sf1_headsoft5_tailp4/recover_latents/videoSRC02_1280x720_30.pt",
+  "raw_file_bytes": 9586781,
+  "raw_bpp": 0.5547905671296296,
+  "low_codec_bytes": 101484,
+  "global_keyframe_bytes": 61504,
+  "single_head_bytes": 0,
+  "dual_head_bytes": 15744,
+  "dual_tail_presidual_bytes": 23424,
+  "metadata_bytes": 812,
+  "low_bpp": 0.005872916666666667,
+  "direct_low_metrics": {
+    "mse": 4.097285270690918,
+    "l1": 0.9855073094367981,
+    "psnr": -6.124962035227119
+  },
+  "restored_metrics": {
+    "mse": 0.41891300678253174,
+    "l1": 0.4962354302406311,
+    "psnr": 3.778761447020515
+  },
+  "low_tail_position_metrics": {
+    "position_0": {
+      "mse": 2.719679355621338,
+      "l1": 0.8518006205558777,
+      "psnr": -4.345177062586817,
+      "count": 6
+    },
+    "position_1": {
+      "mse": 10.532477378845215,
+      "l1": 1.4917460680007935,
+      "psnr": -10.225305354551594,
+      "count": 6
+    },
+    "position_2": {
+      "mse": 1.8211214542388916,
+      "l1": 0.8644959330558777,
+      "psnr": -2.603389131147838,
+      "count": 5
+    },
+    "position_3": {
+      "mse": 3.0208489894866943,
+      "l1": 1.0428413152694702,
+      "psnr": -4.801290171207886,
+      "count": 5
+    },
+    "position_4": {
+      "mse": 4.55325174331665,
+      "l1": 1.216306209564209,
+      "psnr": -6.583216634980755,
+      "count": 5
+    },
+    "position_5": {
+      "mse": 6.456716060638428,
+      "l1": 1.3865081071853638,
+      "psnr": -8.100116890438832,
+      "count": 5
+    }
+  },
+  "recover_tail_position_metrics": {
+    "position_0": {
+      "mse": 0.4400787651538849,
+      "l1": 0.5152127146720886,
+      "psnr": 3.5646957680363043,
+      "count": 6
+    },
+    "position_1": {
+      "mse": 0.4644187390804291,
+      "l1": 0.5277210474014282,
+      "psnr": 3.3309025564792174,
+      "count": 6
+    },
+    "position_2": {
+      "mse": 0.4486386179924011,
+      "l1": 0.5177457928657532,
+      "psnr": 3.4810333618836387,
+      "count": 5
+    },
+    "position_3": {
+      "mse": 0.43514180183410645,
+      "l1": 0.5110853314399719,
+      "psnr": 3.6136918428625315,
+      "count": 5
+    },
+    "position_4": {
+      "mse": 0.3760297894477844,
+      "l1": 0.4797426760196686,
+      "psnr": 4.247777369262686,
+      "count": 5
+    },
+    "position_5": {
+      "mse": 0.42137637734413147,
+      "l1": 0.5054463744163513,
+      "psnr": 3.753298045928134,
+      "count": 5
+    }
+  },
+  "tail_only_metrics": {
+    "mse": 0.43227869272232056,
+    "l1": 0.5102407336235046,
+    "psnr": 3.6423616052930585
+  },
+  "anchor_reconstruction_metrics": {
+    "mse": 0.41744667291641235,
+    "l1": 0.5038290023803711,
+    "psnr": 3.7939898555487197
+  },
+  "temporal_delta_l1": 0.5479942560195923,
+  "low_boundary_transition_l1": 1.4677132546901703,
+  "recover_boundary_transition_l1": 0.5858147144317627,
+  "section_boundary_delta_l1": 0.5858147144317627,
+  "boundary_transition_l1": 0.5858147144317627,
+  "max_temporal_backtrack_latents": 38,
+  "mean_temporal_backtrack_latents": 19.0,
+  "codec_config": {
+    "temporal_factor": 2,
+    "spatial_factor": 4,
+    "quant_dtype": "int8",
+    "keyframe_dtype": "float16",
+    "global_keyframe_codec_type": "int8_refresh_like",
+    "global_keyframe_quant_dtype": "int8",
+    "global_keyframe_spatial_factor": 1,
+    "section_span_latents": 7,
+    "anchor_span_latents": 1,
+    "tail_span_latents": 6,
+    "anchor_quant_dtype": "int8",
+    "anchor_spatial_factor": 1,
+    "dual_head_codec_type": "soft_pool",
+    "dual_head_anchor_spatial_factor": null,
+    "dual_head_p_delta_spatial_factor": 4,
+    "dual_head_soft_pool_spatial_factor": 5,
+    "adaptive_dual_head_full_ratio": 0.0,
+    "adaptive_dual_head_soft_pool_hard_factor": null,
+    "adaptive_dual_head_soft_pool_hard_ratio": 0.0,
+    "dual_tail_anchor_spatial_factor": null,
+    "dual_tail_codec_type": "p_delta",
+    "dual_tail_p_delta_spatial_factor": 4,
+    "tail_codec_type": "trilinear",
+    "learned_codec_hidden_channels": null,
+    "max_predict_only_gap_sections": 2,
+    "single_refresh_gain_threshold": 0.12,
+    "dual_refresh_gain_threshold": 0.18,
+    "boundary_jump_threshold": 0.18,
+    "cut_detection_threshold": 0.35,
+    "target_low_bpp": null
+  },
+  "checkpoint_dir": "/data/heli/code/tele_Gen/reconstruct/experiments/recover_sparse_refresh_1w_x0int8_headsoft5_tailp4_from_ep120_section7_anchor1_steps24/checkpoints/epoch_0001_step_00002000",
+  "num_inference_steps": 24,
+  "num_inference_steps_by_mode": {
+    "predict_only": 2,
+    "single_refresh": 8,
+    "dual_refresh": 12
+  },
+  "effective_inference_steps": 72,
+  "section_mode_counts": {
+    "predict_only": 0,
+    "single_refresh": 0,
+    "dual_refresh": 6
+  },
+  "mode_selection_strategy": "threshold",
+  "target_low_bpp": null,
+  "target_low_bytes": null,
+  "estimated_selected_bytes": null,
+  "estimated_fixed_bytes": null,
+  "latency_seconds": {
+    "total": 63.54673623805866,
+    "prepare_low_latents": 0.06937616784125566,
+    "reconstruct": 63.44083811389282,
+    "postprocess_io_and_metrics": 0.0364469806663692,
+    "first_keyframe_ready": 0.06937616784125566,
+    "first_non_keyframe_ready": 10.645853927824646
+  },
+  "prepare_timing_seconds": {
+    "total_seconds": 0.05139216408133507,
+    "load_metadata_and_flatten_seconds": 0.017869137227535248,
+    "materialize_low_latents_seconds": 0.05143159115687013,
+    "move_clean_latents_to_device_seconds": 9.88086685538292e-06,
+    "encode_low_latents_seconds": 0.03898929338902235,
+    "decode_low_latents_seconds": 0.012246450874954462,
+    "move_low_latents_to_cpu_seconds": 1.10650435090065e-05
+  },
+  "reconstruct_timing": {
+    "total_seconds": 63.44068941893056,
+    "first_section_ready_seconds": 10.57647775998339,
+    "history_window_seconds": 0.0029064035043120384,
+    "condition_build_seconds": 0.006533781532198191,
+    "stage1_prepare_inputs_seconds": 0.0036941193975508213,
+    "proxy_section_build_seconds": 0.0,
+    "stage1_denoise_seconds": 63.40896431962028,
+    "prefix_concat_seconds": 0.009906209539622068,
+    "assemble_output_seconds": 0.005371066275984049,
+    "section_count": 6,
+    "section_count_by_mode": {
+      "predict_only": 0,
+      "single_refresh": 0,
+      "dual_refresh": 6
+    },
+    "section_seconds_by_mode": {
+      "predict_only": 0.0,
+      "single_refresh": 0.0,
+      "dual_refresh": 63.433012353722006
+    },
+    "avg_section_seconds_by_mode": {
+      "predict_only": 0.0,
+      "single_refresh": 0.0,
+      "dual_refresh": 10.572168725620335
+    },
+    "stage1_denoise_submodule_seconds": {
+      "total_seconds": 63.40431636897847,
+      "random_init_and_scheduler_setup_seconds": 0.0060703638009727,
+      "anchor_overwrite_seconds": 0.00800601253286004,
+      "latent_to_weight_dtype_seconds": 0.0013004802167415619,
+      "soft_tail_blend_seconds": 0.008774973452091217,
+      "transformer_forward_seconds": 63.24785298388451,
+      "scheduler_step_seconds": 0.08864774508401752,
+      "finalize_seconds": 0.0030117491260170937,
+      "num_steps": 72
+    }
+  },
+  "postprocess_timing_seconds": {
+    "resolve_output_paths_seconds": 0.0005649668164551258,
+    "build_and_save_low_latents_seconds": 0.003580467775464058,
+    "build_and_save_recover_latents_seconds": 0.014479756820946932,
+    "compute_metrics_seconds": 0.014529748819768429,
+    "write_metrics_json_seconds": 0.002639091107994318,
+    "total_seconds": 0.0364469806663692
+  },
+  "gpu_peak_memory": {
+    "max_memory_allocated_bytes": 31804558848,
+    "max_memory_reserved_bytes": 32849788928
+  },
+  "source_duration_seconds": 5.0,
+  "realtime_factor": 12.709347247611731
+}

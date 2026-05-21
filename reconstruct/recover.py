@@ -22,6 +22,7 @@ import shutil
 import sys
 import time
 import types
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import timedelta
@@ -40,6 +41,8 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 
 from reconstruct.codec_gop import (
     DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO,
+    DEFAULT_SINGLE_HEAD_CODEC_TYPE,
+    DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR,
     DEFAULT_DUAL_HEAD_CODEC_TYPE,
     DEFAULT_BOUNDARY_JUMP_THRESHOLD,
     DEFAULT_CUT_DETECTION_THRESHOLD,
@@ -47,6 +50,8 @@ from reconstruct.codec_gop import (
     DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR,
     DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR,
     DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+    DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR,
+    DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO,
     DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS,
     DEFAULT_SINGLE_REFRESH_GAIN_THRESHOLD,
     DUAL_HEAD_ANCHOR_CODEC_TYPE,
@@ -60,6 +65,8 @@ from reconstruct.codec_gop import (
     INT8_REFRESH_LIKE_GLOBAL_KEYFRAME_CODEC_TYPE,
     PREDICT_ONLY_SECTION_MODE,
     RAW_GLOBAL_KEYFRAME_CODEC_TYPE,
+    SINGLE_HEAD_ANCHOR_CODEC_TYPE,
+    SINGLE_HEAD_SOFT_POOL_CODEC_TYPE,
     SINGLE_REFRESH_SECTION_MODE,
     TRILINEAR_TAIL_CODEC_TYPE,
     decode_low_latents_payload,
@@ -110,11 +117,15 @@ DEFAULT_ANCHOR_SPAN_LATENTS = 1
 DEFAULT_TAIL_SPAN_LATENTS = DEFAULT_SECTION_SPAN_LATENTS - DEFAULT_ANCHOR_SPAN_LATENTS
 DEFAULT_ANCHOR_QUANT_DTYPE = "int8"
 DEFAULT_ANCHOR_SPATIAL_FACTOR = 1
+DEFAULT_SINGLE_HEAD_CODEC_TYPE = DEFAULT_SINGLE_HEAD_CODEC_TYPE
+DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR = DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR
 DEFAULT_DUAL_HEAD_CODEC_TYPE = DEFAULT_DUAL_HEAD_CODEC_TYPE
 DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR: Optional[int] = DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR
 DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR = DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR
 DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR = DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR
 DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO = DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO
+DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR = DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR
+DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO = DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO
 DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR: Optional[int] = None
 DEFAULT_TAIL_CODEC_TYPE = TRILINEAR_TAIL_CODEC_TYPE
 DEFAULT_MAX_PREDICT_ONLY_GAP = DEFAULT_MAX_PREDICT_ONLY_GAP_SECTIONS
@@ -136,6 +147,9 @@ DEFAULT_X_LOSS_WEIGHT = 0.25
 DEFAULT_NOISE_LOSS_WEIGHT = 0.25
 DEFAULT_AUX_LOSS_WARMUP_STEPS = 500
 DEFAULT_AUX_LOSS_RAMP_STEPS = 1000
+DEFAULT_AUX_LOSS_CLIP_VALUE: Optional[float] = None
+DEFAULT_AUX_LOSS_SIGMA_MIN: Optional[float] = None
+DEFAULT_AUX_LOSS_SIGMA_MAX: Optional[float] = None
 DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT = 0.1
 DEFAULT_FIX_ANCHOR_DURING_DENOISE = True
 DEFAULT_SOFT_TAIL_HINT_STRENGTH = 0.35
@@ -180,11 +194,15 @@ class CodecConfig:
     tail_span_latents: int = DEFAULT_TAIL_SPAN_LATENTS
     anchor_quant_dtype: str = DEFAULT_ANCHOR_QUANT_DTYPE
     anchor_spatial_factor: int = DEFAULT_ANCHOR_SPATIAL_FACTOR
+    single_head_codec_type: str = DEFAULT_SINGLE_HEAD_CODEC_TYPE
+    single_head_soft_pool_spatial_factor: int = DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR
     dual_head_codec_type: str = DEFAULT_DUAL_HEAD_CODEC_TYPE
     dual_head_anchor_spatial_factor: Optional[int] = DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR
     dual_head_p_delta_spatial_factor: int = DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR
     dual_head_soft_pool_spatial_factor: int = DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR
     adaptive_dual_head_full_ratio: float = DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO
+    adaptive_dual_head_soft_pool_hard_factor: Optional[int] = DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR
+    adaptive_dual_head_soft_pool_hard_ratio: float = DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO
     dual_tail_anchor_spatial_factor: Optional[int] = DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR
     dual_tail_codec_type: str = DEFAULT_DUAL_TAIL_CODEC_TYPE
     dual_tail_p_delta_spatial_factor: int = DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR
@@ -232,6 +250,16 @@ class PreparedSequence:
     clean_full_latents: torch.Tensor
     low_codec_payload: Optional[Dict[str, object]] = None
     low_full_latents: Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True)
+class LatentSequenceIndexEntry:
+    """训练数据索引中的轻量条目，不持有 latent tensor。"""
+
+    path: Path
+    metadata: SequenceMetadata
+    latent_channels: int
+    total_latent_frames: int
 
 
 @dataclass(frozen=True)
@@ -317,7 +345,7 @@ class LatentWindowDataset(Dataset):
 
     def __init__(
         self,
-        sequences: Sequence[PreparedSequence],
+        sequences: Sequence[LatentSequenceIndexEntry],
         history_sizes: Sequence[int],
         latent_window_size: int,
         anchor_span_latents: int,
@@ -330,7 +358,7 @@ class LatentWindowDataset(Dataset):
         self.samples: List[Tuple[int, int]] = []
 
         for seq_idx, sequence in enumerate(self.sequences):
-            total_latent_frames = sequence.clean_full_latents.shape[1]
+            total_latent_frames = sequence.total_latent_frames
             # section_start 从 1 开始，意味着首帧默认单独保留为 keyframe，
             # 后续所有帧都交给 recover 模块按窗口学习恢复。
             for start in range(1, total_latent_frames, latent_window_size):
@@ -345,6 +373,51 @@ class LatentWindowDataset(Dataset):
             "seq_idx": seq_idx,
             "section_start": section_start,
         }
+
+
+class LazyPreparedSequenceStore:
+    """按需加载训练 latent，并用小 LRU 缓存限制 CPU 常驻内存。
+
+    旧训练流程会在每个 rank 启动时把所有 `.pt` 全部 `torch.load` 到 CPU；
+    多卡时这份数据会按 rank 数重复，容易把宿主机内存顶满。这个 store 只在
+    当前 batch 真正用到某个 `seq_idx` 时加载对应文件。
+    """
+
+    def __init__(
+        self,
+        entries: Sequence[LatentSequenceIndexEntry],
+        codec_config: CodecConfig,
+        cache_size: int,
+    ):
+        self.entries = list(entries)
+        self.codec_config = codec_config
+        self.cache_size = max(0, int(cache_size))
+        self._cache: "OrderedDict[int, PreparedSequence]" = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, seq_idx: int) -> PreparedSequence:
+        seq_idx = int(seq_idx)
+        if seq_idx in self._cache:
+            sequence = self._cache.pop(seq_idx)
+            self._cache[seq_idx] = sequence
+            return sequence
+
+        sequence = prepare_sequence(
+            self.entries[seq_idx].path,
+            self.codec_config,
+            learned_tail_codec=None,
+            materialize_low_latents=False,
+        )
+        if self.cache_size > 0:
+            self._cache[seq_idx] = sequence
+            while len(self._cache) > self.cache_size:
+                self._cache.popitem(last=False)
+        return sequence
+
+    def clear(self) -> None:
+        self._cache.clear()
 
 
 def parse_args() -> argparse.Namespace:
@@ -382,7 +455,22 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument(
+        "--checkpoint_every_steps",
+        type=int,
+        default=None,
+        help="Save a periodic checkpoint every N optimizer steps. Disabled when unset.",
+    )
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument(
+        "--lazy_sequence_cache_size",
+        type=int,
+        default=2,
+        help=(
+            "Number of fully loaded latent sequences kept per rank during training. "
+            "Use 0 to disable the CPU cache; low values avoid loading the whole dataset into RAM."
+        ),
+    )
     parser.add_argument("--learning_rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -424,6 +512,19 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--anchor_quant_dtype", type=str, default=DEFAULT_ANCHOR_QUANT_DTYPE, choices=["int8"])
     parser.add_argument("--anchor_spatial_factor", type=int, default=DEFAULT_ANCHOR_SPATIAL_FACTOR)
     parser.add_argument(
+        "--single_head_codec_type",
+        type=str,
+        default=DEFAULT_SINGLE_HEAD_CODEC_TYPE,
+        choices=[SINGLE_HEAD_ANCHOR_CODEC_TYPE, SINGLE_HEAD_SOFT_POOL_CODEC_TYPE],
+        help="Codec used for the head condition in single-refresh sections.",
+    )
+    parser.add_argument(
+        "--single_head_soft_pool_spatial_factor",
+        type=int,
+        default=DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+        help="Spatial downsample factor for soft pooled head payloads in single-refresh sections.",
+    )
+    parser.add_argument(
         "--dual_head_codec_type",
         type=str,
         default=DEFAULT_DUAL_HEAD_CODEC_TYPE,
@@ -453,6 +554,18 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO,
         help="Fraction of dual-refresh sections that keep full-resolution head anchors instead of the cheap dual-head variant.",
+    )
+    parser.add_argument(
+        "--adaptive_dual_head_soft_pool_hard_factor",
+        type=int,
+        default=DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR,
+        help="Optional stronger soft-pool factor for the hardest dual-refresh head hints.",
+    )
+    parser.add_argument(
+        "--adaptive_dual_head_soft_pool_hard_ratio",
+        type=float,
+        default=DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO,
+        help="Fraction of dual-refresh sections that use the stronger soft-pool head factor.",
     )
     parser.add_argument(
         "--dual_tail_anchor_spatial_factor",
@@ -535,6 +648,24 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--aux_loss_warmup_steps", type=int, default=DEFAULT_AUX_LOSS_WARMUP_STEPS)
     parser.add_argument("--aux_loss_ramp_steps", type=int, default=DEFAULT_AUX_LOSS_RAMP_STEPS)
     parser.add_argument(
+        "--aux_loss_clip_value",
+        type=float,
+        default=DEFAULT_AUX_LOSS_CLIP_VALUE,
+        help="Optional max value for each auxiliary loss term before it enters optimization.",
+    )
+    parser.add_argument(
+        "--aux_loss_sigma_min",
+        type=float,
+        default=DEFAULT_AUX_LOSS_SIGMA_MIN,
+        help="Only apply auxiliary losses when sampled sigma is at least this value.",
+    )
+    parser.add_argument(
+        "--aux_loss_sigma_max",
+        type=float,
+        default=DEFAULT_AUX_LOSS_SIGMA_MAX,
+        help="Only apply auxiliary losses when sampled sigma is at most this value.",
+    )
+    parser.add_argument(
         "--fix_anchor_during_denoise",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_FIX_ANCHOR_DURING_DENOISE,
@@ -599,6 +730,19 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         help="Spatial downsample factor used when encoding the global keyframe payload.",
     )
     parser.add_argument(
+        "--single_head_codec_type",
+        type=str,
+        default=DEFAULT_SINGLE_HEAD_CODEC_TYPE,
+        choices=[SINGLE_HEAD_ANCHOR_CODEC_TYPE, SINGLE_HEAD_SOFT_POOL_CODEC_TYPE],
+        help="Codec used for the head condition in single-refresh sections.",
+    )
+    parser.add_argument(
+        "--single_head_soft_pool_spatial_factor",
+        type=int,
+        default=DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+        help="Spatial downsample factor for soft pooled head payloads in single-refresh sections.",
+    )
+    parser.add_argument(
         "--dual_head_codec_type",
         type=str,
         default=DEFAULT_DUAL_HEAD_CODEC_TYPE,
@@ -630,6 +774,18 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         help="Fraction of dual-refresh sections that keep full-resolution head anchors instead of the cheap dual-head variant.",
     )
     parser.add_argument(
+        "--adaptive_dual_head_soft_pool_hard_factor",
+        type=int,
+        default=DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR,
+        help="Optional stronger soft-pool factor for the hardest dual-refresh head hints.",
+    )
+    parser.add_argument(
+        "--adaptive_dual_head_soft_pool_hard_ratio",
+        type=float,
+        default=DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO,
+        help="Fraction of dual-refresh sections that use the stronger soft-pool head factor.",
+    )
+    parser.add_argument(
         "--dual_tail_anchor_spatial_factor",
         type=int,
         default=DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR,
@@ -654,6 +810,11 @@ def add_common_infer_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_TARGET_LOW_BPP,
         help="Optional low-bpp target used by budget-driven sparse refresh allocation.",
     )
+    parser.add_argument("--max_predict_only_gap_sections", type=int, default=DEFAULT_MAX_PREDICT_ONLY_GAP)
+    parser.add_argument("--single_refresh_gain_threshold", type=float, default=DEFAULT_SINGLE_REFRESH_GAIN)
+    parser.add_argument("--dual_refresh_gain_threshold", type=float, default=DEFAULT_DUAL_REFRESH_GAIN)
+    parser.add_argument("--boundary_jump_threshold", type=float, default=DEFAULT_BOUNDARY_JUMP)
+    parser.add_argument("--cut_detection_threshold", type=float, default=DEFAULT_CUT_DETECTION)
     parser.add_argument(
         "--predict_only_steps",
         type=int,
@@ -813,8 +974,30 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError(f"aux_loss_warmup_steps must be >= 0, got {args.aux_loss_warmup_steps}.")
     if args.aux_loss_ramp_steps < 0:
         raise ValueError(f"aux_loss_ramp_steps must be >= 0, got {args.aux_loss_ramp_steps}.")
+    if args.aux_loss_clip_value is not None and args.aux_loss_clip_value <= 0.0:
+        raise ValueError(f"aux_loss_clip_value must be > 0 when set, got {args.aux_loss_clip_value}.")
+    if args.aux_loss_sigma_min is not None and not 0.0 <= args.aux_loss_sigma_min <= 1.0:
+        raise ValueError(f"aux_loss_sigma_min must be in [0, 1], got {args.aux_loss_sigma_min}.")
+    if args.aux_loss_sigma_max is not None and not 0.0 <= args.aux_loss_sigma_max <= 1.0:
+        raise ValueError(f"aux_loss_sigma_max must be in [0, 1], got {args.aux_loss_sigma_max}.")
+    if (
+        args.aux_loss_sigma_min is not None
+        and args.aux_loss_sigma_max is not None
+        and args.aux_loss_sigma_min > args.aux_loss_sigma_max
+    ):
+        raise ValueError(
+            "aux_loss_sigma_min must be <= aux_loss_sigma_max, "
+            f"got {args.aux_loss_sigma_min} > {args.aux_loss_sigma_max}."
+        )
     if args.num_inference_steps <= 0:
         raise ValueError(f"num_inference_steps must be > 0, got {args.num_inference_steps}.")
+    if args.checkpoint_every_steps is not None and int(args.checkpoint_every_steps) <= 0:
+        raise ValueError(f"checkpoint_every_steps must be > 0 when set, got {args.checkpoint_every_steps}.")
+    if int(getattr(args, "lazy_sequence_cache_size", 2)) < 0:
+        raise ValueError(
+            "lazy_sequence_cache_size must be >= 0, "
+            f"got {getattr(args, 'lazy_sequence_cache_size')}."
+        )
     target_low_bpp = getattr(args, "target_low_bpp", DEFAULT_TARGET_LOW_BPP)
     if target_low_bpp is not None and float(target_low_bpp) <= 0.0:
         raise ValueError(f"target_low_bpp must be > 0, got {target_low_bpp}.")
@@ -878,6 +1061,31 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "adaptive_dual_head_full_ratio must be in [0, 1], "
             f"got {adaptive_dual_head_full_ratio}."
+        )
+    adaptive_dual_head_soft_pool_hard_factor = getattr(
+        args,
+        "adaptive_dual_head_soft_pool_hard_factor",
+        DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR,
+    )
+    if (
+        adaptive_dual_head_soft_pool_hard_factor is not None
+        and int(adaptive_dual_head_soft_pool_hard_factor) < 1
+    ):
+        raise ValueError(
+            "adaptive_dual_head_soft_pool_hard_factor must be >= 1 when set, "
+            f"got {adaptive_dual_head_soft_pool_hard_factor}."
+        )
+    adaptive_dual_head_soft_pool_hard_ratio = float(
+        getattr(
+            args,
+            "adaptive_dual_head_soft_pool_hard_ratio",
+            DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO,
+        )
+    )
+    if not 0.0 <= adaptive_dual_head_soft_pool_hard_ratio <= 1.0:
+        raise ValueError(
+            "adaptive_dual_head_soft_pool_hard_ratio must be in [0, 1], "
+            f"got {adaptive_dual_head_soft_pool_hard_ratio}."
         )
     if dual_tail_anchor_spatial_factor is not None and int(dual_tail_anchor_spatial_factor) < 1:
         raise ValueError(
@@ -1027,7 +1235,49 @@ def create_train_accelerator(weight_dtype: str, gradient_accumulation_steps: int
     )
 
 
-def init_offline_wandb_run(
+def build_train_logging_config(
+    output_dir: Path,
+    args: argparse.Namespace,
+    codec_config: CodecConfig,
+    history_sizes: Sequence[int],
+    latent_window_size: int,
+    checkpoint_save_interval_epochs: int,
+) -> Dict[str, object]:
+    return {
+        "input_path": str(args.input_path.resolve()),
+        "output_dir": str(output_dir),
+        "base_model_path": args.base_model_path,
+        "epochs": args.epochs,
+        "max_steps": args.max_steps,
+        "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "max_grad_norm": args.max_grad_norm,
+        "weight_dtype": args.weight_dtype,
+        "history_sizes": list(history_sizes),
+        "latent_window_size": latent_window_size,
+        "codec_config": asdict(codec_config),
+        "checkpoint_save_interval_epochs": checkpoint_save_interval_epochs,
+        "flow_loss_weight": args.flow_loss_weight,
+        "x_loss_weight": args.x_loss_weight,
+        "noise_loss_weight": args.noise_loss_weight,
+        "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
+        "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
+        "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
+        "aux_loss_clip_value": args.aux_loss_clip_value,
+        "aux_loss_sigma_min": args.aux_loss_sigma_min,
+        "aux_loss_sigma_max": args.aux_loss_sigma_max,
+        "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
+        "soft_tail_hint_strength": args.soft_tail_hint_strength,
+        "soft_tail_hint_step_fraction": args.soft_tail_hint_step_fraction,
+        "init_checkpoint_dir": None if args.init_checkpoint_dir is None else str(args.init_checkpoint_dir.resolve()),
+        "train_mixed_dual_tail_spatial_factor": args.train_mixed_dual_tail_spatial_factor,
+        "train_mixed_dual_tail_ratio": args.train_mixed_dual_tail_ratio,
+    }
+
+
+def init_tensorboard_writer(
     output_dir: Path,
     args: argparse.Namespace,
     codec_config: CodecConfig,
@@ -1035,54 +1285,34 @@ def init_offline_wandb_run(
     latent_window_size: int,
     checkpoint_save_interval_epochs: int,
 ):
-    """初始化离线 wandb run。
-
-    这里不依赖在线服务，主要作用是把训练损失、sigma、RMS 等指标持久化，
-    方便后续分析恢复质量与训练稳定性。
-    """
+    """初始化 TensorBoard writer，把训练曲线写到 output_dir/tensorboard。"""
     try:
-        import wandb
+        from torch.utils.tensorboard import SummaryWriter
     except ImportError as exc:
-        raise ImportError("Recover training requires wandb for offline loss logging.") from exc
+        raise ImportError("Recover training requires tensorboard for TensorBoard loss logging.") from exc
 
-    os.environ.setdefault("WANDB_MODE", "offline")
-    return wandb.init(
-        project="helios-recover",
-        job_type="train",
-        name=output_dir.name,
-        mode="offline",
-        dir=str(output_dir),
-        config={
-            "input_path": str(args.input_path.resolve()),
-            "output_dir": str(output_dir),
-            "base_model_path": args.base_model_path,
-            "epochs": args.epochs,
-            "max_steps": args.max_steps,
-            "batch_size": args.batch_size,
-            "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "learning_rate": args.learning_rate,
-            "weight_decay": args.weight_decay,
-            "max_grad_norm": args.max_grad_norm,
-            "weight_dtype": args.weight_dtype,
-            "history_sizes": list(history_sizes),
-            "latent_window_size": latent_window_size,
-            "codec_config": asdict(codec_config),
-            "checkpoint_save_interval_epochs": checkpoint_save_interval_epochs,
-            "flow_loss_weight": args.flow_loss_weight,
-            "x_loss_weight": args.x_loss_weight,
-            "noise_loss_weight": args.noise_loss_weight,
-            "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
-            "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
-            "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
-            "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
-            "soft_tail_hint_strength": args.soft_tail_hint_strength,
-            "soft_tail_hint_step_fraction": args.soft_tail_hint_step_fraction,
-            "init_checkpoint_dir": None if args.init_checkpoint_dir is None else str(args.init_checkpoint_dir.resolve()),
-            "train_mixed_dual_tail_spatial_factor": args.train_mixed_dual_tail_spatial_factor,
-            "train_mixed_dual_tail_ratio": args.train_mixed_dual_tail_ratio,
-        },
-        reinit=True,
+    log_dir = output_dir / "tensorboard"
+    writer = SummaryWriter(log_dir=str(log_dir))
+    config = build_train_logging_config(
+        output_dir=output_dir,
+        args=args,
+        codec_config=codec_config,
+        history_sizes=history_sizes,
+        latent_window_size=latent_window_size,
+        checkpoint_save_interval_epochs=checkpoint_save_interval_epochs,
     )
+    writer.add_text("config/json", json.dumps(config, indent=2, ensure_ascii=False), global_step=0)
+    return writer
+
+
+def log_tensorboard_scalars(writer, scalars: Dict[str, object], step: int) -> None:
+    if writer is None:
+        return
+    for key, value in scalars.items():
+        if isinstance(value, bool):
+            writer.add_scalar(key, int(value), step)
+        elif isinstance(value, (int, float)):
+            writer.add_scalar(key, value, step)
 
 
 def build_periodic_checkpoint_dir(output_dir: Path, epoch: int, global_step: int) -> Path:
@@ -1161,24 +1391,21 @@ def command_train(args: argparse.Namespace) -> None:
         checkpoint_path=None if init_checkpoint_config is None else init_checkpoint_config.get("base_model_path"),
         latent_paths=latent_paths,
     )
-    # 联合优化时训练阶段不预先固化 low latents，而是保留 clean latents，后续在线压缩并反传。
-    prepared_sequences = [
-        prepare_sequence(
-            path,
-            codec_config,
-            learned_tail_codec=None,
-            materialize_low_latents=False,
-        )
-        for path in latent_paths
-    ]
+    # 只建立窗口索引，不把所有 latent tensor 常驻 CPU 内存。
+    sequence_entries = build_sequence_index(latent_paths)
     dataset = LatentWindowDataset(
-        sequences=prepared_sequences,
+        sequences=sequence_entries,
         history_sizes=history_sizes,
         latent_window_size=latent_window_size,
         anchor_span_latents=codec_config.anchor_span_latents,
     )
     if len(dataset) == 0:
         raise RuntimeError("No training windows were built from the provided latent files.")
+    sequence_store = LazyPreparedSequenceStore(
+        entries=sequence_entries,
+        codec_config=codec_config,
+        cache_size=args.lazy_sequence_cache_size,
+    )
 
     dataloader = DataLoader(
         dataset,
@@ -1204,13 +1431,13 @@ def command_train(args: argparse.Namespace) -> None:
         learned_tail_codec = load_learned_tail_codec(
             checkpoint_dir=init_checkpoint_dir,
             codec_config=codec_config,
-            latent_channels=infer_latent_channels(prepared_sequences),
+            latent_channels=infer_latent_channels(sequence_entries),
             device=device,
         )
         if learned_tail_codec is None:
             learned_tail_codec = build_learned_tail_codec(
                 codec_config=asdict(codec_config),
-                in_channels=infer_latent_channels(prepared_sequences),
+                in_channels=infer_latent_channels(sequence_entries),
             ).to(device)
         learned_tail_codec.train()
         learned_codec_trainable_params = count_trainable_parameters(learned_tail_codec)
@@ -1250,12 +1477,15 @@ def command_train(args: argparse.Namespace) -> None:
             f"[train] input_root={input_root} files={len(latent_paths)} windows={len(dataset)} "
             f"device={device} world_size={accelerator.num_processes} "
             f"effective_global_batch_size={args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps} "
+            f"lazy_sequence_cache_size={args.lazy_sequence_cache_size} "
             f"tail_codec_type={codec_config.tail_codec_type} "
             f"init_checkpoint_dir={init_checkpoint_dir} "
             f"save_every_epochs={checkpoint_save_interval_epochs} "
+            f"checkpoint_every_steps={args.checkpoint_every_steps} "
             f"loss_weighting_scheme={args.loss_weighting_scheme} "
             f"flow/x/noise/delta=({args.flow_loss_weight:.3f}/{args.x_loss_weight:.3f}/{args.noise_loss_weight:.3f}/{args.temporal_delta_loss_weight:.3f}) "
             f"aux_warmup={args.aux_loss_warmup_steps} aux_ramp={args.aux_loss_ramp_steps} "
+            f"aux_clip={args.aux_loss_clip_value} aux_sigma=({args.aux_loss_sigma_min}, {args.aux_loss_sigma_max}) "
             f"mixed_dual_tail=({args.train_mixed_dual_tail_spatial_factor}, ratio={args.train_mixed_dual_tail_ratio:.3f}) "
             f"soft_tail_hint=(strength={args.soft_tail_hint_strength:.3f}, "
             f"step_fraction={args.soft_tail_hint_step_fraction:.3f})"
@@ -1276,7 +1506,8 @@ def command_train(args: argparse.Namespace) -> None:
         "gradient_checkpointing": args.gradient_checkpointing,
         "learning_rate": args.learning_rate,
         "input_path": str(args.input_path.resolve()),
-        "num_sequences": len(prepared_sequences),
+        "num_sequences": len(sequence_entries),
+        "lazy_sequence_cache_size": args.lazy_sequence_cache_size,
         "loss_weighting_scheme": args.loss_weighting_scheme,
         "logit_mean": args.logit_mean,
         "logit_std": args.logit_std,
@@ -1289,6 +1520,9 @@ def command_train(args: argparse.Namespace) -> None:
         "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
         "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
         "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
+        "aux_loss_clip_value": args.aux_loss_clip_value,
+        "aux_loss_sigma_min": args.aux_loss_sigma_min,
+        "aux_loss_sigma_max": args.aux_loss_sigma_max,
         "fix_anchor_during_denoise": args.fix_anchor_during_denoise,
         "soft_tail_hint_strength": args.soft_tail_hint_strength,
         "soft_tail_hint_step_fraction": args.soft_tail_hint_step_fraction,
@@ -1323,15 +1557,16 @@ def command_train(args: argparse.Namespace) -> None:
         "noise_pred_rms": [],
         "epoch_summaries": [],
         "checkpoint_save_interval_epochs": checkpoint_save_interval_epochs,
+        "checkpoint_every_steps": args.checkpoint_every_steps,
         "saved_checkpoints": [],
     }
 
     # 训练日志既保留逐 step 记录，也保留逐 epoch 汇总，方便看短期波动和长期趋势。
     progress = None
-    wandb_run = None
+    tb_writer = None
     try:
         if accelerator.is_main_process:
-            wandb_run = init_offline_wandb_run(
+            tb_writer = init_tensorboard_writer(
                 output_dir=output_dir,
                 args=args,
                 codec_config=codec_config,
@@ -1339,6 +1574,7 @@ def command_train(args: argparse.Namespace) -> None:
                 latent_window_size=latent_window_size,
                 checkpoint_save_interval_epochs=checkpoint_save_interval_epochs,
             )
+            print(f"[train] tensorboard_log_dir={output_dir / 'tensorboard'}")
 
         if args.max_steps is not None and accelerator.is_main_process:
             progress = tqdm(total=args.max_steps, desc="Training")
@@ -1348,6 +1584,7 @@ def command_train(args: argparse.Namespace) -> None:
         running_metrics: Dict[str, torch.Tensor] = {}
         running_micro_steps = 0
         loss_ema_value: Optional[float] = None
+        last_checkpoint_step: Optional[int] = None
         for epoch in range(args.epochs):
             # epoch 内先累计，再在真正 sync gradients 后统一做 reduce 和日志记录，
             # 这样与梯度累积的语义保持一致。
@@ -1377,7 +1614,7 @@ def command_train(args: argparse.Namespace) -> None:
                 with accelerator.accumulate(transformer):
                     step_output = training_step(
                         batch=batch,
-                        sequences=prepared_sequences,
+                        sequences=sequence_store,
                         codec_config=codec_config,
                         transformer=transformer,
                         learned_tail_codec=learned_tail_codec,
@@ -1397,6 +1634,9 @@ def command_train(args: argparse.Namespace) -> None:
                         temporal_delta_loss_weight=args.temporal_delta_loss_weight,
                         aux_loss_warmup_steps=args.aux_loss_warmup_steps,
                         aux_loss_ramp_steps=args.aux_loss_ramp_steps,
+                        aux_loss_clip_value=args.aux_loss_clip_value,
+                        aux_loss_sigma_min=args.aux_loss_sigma_min,
+                        aux_loss_sigma_max=args.aux_loss_sigma_max,
                         soft_tail_hint_strength=args.soft_tail_hint_strength,
                         train_mixed_dual_tail_spatial_factor=args.train_mixed_dual_tail_spatial_factor,
                         train_mixed_dual_tail_ratio=args.train_mixed_dual_tail_ratio,
@@ -1503,35 +1743,90 @@ def command_train(args: argparse.Namespace) -> None:
                         )
                     if progress is not None:
                         progress.update(1)
-                    if wandb_run is not None:
-                        wandb_run.log(
-                            {
-                                "train/loss": loss_value,
-                                "train/raw_loss": raw_loss_value,
-                                "train/flow_loss": flow_loss_value,
-                                "train/x_loss": x_loss_value,
-                                "train/noise_loss": noise_loss_value,
-                                "train/temporal_delta_loss": temporal_delta_loss_value,
-                                "train/aux_scale": aux_scale_value,
-                                "train/loss_ema": loss_ema_value,
-                                "train/sigma_mean": sigma_mean_value,
-                                "train/flow_target_rms": flow_target_rms_value,
-                                "train/flow_pred_rms": flow_pred_rms_value,
-                                "train/x_target_rms": x_target_rms_value,
-                                "train/x_pred_rms": x_pred_rms_value,
-                                "train/noise_target_rms": noise_target_rms_value,
-                                "train/noise_pred_rms": noise_pred_rms_value,
-                                "train/epoch": epoch + 1,
-                            },
-                            step=global_step,
+                    log_tensorboard_scalars(
+                        tb_writer,
+                        {
+                            "train/loss": loss_value,
+                            "train/raw_loss": raw_loss_value,
+                            "train/flow_loss": flow_loss_value,
+                            "train/x_loss": x_loss_value,
+                            "train/noise_loss": noise_loss_value,
+                            "train/temporal_delta_loss": temporal_delta_loss_value,
+                            "train/aux_scale": aux_scale_value,
+                            "train/loss_ema": loss_ema_value,
+                            "train/sigma_mean": sigma_mean_value,
+                            "train/flow_target_rms": flow_target_rms_value,
+                            "train/flow_pred_rms": flow_pred_rms_value,
+                            "train/x_target_rms": x_target_rms_value,
+                            "train/x_pred_rms": x_pred_rms_value,
+                            "train/noise_target_rms": noise_target_rms_value,
+                            "train/noise_pred_rms": noise_pred_rms_value,
+                            "train/epoch": epoch + 1,
+                        },
+                        global_step,
+                    )
+
+                should_save_step_checkpoint = (
+                    args.checkpoint_every_steps is not None
+                    and global_step > 0
+                    and global_step % int(args.checkpoint_every_steps) == 0
+                    and last_checkpoint_step != global_step
+                )
+                if should_save_step_checkpoint:
+                    step_checkpoint_dir = build_periodic_checkpoint_dir(
+                        output_dir=output_dir,
+                        epoch=epoch + 1,
+                        global_step=global_step,
+                    )
+                    if accelerator.is_main_process:
+                        checkpoint_record = {
+                            "epoch": epoch + 1,
+                            "global_step": global_step,
+                            "checkpoint_dir": str(step_checkpoint_dir),
+                            "reason": "step",
+                        }
+                        train_metrics["saved_checkpoints"].append(checkpoint_record)
+                        print(
+                            f"[train] saving step checkpoint epoch={epoch + 1} "
+                            f"step={global_step} dir={step_checkpoint_dir}"
                         )
+                    save_training_artifacts(
+                        output_dir=step_checkpoint_dir,
+                        transformer=transformer,
+                        learned_tail_codec=learned_tail_codec,
+                        training_model=None,
+                        codec_config=codec_config,
+                        history_sizes=history_sizes,
+                        latent_window_size=latent_window_size,
+                        args=args,
+                        train_metrics=train_metrics,
+                        accelerator=accelerator,
+                    )
+                    last_checkpoint_step = global_step
+                    if accelerator.is_main_process:
+                        log_tensorboard_scalars(
+                            tb_writer,
+                            {
+                                "checkpoint/epoch": epoch + 1,
+                                "checkpoint/global_step": global_step,
+                                "checkpoint/is_step_checkpoint": 1,
+                            },
+                            global_step,
+                        )
+                        if tb_writer is not None:
+                            tb_writer.add_text("checkpoint/reason", "step", global_step)
+                            tb_writer.flush()
 
                 if args.max_steps is not None and global_step >= args.max_steps:
                     stop_training = True
                     break
 
             # 周期性 checkpoint 方便观察不同训练阶段的恢复质量，也利于中断后续训。
-            should_save_periodic_checkpoint = global_step > 0 and (epoch + 1) % checkpoint_save_interval_epochs == 0
+            should_save_periodic_checkpoint = (
+                global_step > 0
+                and (epoch + 1) % checkpoint_save_interval_epochs == 0
+                and last_checkpoint_step != global_step
+            )
             if accelerator.is_main_process and epoch_logged_steps > 0:
                 epoch_summary = {
                     "epoch": epoch + 1,
@@ -1553,27 +1848,27 @@ def command_train(args: argparse.Namespace) -> None:
                     "noise_pred_rms_mean": epoch_metric_sums["noise_pred_rms"] / epoch_logged_steps,
                 }
                 train_metrics["epoch_summaries"].append(epoch_summary)
-                if wandb_run is not None:
-                    wandb_run.log(
-                        {
-                            "epoch/loss_mean": epoch_summary["loss_mean"],
-                            "epoch/raw_loss_mean": epoch_summary["raw_loss_mean"],
-                            "epoch/flow_loss_mean": epoch_summary["flow_loss_mean"],
-                            "epoch/x_loss_mean": epoch_summary["x_loss_mean"],
-                            "epoch/noise_loss_mean": epoch_summary["noise_loss_mean"],
-                            "epoch/temporal_delta_loss_mean": epoch_summary["temporal_delta_loss_mean"],
-                            "epoch/aux_scale_mean": epoch_summary["aux_scale_mean"],
-                            "epoch/loss_ema_last": epoch_summary["loss_ema_last"],
-                            "epoch/sigma_mean": epoch_summary["sigma_mean"],
-                            "epoch/flow_target_rms_mean": epoch_summary["flow_target_rms_mean"],
-                            "epoch/flow_pred_rms_mean": epoch_summary["flow_pred_rms_mean"],
-                            "epoch/x_target_rms_mean": epoch_summary["x_target_rms_mean"],
-                            "epoch/x_pred_rms_mean": epoch_summary["x_pred_rms_mean"],
-                            "epoch/noise_target_rms_mean": epoch_summary["noise_target_rms_mean"],
-                            "epoch/noise_pred_rms_mean": epoch_summary["noise_pred_rms_mean"],
-                        },
-                        step=global_step,
-                    )
+                log_tensorboard_scalars(
+                    tb_writer,
+                    {
+                        "epoch/loss_mean": epoch_summary["loss_mean"],
+                        "epoch/raw_loss_mean": epoch_summary["raw_loss_mean"],
+                        "epoch/flow_loss_mean": epoch_summary["flow_loss_mean"],
+                        "epoch/x_loss_mean": epoch_summary["x_loss_mean"],
+                        "epoch/noise_loss_mean": epoch_summary["noise_loss_mean"],
+                        "epoch/temporal_delta_loss_mean": epoch_summary["temporal_delta_loss_mean"],
+                        "epoch/aux_scale_mean": epoch_summary["aux_scale_mean"],
+                        "epoch/loss_ema_last": epoch_summary["loss_ema_last"],
+                        "epoch/sigma_mean": epoch_summary["sigma_mean"],
+                        "epoch/flow_target_rms_mean": epoch_summary["flow_target_rms_mean"],
+                        "epoch/flow_pred_rms_mean": epoch_summary["flow_pred_rms_mean"],
+                        "epoch/x_target_rms_mean": epoch_summary["x_target_rms_mean"],
+                        "epoch/x_pred_rms_mean": epoch_summary["x_pred_rms_mean"],
+                        "epoch/noise_target_rms_mean": epoch_summary["noise_target_rms_mean"],
+                        "epoch/noise_pred_rms_mean": epoch_summary["noise_pred_rms_mean"],
+                    },
+                    global_step,
+                )
             if should_save_periodic_checkpoint:
                 periodic_checkpoint_dir = build_periodic_checkpoint_dir(
                     output_dir=output_dir,
@@ -1585,6 +1880,7 @@ def command_train(args: argparse.Namespace) -> None:
                         "epoch": epoch + 1,
                         "global_step": global_step,
                         "checkpoint_dir": str(periodic_checkpoint_dir),
+                        "reason": "epoch",
                     }
                     train_metrics["saved_checkpoints"].append(checkpoint_record)
                     print(
@@ -1603,14 +1899,20 @@ def command_train(args: argparse.Namespace) -> None:
                     train_metrics=train_metrics,
                     accelerator=accelerator,
                 )
-                if accelerator.is_main_process and wandb_run is not None:
-                    wandb_run.log(
+                last_checkpoint_step = global_step
+                if accelerator.is_main_process:
+                    log_tensorboard_scalars(
+                        tb_writer,
                         {
                             "checkpoint/epoch": epoch + 1,
                             "checkpoint/global_step": global_step,
+                            "checkpoint/is_epoch_checkpoint": 1,
                         },
-                        step=global_step,
+                        global_step,
                     )
+                    if tb_writer is not None:
+                        tb_writer.add_text("checkpoint/reason", "epoch", global_step)
+                        tb_writer.flush()
 
             if stop_training:
                 break
@@ -1629,16 +1931,23 @@ def command_train(args: argparse.Namespace) -> None:
             accelerator=accelerator,
         )
         if accelerator.is_main_process and train_metrics["losses"]:
-            if wandb_run is not None:
-                wandb_run.summary["train/steps"] = train_metrics["steps"]
-                wandb_run.summary["train/last_loss"] = train_metrics["losses"][-1]
-                wandb_run.summary["train/last_raw_loss"] = train_metrics["raw_losses"][-1]
-                wandb_run.summary["train/last_flow_loss"] = train_metrics["flow_losses"][-1]
-                wandb_run.summary["train/last_x_loss"] = train_metrics["x_losses"][-1]
-                wandb_run.summary["train/last_noise_loss"] = train_metrics["noise_losses"][-1]
-                wandb_run.summary["train/last_temporal_delta_loss"] = train_metrics["temporal_delta_losses"][-1]
-                wandb_run.summary["train/last_loss_ema"] = train_metrics["losses_ema"][-1]
-                wandb_run.summary["train/trainable_params"] = train_metrics["trainable_params"]
+            log_tensorboard_scalars(
+                tb_writer,
+                {
+                    "summary/steps": train_metrics["steps"],
+                    "summary/last_loss": train_metrics["losses"][-1],
+                    "summary/last_raw_loss": train_metrics["raw_losses"][-1],
+                    "summary/last_flow_loss": train_metrics["flow_losses"][-1],
+                    "summary/last_x_loss": train_metrics["x_losses"][-1],
+                    "summary/last_noise_loss": train_metrics["noise_losses"][-1],
+                    "summary/last_temporal_delta_loss": train_metrics["temporal_delta_losses"][-1],
+                    "summary/last_loss_ema": train_metrics["losses_ema"][-1],
+                    "summary/trainable_params": train_metrics["trainable_params"],
+                },
+                int(train_metrics["steps"]),
+            )
+            if tb_writer is not None:
+                tb_writer.flush()
             print(
                 f"[train] completed steps={train_metrics['steps']} "
                 f"last_loss={train_metrics['losses'][-1]:.6f} "
@@ -1653,9 +1962,8 @@ def command_train(args: argparse.Namespace) -> None:
     finally:
         if progress is not None:
             progress.close()
-        if accelerator.is_main_process and wandb_run is not None:
-            # 使用 finally 确保异常退出时也能正常结束 wandb run，避免日志目录损坏。
-            wandb_run.finish()
+        if accelerator.is_main_process and tb_writer is not None:
+            tb_writer.close()
 
 
 def command_infer(args: argparse.Namespace) -> None:
@@ -1703,6 +2011,40 @@ def command_infer(args: argparse.Namespace) -> None:
             raise ValueError(f"--num_inference_steps must be > 0, got {args.num_inference_steps}.")
         mode_inference_steps = resolve_mode_inference_steps(args, checkpoint_config)
         codec_config = CodecConfig(**checkpoint_config["codec_config"])
+        codec_config.single_head_codec_type = str(
+            resolve_infer_value(
+                cli_value=args.single_head_codec_type,
+                default_value=DEFAULT_SINGLE_HEAD_CODEC_TYPE,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "single_head_codec_type",
+                    DEFAULT_SINGLE_HEAD_CODEC_TYPE,
+                ),
+            )
+        )
+        if codec_config.single_head_codec_type not in {
+            SINGLE_HEAD_ANCHOR_CODEC_TYPE,
+            SINGLE_HEAD_SOFT_POOL_CODEC_TYPE,
+        }:
+            raise ValueError(
+                "--single_head_codec_type must be one of "
+                f"{SINGLE_HEAD_ANCHOR_CODEC_TYPE}, {SINGLE_HEAD_SOFT_POOL_CODEC_TYPE}; "
+                f"got {codec_config.single_head_codec_type}."
+            )
+        codec_config.single_head_soft_pool_spatial_factor = int(
+            resolve_infer_value(
+                cli_value=args.single_head_soft_pool_spatial_factor,
+                default_value=DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "single_head_soft_pool_spatial_factor",
+                    DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+                ),
+            )
+        )
+        if codec_config.single_head_soft_pool_spatial_factor < 1:
+            raise ValueError(
+                "--single_head_soft_pool_spatial_factor must be >= 1, "
+                f"got {codec_config.single_head_soft_pool_spatial_factor}."
+            )
         codec_config.dual_head_codec_type = str(
             resolve_infer_value(
                 cli_value=args.dual_head_codec_type,
@@ -1787,6 +2129,42 @@ def command_infer(args: argparse.Namespace) -> None:
                 "--adaptive_dual_head_full_ratio must be in [0, 1], "
                 f"got {codec_config.adaptive_dual_head_full_ratio}."
             )
+        resolved_adaptive_dual_head_soft_pool_hard_factor = resolve_infer_value(
+            cli_value=args.adaptive_dual_head_soft_pool_hard_factor,
+            default_value=DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR,
+            checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                "adaptive_dual_head_soft_pool_hard_factor",
+                DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR,
+            ),
+        )
+        codec_config.adaptive_dual_head_soft_pool_hard_factor = (
+            None
+            if resolved_adaptive_dual_head_soft_pool_hard_factor is None
+            else int(resolved_adaptive_dual_head_soft_pool_hard_factor)
+        )
+        if (
+            codec_config.adaptive_dual_head_soft_pool_hard_factor is not None
+            and codec_config.adaptive_dual_head_soft_pool_hard_factor < 1
+        ):
+            raise ValueError(
+                "--adaptive_dual_head_soft_pool_hard_factor must be >= 1 when set, "
+                f"got {codec_config.adaptive_dual_head_soft_pool_hard_factor}."
+            )
+        codec_config.adaptive_dual_head_soft_pool_hard_ratio = float(
+            resolve_infer_value(
+                cli_value=args.adaptive_dual_head_soft_pool_hard_ratio,
+                default_value=DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "adaptive_dual_head_soft_pool_hard_ratio",
+                    DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO,
+                ),
+            )
+        )
+        if not 0.0 <= codec_config.adaptive_dual_head_soft_pool_hard_ratio <= 1.0:
+            raise ValueError(
+                "--adaptive_dual_head_soft_pool_hard_ratio must be in [0, 1], "
+                f"got {codec_config.adaptive_dual_head_soft_pool_hard_ratio}."
+            )
         codec_config.global_keyframe_codec_type = str(
             resolve_infer_value(
                 cli_value=args.global_keyframe_codec_type,
@@ -1862,6 +2240,56 @@ def command_infer(args: argparse.Namespace) -> None:
         )
         if codec_config.target_low_bpp is not None and codec_config.target_low_bpp <= 0.0:
             raise ValueError(f"--target_low_bpp must be > 0, got {codec_config.target_low_bpp}.")
+        codec_config.max_predict_only_gap_sections = int(
+            resolve_infer_value(
+                cli_value=args.max_predict_only_gap_sections,
+                default_value=DEFAULT_MAX_PREDICT_ONLY_GAP,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "max_predict_only_gap_sections",
+                    DEFAULT_MAX_PREDICT_ONLY_GAP,
+                ),
+            )
+        )
+        codec_config.single_refresh_gain_threshold = float(
+            resolve_infer_value(
+                cli_value=args.single_refresh_gain_threshold,
+                default_value=DEFAULT_SINGLE_REFRESH_GAIN,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "single_refresh_gain_threshold",
+                    DEFAULT_SINGLE_REFRESH_GAIN,
+                ),
+            )
+        )
+        codec_config.dual_refresh_gain_threshold = float(
+            resolve_infer_value(
+                cli_value=args.dual_refresh_gain_threshold,
+                default_value=DEFAULT_DUAL_REFRESH_GAIN,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "dual_refresh_gain_threshold",
+                    DEFAULT_DUAL_REFRESH_GAIN,
+                ),
+            )
+        )
+        codec_config.boundary_jump_threshold = float(
+            resolve_infer_value(
+                cli_value=args.boundary_jump_threshold,
+                default_value=DEFAULT_BOUNDARY_JUMP,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "boundary_jump_threshold",
+                    DEFAULT_BOUNDARY_JUMP,
+                ),
+            )
+        )
+        codec_config.cut_detection_threshold = float(
+            resolve_infer_value(
+                cli_value=args.cut_detection_threshold,
+                default_value=DEFAULT_CUT_DETECTION,
+                checkpoint_value=checkpoint_config.get("codec_config", {}).get(
+                    "cut_detection_threshold",
+                    DEFAULT_CUT_DETECTION,
+                ),
+            )
+        )
         validate_codec_config(asdict(codec_config))
         history_sizes = normalize_history_sizes(checkpoint_config["history_sizes"])
         latent_window_size = int(checkpoint_config.get("section_span_latents", checkpoint_config["latent_window_size"]))
@@ -2094,6 +2522,13 @@ def command_infer(args: argparse.Namespace) -> None:
                 if first_section_ready_seconds is None
                 else stage_prepare_seconds + float(first_section_ready_seconds)
             )
+            streaming_frame_group_ready_events = []
+            for event in reconstruct_timing.get("streaming_latent_ready_events", []):
+                reconstruct_ready_seconds = float(event["ready_seconds"])
+                enriched_event = dict(event)
+                enriched_event["reconstruct_ready_seconds"] = reconstruct_ready_seconds
+                enriched_event["ready_seconds"] = stage_prepare_seconds + reconstruct_ready_seconds
+                streaming_frame_group_ready_events.append(enriched_event)
             metrics_payload = {
                 "input_path": str(sequence.path),
                 "low_latent_path": str(low_latent_path),
@@ -2118,6 +2553,10 @@ def command_infer(args: argparse.Namespace) -> None:
                 "recover_boundary_transition_l1": recover_boundary_transition_l1,
                 "section_boundary_delta_l1": recover_boundary_transition_l1,
                 "boundary_transition_l1": recover_boundary_transition_l1,
+                "streaming_frame_group_ready_events": streaming_frame_group_ready_events,
+                "streaming_frame_group_ready_seconds": [
+                    float(event["ready_seconds"]) for event in streaming_frame_group_ready_events
+                ],
                 **temporal_backtrack_metrics,
                 "codec_config": asdict(codec_config),
                 "checkpoint_dir": str(checkpoint_dir),
@@ -2228,6 +2667,12 @@ def build_codec_config(args: argparse.Namespace) -> CodecConfig:
         tail_span_latents=tail_span_latents,
         anchor_quant_dtype=args.anchor_quant_dtype,
         anchor_spatial_factor=args.anchor_spatial_factor,
+        single_head_codec_type=getattr(args, "single_head_codec_type", DEFAULT_SINGLE_HEAD_CODEC_TYPE),
+        single_head_soft_pool_spatial_factor=getattr(
+            args,
+            "single_head_soft_pool_spatial_factor",
+            DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+        ),
         dual_head_codec_type=getattr(args, "dual_head_codec_type", DEFAULT_DUAL_HEAD_CODEC_TYPE),
         dual_head_anchor_spatial_factor=getattr(args, "dual_head_anchor_spatial_factor", DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR),
         dual_head_p_delta_spatial_factor=getattr(
@@ -2244,6 +2689,16 @@ def build_codec_config(args: argparse.Namespace) -> CodecConfig:
             args,
             "adaptive_dual_head_full_ratio",
             DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO,
+        ),
+        adaptive_dual_head_soft_pool_hard_factor=getattr(
+            args,
+            "adaptive_dual_head_soft_pool_hard_factor",
+            DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR,
+        ),
+        adaptive_dual_head_soft_pool_hard_ratio=getattr(
+            args,
+            "adaptive_dual_head_soft_pool_hard_ratio",
+            DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO,
         ),
         dual_tail_anchor_spatial_factor=getattr(args, "dual_tail_anchor_spatial_factor", DEFAULT_DUAL_TAIL_ANCHOR_SPATIAL_FACTOR),
         dual_tail_codec_type=getattr(args, "dual_tail_codec_type", DEFAULT_DUAL_TAIL_CODEC_TYPE),
@@ -2298,6 +2753,46 @@ def discover_input_latent_paths(input_path: Path) -> Tuple[Path, List[Path]]:
     if not latent_paths:
         raise FileNotFoundError(f"No latent files found in: {resolved}")
     return resolved, latent_paths
+
+
+def build_sequence_index_entry(path: Path) -> LatentSequenceIndexEntry:
+    """读取单个 latent 的轻量索引信息，然后释放 payload tensor。"""
+    payload = load_payload(path)
+    validate_payload(payload, path)
+    latent_chunks = payload["latent_chunks"]
+    first_chunk = latent_chunks[0]
+    latent_channels = int(first_chunk.shape[0])
+    chunk_lengths = [int(chunk.shape[1]) for chunk in latent_chunks]
+    chunk_frame_ranges = build_chunk_frame_ranges(
+        [int((chunk.shape[1] - 1) * 4 + 1) for chunk in latent_chunks]
+    )
+    source_num_frames = infer_source_num_frames(latent_chunks, payload)
+    source_width, source_height = resolve_source_resolution(payload, path)
+    total_pixels = source_num_frames * source_width * source_height
+    raw_file_bytes = path.stat().st_size
+    raw_bpp = compute_bpp_from_total_pixels(raw_file_bytes, total_pixels)
+    metadata = SequenceMetadata(
+        source_fps=float(payload["source_fps"]),
+        source_num_frames=source_num_frames,
+        source_width=source_width,
+        source_height=source_height,
+        total_pixels=total_pixels,
+        raw_file_bytes=raw_file_bytes,
+        raw_bpp=raw_bpp,
+        chunk_lengths=chunk_lengths,
+        chunk_frame_ranges=chunk_frame_ranges,
+    )
+    return LatentSequenceIndexEntry(
+        path=path.resolve(),
+        metadata=metadata,
+        latent_channels=latent_channels,
+        total_latent_frames=sum(chunk_lengths),
+    )
+
+
+def build_sequence_index(latent_paths: Sequence[Path]) -> List[LatentSequenceIndexEntry]:
+    """构建训练窗口需要的轻量索引，不保留任何 latent tensor。"""
+    return [build_sequence_index_entry(path) for path in latent_paths]
 
 
 def prepare_sequence(
@@ -2389,12 +2884,18 @@ def prepare_sequence(
     return sequence
 
 
-def infer_latent_channels(sequences: Sequence[PreparedSequence]) -> int:
+def get_sequence_latent_channels(sequence: PreparedSequence | LatentSequenceIndexEntry) -> int:
+    if isinstance(sequence, LatentSequenceIndexEntry):
+        return int(sequence.latent_channels)
+    return int(sequence.clean_full_latents.shape[0])
+
+
+def infer_latent_channels(sequences: Sequence[PreparedSequence | LatentSequenceIndexEntry]) -> int:
     if not sequences:
         raise ValueError("Expected at least one sequence to infer latent channels.")
-    latent_channels = int(sequences[0].clean_full_latents.shape[0])
+    latent_channels = get_sequence_latent_channels(sequences[0])
     for sequence in sequences[1:]:
-        current_channels = int(sequence.clean_full_latents.shape[0])
+        current_channels = get_sequence_latent_channels(sequence)
         if current_channels != latent_channels:
             raise ValueError(
                 "All sequences must share the same latent channel count for a shared learned codec, "
@@ -2747,7 +3248,13 @@ def predict_section_from_history(
     else:
         delta = torch.zeros_like(last_frame, dtype=torch.float32)
 
-    steps = torch.arange(1, section_length + 1, device=device, dtype=torch.float32).view(1, section_length, 1, 1)
+    steps = torch.linspace(
+        1.0 / float(section_length),
+        1.0,
+        steps=section_length,
+        device=device,
+        dtype=torch.float32,
+    ).view(1, section_length, 1, 1)
     predicted = last_frame.expand(-1, section_length, -1, -1) + steps * delta.expand(-1, section_length, -1, -1)
     if predicted.shape[2] != height or predicted.shape[3] != width:
         predicted = torch.nn.functional.interpolate(
@@ -3203,6 +3710,9 @@ def training_step(
     temporal_delta_loss_weight: float,
     aux_loss_warmup_steps: int,
     aux_loss_ramp_steps: int,
+    aux_loss_clip_value: Optional[float],
+    aux_loss_sigma_min: Optional[float],
+    aux_loss_sigma_max: Optional[float],
     soft_tail_hint_strength: float,
     train_mixed_dual_tail_spatial_factor: Optional[int],
     train_mixed_dual_tail_ratio: float,
@@ -3327,6 +3837,12 @@ def training_step(
         dtype=torch.float32,
     )
     weighted_mask = mask * tail_position_weights
+    aux_sigma_mask = torch.ones_like(sigma.view(-1, 1, 1, 1, 1), dtype=torch.float32)
+    if aux_loss_sigma_min is not None:
+        aux_sigma_mask = aux_sigma_mask * (sigma.view(-1, 1, 1, 1, 1) >= float(aux_loss_sigma_min)).float()
+    if aux_loss_sigma_max is not None:
+        aux_sigma_mask = aux_sigma_mask * (sigma.view(-1, 1, 1, 1, 1) <= float(aux_loss_sigma_max)).float()
+    aux_weighted_mask = weighted_mask * aux_sigma_mask
     sigma_view_float = sigma.view(-1, 1, 1, 1, 1)
     xt = noisy_model_input.float()
     x_target = model_input.float()
@@ -3360,22 +3876,25 @@ def training_step(
     )
     raw_loss = masked_mean(flow_sq_error, mask)
     flow_loss = masked_mean(flow_sq_error * weighting, weighted_mask)
-    x_loss = normalized_masked_mse(x_pred, x_target, weighted_mask)
-    noise_loss = normalized_masked_mse(noise_pred, noise_target, weighted_mask)
+    x_loss = normalized_masked_mse(x_pred, x_target, aux_weighted_mask)
+    noise_loss = normalized_masked_mse(noise_pred, noise_target, aux_weighted_mask)
     temporal_delta_loss = compute_temporal_delta_loss(
         prediction=x_pred_for_temporal,
         target=x_target_for_temporal,
         valid_target_frames=valid_target_frames,
         device=device,
-        position_weights=tail_position_weights,
+        position_weights=tail_position_weights * aux_sigma_mask,
     )
+    x_loss_for_optim = clamp_loss_for_optimization(x_loss, aux_loss_clip_value)
+    noise_loss_for_optim = clamp_loss_for_optimization(noise_loss, aux_loss_clip_value)
+    temporal_delta_loss_for_optim = clamp_loss_for_optimization(temporal_delta_loss, aux_loss_clip_value)
     loss = (
         flow_loss_weight * flow_loss
         + aux_scale
         * (
-            x_loss_weight * x_loss
-            + noise_loss_weight * noise_loss
-            + temporal_delta_loss_weight * temporal_delta_loss
+            x_loss_weight * x_loss_for_optim
+            + noise_loss_weight * noise_loss_for_optim
+            + temporal_delta_loss_weight * temporal_delta_loss_for_optim
         )
     )
     return TrainingStepOutput(
@@ -3407,6 +3926,12 @@ def normalized_masked_mse(prediction: torch.Tensor, target: torch.Tensor, mask: 
     numerator = masked_mean((prediction - target).pow(2), mask)
     denominator = masked_mean(target.pow(2), mask) + EPS
     return numerator / denominator
+
+
+def clamp_loss_for_optimization(loss: torch.Tensor, clip_value: Optional[float]) -> torch.Tensor:
+    if clip_value is None:
+        return loss
+    return loss.clamp(max=float(clip_value))
 
 
 def overwrite_anchor_latents(
@@ -3669,6 +4194,7 @@ def reconstruct_sequence(
     )
     section_count_by_mode = {mode_name: 0 for mode_name in mode_order}
     section_seconds_by_mode = {mode_name: 0.0 for mode_name in mode_order}
+    streaming_latent_ready_events: List[Dict[str, object]] = []
     denoise_submodule_seconds = {
         "total_seconds": 0.0,
         "random_init_and_scheduler_setup_seconds": 0.0,
@@ -3710,6 +4236,7 @@ def reconstruct_sequence(
                     "section_count_by_mode": section_count_by_mode,
                     "section_seconds_by_mode": section_seconds_by_mode,
                     "avg_section_seconds_by_mode": {mode_name: 0.0 for mode_name in mode_order},
+                    "streaming_latent_ready_events": [],
                     "stage1_denoise_submodule_seconds": denoise_submodule_seconds,
                 }
             )
@@ -3722,6 +4249,7 @@ def reconstruct_sequence(
     section_starts = list(range(1, clean_full.shape[1], latent_window_size))
     recovered_sections: List[torch.Tensor] = []
     recovered_prefix = low_full[:, :1].float().cpu().contiguous()
+    low_history_source = low_full.float().cpu().contiguous()
     section_payload_lookup = build_section_payload_lookup(sequence.low_codec_payload)
     dummy_target = torch.zeros(
         1,
@@ -3735,16 +4263,18 @@ def reconstruct_sequence(
     x0_latents = low_full[:, :1].unsqueeze(0).to(device=device, dtype=weight_dtype)
     validate_mode_inference_steps(mode_inference_steps)
 
-    for section_start in tqdm(
-        section_starts,
-        desc=f"Reconstructing sections rank={distributed_context.rank}",
-        disable=distributed_context.is_distributed and not distributed_context.is_main_process,
+    for section_idx, section_start in enumerate(
+        tqdm(
+            section_starts,
+            desc=f"Reconstructing sections rank={distributed_context.rank}",
+            disable=distributed_context.is_distributed and not distributed_context.is_main_process,
+        )
     ):
         section_wall_start_time = start_synced_timer(device) if timing is not None else None
         history_start_time = start_synced_timer(device) if timing is not None else None
         history_latents = extract_history_window(
-            source_full_latents=recovered_prefix,
-            section_start=int(recovered_prefix.shape[1]),
+            source_full_latents=low_history_source,
+            section_start=section_start,
             history_window_size=sum(history_sizes),
         ).unsqueeze(0)
         if history_start_time is not None:
@@ -3863,8 +4393,28 @@ def reconstruct_sequence(
         if section_wall_start_time is not None:
             section_wall_seconds = stop_synced_timer(section_wall_start_time, device)
             section_seconds_by_mode[section_mode] += float(section_wall_seconds)
+            section_ready_seconds = stop_synced_timer(reconstruct_start_time, device)
             if first_section_ready_seconds is None:
-                first_section_ready_seconds = stop_synced_timer(reconstruct_start_time, device)
+                first_section_ready_seconds = section_ready_seconds
+            for latent_offset in range(valid_target_frames):
+                latent_index = int(section_start + latent_offset)
+                frame_start = 1 + 4 * (latent_index - 1)
+                frame_end = min(int(sequence.metadata.source_num_frames), frame_start + 4)
+                if frame_end <= frame_start:
+                    continue
+                streaming_latent_ready_events.append(
+                    {
+                        "frame_group_index": len(streaming_latent_ready_events) + 1,
+                        "latent_index": latent_index,
+                        "section_index": int(section_idx),
+                        "section_start_latent": int(section_start),
+                        "section_mode": section_mode,
+                        "frame_start": int(frame_start),
+                        "frame_end": int(frame_end),
+                        "ready_seconds": float(section_ready_seconds),
+                        "section_elapsed_seconds": float(section_wall_seconds),
+                    }
+                )
 
     assemble_start_time = start_synced_timer(device) if timing is not None else None
     recovered_remainder = torch.cat(recovered_sections, dim=1)
@@ -3895,6 +4445,7 @@ def reconstruct_sequence(
                     )
                     for mode_name in mode_order
                 },
+                "streaming_latent_ready_events": streaming_latent_ready_events,
                 "stage1_denoise_submodule_seconds": denoise_submodule_seconds,
             }
         )
@@ -4414,11 +4965,15 @@ def build_recover_config(
         "tail_span_latents": codec_config.tail_span_latents,
         "anchor_quant_dtype": codec_config.anchor_quant_dtype,
         "anchor_spatial_factor": codec_config.anchor_spatial_factor,
+        "single_head_codec_type": codec_config.single_head_codec_type,
+        "single_head_soft_pool_spatial_factor": codec_config.single_head_soft_pool_spatial_factor,
         "dual_head_codec_type": codec_config.dual_head_codec_type,
         "dual_head_anchor_spatial_factor": codec_config.dual_head_anchor_spatial_factor,
         "dual_head_p_delta_spatial_factor": codec_config.dual_head_p_delta_spatial_factor,
         "dual_head_soft_pool_spatial_factor": codec_config.dual_head_soft_pool_spatial_factor,
         "adaptive_dual_head_full_ratio": codec_config.adaptive_dual_head_full_ratio,
+        "adaptive_dual_head_soft_pool_hard_factor": codec_config.adaptive_dual_head_soft_pool_hard_factor,
+        "adaptive_dual_head_soft_pool_hard_ratio": codec_config.adaptive_dual_head_soft_pool_hard_ratio,
         "global_keyframe_codec_type": codec_config.global_keyframe_codec_type,
         "global_keyframe_quant_dtype": codec_config.global_keyframe_quant_dtype,
         "global_keyframe_spatial_factor": codec_config.global_keyframe_spatial_factor,
@@ -4446,6 +5001,9 @@ def build_recover_config(
             "temporal_delta_loss_weight": args.temporal_delta_loss_weight,
             "aux_loss_warmup_steps": args.aux_loss_warmup_steps,
             "aux_loss_ramp_steps": args.aux_loss_ramp_steps,
+            "aux_loss_clip_value": args.aux_loss_clip_value,
+            "aux_loss_sigma_min": args.aux_loss_sigma_min,
+            "aux_loss_sigma_max": args.aux_loss_sigma_max,
         },
     }
 
@@ -4626,6 +5184,19 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     )
     codec_config.setdefault("anchor_quant_dtype", config.get("anchor_quant_dtype", DEFAULT_ANCHOR_QUANT_DTYPE))
     codec_config.setdefault("anchor_spatial_factor", int(config.get("anchor_spatial_factor", DEFAULT_ANCHOR_SPATIAL_FACTOR)))
+    codec_config.setdefault(
+        "single_head_codec_type",
+        str(config.get("single_head_codec_type", DEFAULT_SINGLE_HEAD_CODEC_TYPE)),
+    )
+    codec_config.setdefault(
+        "single_head_soft_pool_spatial_factor",
+        int(
+            config.get(
+                "single_head_soft_pool_spatial_factor",
+                DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+            )
+        ),
+    )
     dual_head_anchor_spatial_factor = config.get("dual_head_anchor_spatial_factor")
     codec_config.setdefault(
         "dual_head_codec_type",
@@ -4646,6 +5217,22 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     codec_config.setdefault(
         "adaptive_dual_head_full_ratio",
         float(config.get("adaptive_dual_head_full_ratio", DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO)),
+    )
+    adaptive_dual_head_soft_pool_hard_factor = config.get("adaptive_dual_head_soft_pool_hard_factor")
+    codec_config.setdefault(
+        "adaptive_dual_head_soft_pool_hard_factor",
+        None
+        if adaptive_dual_head_soft_pool_hard_factor is None
+        else int(adaptive_dual_head_soft_pool_hard_factor),
+    )
+    codec_config.setdefault(
+        "adaptive_dual_head_soft_pool_hard_ratio",
+        float(
+            config.get(
+                "adaptive_dual_head_soft_pool_hard_ratio",
+                DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO,
+            )
+        ),
     )
     codec_config.setdefault(
         "global_keyframe_codec_type",
@@ -4684,11 +5271,21 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config["tail_span_latents"] = int(codec_config["tail_span_latents"])
     config["anchor_quant_dtype"] = codec_config["anchor_quant_dtype"]
     config["anchor_spatial_factor"] = int(codec_config["anchor_spatial_factor"])
+    config["single_head_codec_type"] = str(codec_config["single_head_codec_type"])
+    config["single_head_soft_pool_spatial_factor"] = int(
+        codec_config["single_head_soft_pool_spatial_factor"]
+    )
     config["dual_head_codec_type"] = str(codec_config["dual_head_codec_type"])
     config["dual_head_anchor_spatial_factor"] = codec_config["dual_head_anchor_spatial_factor"]
     config["dual_head_p_delta_spatial_factor"] = int(codec_config["dual_head_p_delta_spatial_factor"])
     config["dual_head_soft_pool_spatial_factor"] = int(codec_config["dual_head_soft_pool_spatial_factor"])
     config["adaptive_dual_head_full_ratio"] = float(codec_config["adaptive_dual_head_full_ratio"])
+    config["adaptive_dual_head_soft_pool_hard_factor"] = codec_config[
+        "adaptive_dual_head_soft_pool_hard_factor"
+    ]
+    config["adaptive_dual_head_soft_pool_hard_ratio"] = float(
+        codec_config["adaptive_dual_head_soft_pool_hard_ratio"]
+    )
     config["global_keyframe_codec_type"] = str(codec_config["global_keyframe_codec_type"])
     config["global_keyframe_quant_dtype"] = str(codec_config["global_keyframe_quant_dtype"])
     config["global_keyframe_spatial_factor"] = int(codec_config["global_keyframe_spatial_factor"])
@@ -4708,6 +5305,9 @@ def load_recover_config(checkpoint_dir: Path) -> Dict[str, object]:
     config.setdefault("soft_tail_hint_step_fraction", DEFAULT_SOFT_TAIL_HINT_STEP_FRACTION)
     train_loss_config = dict(config.get("train_loss_config") or {})
     train_loss_config.setdefault("temporal_delta_loss_weight", DEFAULT_TEMPORAL_DELTA_LOSS_WEIGHT)
+    train_loss_config.setdefault("aux_loss_clip_value", DEFAULT_AUX_LOSS_CLIP_VALUE)
+    train_loss_config.setdefault("aux_loss_sigma_min", DEFAULT_AUX_LOSS_SIGMA_MIN)
+    train_loss_config.setdefault("aux_loss_sigma_max", DEFAULT_AUX_LOSS_SIGMA_MAX)
     config["temporal_delta_loss_weight"] = train_loss_config["temporal_delta_loss_weight"]
     config["train_loss_config"] = train_loss_config
     return config

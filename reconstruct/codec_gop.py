@@ -14,6 +14,8 @@ INT8_REFRESH_LIKE_GLOBAL_KEYFRAME_CODEC_TYPE = "int8_refresh_like"
 DUAL_HEAD_ANCHOR_CODEC_TYPE = "anchor"
 DUAL_HEAD_P_DELTA_CODEC_TYPE = "p_delta"
 DUAL_HEAD_SOFT_POOL_CODEC_TYPE = "soft_pool"
+SINGLE_HEAD_ANCHOR_CODEC_TYPE = DUAL_HEAD_ANCHOR_CODEC_TYPE
+SINGLE_HEAD_SOFT_POOL_CODEC_TYPE = DUAL_HEAD_SOFT_POOL_CODEC_TYPE
 DUAL_TAIL_ANCHOR_CODEC_TYPE = "anchor"
 DUAL_TAIL_P_DELTA_CODEC_TYPE = "p_delta"
 PREDICT_ONLY_SECTION_MODE = "predict_only"
@@ -27,11 +29,15 @@ DEFAULT_CUT_DETECTION_THRESHOLD = 0.35
 DEFAULT_GLOBAL_KEYFRAME_CODEC_TYPE = RAW_GLOBAL_KEYFRAME_CODEC_TYPE
 DEFAULT_GLOBAL_KEYFRAME_QUANT_DTYPE = "int8"
 DEFAULT_GLOBAL_KEYFRAME_SPATIAL_FACTOR = 1
+DEFAULT_SINGLE_HEAD_CODEC_TYPE = SINGLE_HEAD_ANCHOR_CODEC_TYPE
+DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR = 4
 DEFAULT_DUAL_HEAD_CODEC_TYPE = DUAL_HEAD_ANCHOR_CODEC_TYPE
 DEFAULT_DUAL_HEAD_ANCHOR_SPATIAL_FACTOR: Optional[int] = None
 DEFAULT_DUAL_HEAD_P_DELTA_SPATIAL_FACTOR = 4
 DEFAULT_DUAL_HEAD_SOFT_POOL_SPATIAL_FACTOR = 4
 DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO = 0.0
+DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_FACTOR: Optional[int] = None
+DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO = 0.0
 DEFAULT_DUAL_TAIL_CODEC_TYPE = DUAL_TAIL_ANCHOR_CODEC_TYPE
 DEFAULT_DUAL_TAIL_P_DELTA_SPATIAL_FACTOR = 4
 LOW_CODEC_BYTE_BREAKDOWN_KEYS = (
@@ -112,6 +118,29 @@ def _dual_head_anchor_spatial_factor(codec_config) -> Optional[int]:
     return int(value)
 
 
+def _single_head_codec_type(codec_config) -> str:
+    if isinstance(codec_config, dict):
+        return str(codec_config.get("single_head_codec_type", DEFAULT_SINGLE_HEAD_CODEC_TYPE))
+    return str(getattr(codec_config, "single_head_codec_type", DEFAULT_SINGLE_HEAD_CODEC_TYPE))
+
+
+def _single_head_soft_pool_spatial_factor(codec_config) -> int:
+    if isinstance(codec_config, dict):
+        return int(
+            codec_config.get(
+                "single_head_soft_pool_spatial_factor",
+                DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+            )
+        )
+    return int(
+        getattr(
+            codec_config,
+            "single_head_soft_pool_spatial_factor",
+            DEFAULT_SINGLE_HEAD_SOFT_POOL_SPATIAL_FACTOR,
+        )
+    )
+
+
 def _dual_head_codec_type(codec_config) -> str:
     if isinstance(codec_config, dict):
         return str(codec_config.get("dual_head_codec_type", DEFAULT_DUAL_HEAD_CODEC_TYPE))
@@ -134,6 +163,30 @@ def _adaptive_dual_head_full_ratio(codec_config) -> float:
     if isinstance(codec_config, dict):
         return float(codec_config.get("adaptive_dual_head_full_ratio", DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO))
     return float(getattr(codec_config, "adaptive_dual_head_full_ratio", DEFAULT_ADAPTIVE_DUAL_HEAD_FULL_RATIO))
+
+
+def _adaptive_dual_head_soft_pool_hard_factor(codec_config) -> Optional[int]:
+    value = _get_optional_config_value(codec_config, "adaptive_dual_head_soft_pool_hard_factor", None)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _adaptive_dual_head_soft_pool_hard_ratio(codec_config) -> float:
+    if isinstance(codec_config, dict):
+        return float(
+            codec_config.get(
+                "adaptive_dual_head_soft_pool_hard_ratio",
+                DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO,
+            )
+        )
+    return float(
+        getattr(
+            codec_config,
+            "adaptive_dual_head_soft_pool_hard_ratio",
+            DEFAULT_ADAPTIVE_DUAL_HEAD_SOFT_POOL_HARD_RATIO,
+        )
+    )
 
 
 def _dual_tail_codec_type(codec_config) -> str:
@@ -171,11 +224,15 @@ def validate_codec_config(codec_config) -> None:
     spatial_factor = _as_int(codec_config, "spatial_factor")
     anchor_spatial_factor = _as_int(codec_config, "anchor_spatial_factor")
     dual_tail_anchor_spatial_factor = _dual_tail_anchor_spatial_factor(codec_config)
+    single_head_codec_type = _single_head_codec_type(codec_config)
+    single_head_soft_pool_spatial_factor = _single_head_soft_pool_spatial_factor(codec_config)
     dual_head_codec_type = _dual_head_codec_type(codec_config)
     dual_head_anchor_spatial_factor = _dual_head_anchor_spatial_factor(codec_config)
     dual_head_p_delta_spatial_factor = _dual_head_p_delta_spatial_factor(codec_config)
     dual_head_soft_pool_spatial_factor = _dual_head_soft_pool_spatial_factor(codec_config)
     adaptive_dual_head_full_ratio = _adaptive_dual_head_full_ratio(codec_config)
+    adaptive_dual_head_soft_pool_hard_factor = _adaptive_dual_head_soft_pool_hard_factor(codec_config)
+    adaptive_dual_head_soft_pool_hard_ratio = _adaptive_dual_head_soft_pool_hard_ratio(codec_config)
     dual_tail_codec_type = _dual_tail_codec_type(codec_config)
     dual_tail_p_delta_spatial_factor = _dual_tail_p_delta_spatial_factor(codec_config)
 
@@ -212,6 +269,16 @@ def validate_codec_config(codec_config) -> None:
             "dual_head_anchor_spatial_factor must be >= 1 when set, "
             f"got {dual_head_anchor_spatial_factor}."
         )
+    if single_head_codec_type not in {SINGLE_HEAD_ANCHOR_CODEC_TYPE, SINGLE_HEAD_SOFT_POOL_CODEC_TYPE}:
+        raise ValueError(
+            f"Unsupported single_head_codec_type={single_head_codec_type}. "
+            f"Expected {SINGLE_HEAD_ANCHOR_CODEC_TYPE} or {SINGLE_HEAD_SOFT_POOL_CODEC_TYPE}."
+        )
+    if single_head_soft_pool_spatial_factor < 1:
+        raise ValueError(
+            "single_head_soft_pool_spatial_factor must be >= 1, "
+            f"got {single_head_soft_pool_spatial_factor}."
+        )
     if dual_head_codec_type not in {
         DUAL_HEAD_ANCHOR_CODEC_TYPE,
         DUAL_HEAD_P_DELTA_CODEC_TYPE,
@@ -236,6 +303,19 @@ def validate_codec_config(codec_config) -> None:
         raise ValueError(
             "adaptive_dual_head_full_ratio must be in [0, 1], "
             f"got {adaptive_dual_head_full_ratio}."
+        )
+    if (
+        adaptive_dual_head_soft_pool_hard_factor is not None
+        and adaptive_dual_head_soft_pool_hard_factor < 1
+    ):
+        raise ValueError(
+            "adaptive_dual_head_soft_pool_hard_factor must be >= 1 when set, "
+            f"got {adaptive_dual_head_soft_pool_hard_factor}."
+        )
+    if not 0.0 <= adaptive_dual_head_soft_pool_hard_ratio <= 1.0:
+        raise ValueError(
+            "adaptive_dual_head_soft_pool_hard_ratio must be in [0, 1], "
+            f"got {adaptive_dual_head_soft_pool_hard_ratio}."
         )
     if dual_tail_codec_type not in {DUAL_TAIL_ANCHOR_CODEC_TYPE, DUAL_TAIL_P_DELTA_CODEC_TYPE}:
         raise ValueError(
@@ -471,13 +551,18 @@ def encode_head_soft_pool(
     clean_head_latents: torch.Tensor,
     codec_config,
     move_to_cpu: bool = True,
+    spatial_factor_override: Optional[int] = None,
 ) -> Dict[str, object]:
     if clean_head_latents.ndim != 4:
         raise ValueError(
             f"Expected clean_head_latents with shape [C, T, H, W], got {tuple(clean_head_latents.shape)}."
         )
     quant_dtype = _as_str(codec_config, "anchor_quant_dtype")
-    spatial_factor = _dual_head_soft_pool_spatial_factor(codec_config)
+    spatial_factor = (
+        int(spatial_factor_override)
+        if spatial_factor_override is not None
+        else _dual_head_soft_pool_spatial_factor(codec_config)
+    )
     reduced_head = clean_head_latents.float()
     if spatial_factor > 1:
         reduced_head = F.adaptive_avg_pool3d(
@@ -609,7 +694,13 @@ def _predict_section_from_history(
     else:
         delta = torch.zeros_like(last_frame, dtype=torch.float32)
 
-    steps = torch.arange(1, section_length + 1, device=device, dtype=torch.float32).view(1, section_length, 1, 1)
+    steps = torch.linspace(
+        1.0 / float(section_length),
+        1.0,
+        steps=section_length,
+        device=device,
+        dtype=torch.float32,
+    ).view(1, section_length, 1, 1)
     predicted = last_frame.expand(-1, section_length, -1, -1) + steps * delta.expand(-1, section_length, -1, -1)
     if predicted.shape[2] != height or predicted.shape[3] != width:
         predicted = trilinear_resize(predicted.unsqueeze(0), (section_length, height, width)).squeeze(0)
@@ -809,20 +900,47 @@ def _analyze_section_mode_candidates(
     tail_start = max(0, section_length - anchor_span)
     tail_clean_block = (tail_start, section_latents[:, tail_start:].contiguous())
 
-    head_payload = encode_refresh_anchor(head_clean_block[1], codec_config, move_to_cpu=move_to_cpu)
-    head_decoded_block = (
+    full_head_payload = encode_refresh_anchor(head_clean_block[1], codec_config, move_to_cpu=move_to_cpu)
+    full_head_decoded_block = (
         int(head_clean_block[0]),
-        decode_refresh_anchor(head_payload).to(device=section_latents.device, dtype=torch.float32),
+        decode_refresh_anchor(full_head_payload).to(device=section_latents.device, dtype=torch.float32),
     )
-    single_decoded_blocks = [head_decoded_block]
-    single_encoded_blocks = [
-        {
-            "start": int(head_clean_block[0]),
-            "length": int(head_clean_block[1].shape[1]),
-            "payload": head_payload,
-            "bytes": _estimate_refresh_anchor_bytes(head_payload),
-        }
-    ]
+    full_head_encoded_block = {
+        "start": int(head_clean_block[0]),
+        "length": int(head_clean_block[1].shape[1]),
+        "payload": full_head_payload,
+        "bytes": _estimate_refresh_anchor_bytes(full_head_payload),
+    }
+
+    single_head_codec_type = _single_head_codec_type(codec_config)
+    if single_head_codec_type == SINGLE_HEAD_SOFT_POOL_CODEC_TYPE:
+        single_head_payload = encode_head_soft_pool(
+            clean_head_latents=head_clean_block[1],
+            codec_config=codec_config,
+            move_to_cpu=move_to_cpu,
+            spatial_factor_override=_single_head_soft_pool_spatial_factor(codec_config),
+        )
+        single_decoded_blocks = [
+            (
+                int(head_clean_block[0]),
+                decode_head_soft_pool(single_head_payload).to(
+                    device=section_latents.device,
+                    dtype=torch.float32,
+                ),
+            )
+        ]
+        single_encoded_blocks = [
+            {
+                "start": int(head_clean_block[0]),
+                "length": int(head_clean_block[1].shape[1]),
+                "payload": single_head_payload,
+                "bytes": _estimate_refresh_anchor_bytes(single_head_payload),
+                "head_codec_type": SINGLE_HEAD_SOFT_POOL_CODEC_TYPE,
+            }
+        ]
+    else:
+        single_decoded_blocks = [full_head_decoded_block]
+        single_encoded_blocks = [dict(full_head_encoded_block)]
 
     none_prediction = _build_proxy_section_from_history(
         history_latents,
@@ -830,8 +948,8 @@ def _analyze_section_mode_candidates(
         [],
     )
 
-    dual_decoded_blocks = list(single_decoded_blocks)
-    dual_encoded_blocks = list(single_encoded_blocks)
+    dual_decoded_blocks = [full_head_decoded_block]
+    dual_encoded_blocks = [dict(full_head_encoded_block)]
     dual_head_codec_type = _dual_head_codec_type(codec_config)
     dual_head_spatial_factor = _dual_head_anchor_spatial_factor(codec_config)
     if dual_head_codec_type == DUAL_HEAD_P_DELTA_CODEC_TYPE:
@@ -1024,6 +1142,8 @@ def _analyze_section_mode_candidates(
             SINGLE_REFRESH_SECTION_MODE: list(single_encoded_blocks),
             DUAL_REFRESH_SECTION_MODE: list(dual_encoded_blocks),
         },
+        "full_head_encoded_block": dict(full_head_encoded_block),
+        "single_head_codec_type": single_head_codec_type,
         "mode_total_anchor_bytes": {
             PREDICT_ONLY_SECTION_MODE: 0,
             SINGLE_REFRESH_SECTION_MODE: sum(
@@ -1144,6 +1264,49 @@ def _select_adaptive_dual_head_full_indices(
 
     scored_dual_sections.sort(key=lambda item: (item[0], -item[1]), reverse=True)
     return {section_index for _, section_index in scored_dual_sections[:full_count]}
+
+
+def _select_adaptive_dual_head_soft_pool_hard_indices(
+    section_analyses: Sequence[Dict[str, object]],
+    selected_modes: Sequence[str],
+    codec_config,
+) -> set[int]:
+    if _dual_head_codec_type(codec_config) != DUAL_HEAD_SOFT_POOL_CODEC_TYPE:
+        return set()
+    hard_factor = _adaptive_dual_head_soft_pool_hard_factor(codec_config)
+    if hard_factor is None:
+        return set()
+    if hard_factor == _dual_head_soft_pool_spatial_factor(codec_config):
+        return set()
+
+    hard_ratio = _adaptive_dual_head_soft_pool_hard_ratio(codec_config)
+    if hard_ratio <= 0.0:
+        return set()
+
+    scored_dual_sections: List[Tuple[Tuple[float, float, float], int]] = []
+    for section_index, (section_analysis, selected_mode) in enumerate(zip(section_analyses, selected_modes)):
+        if str(selected_mode) != DUAL_REFRESH_SECTION_MODE:
+            continue
+        dual_blocks = section_analysis["encoded_blocks_by_mode"][DUAL_REFRESH_SECTION_MODE]
+        if not dual_blocks:
+            continue
+        heuristic_scores = section_analysis["heuristic_scores"]
+        hard_score = (
+            float(heuristic_scores["boundary_jump_l1"]),
+            float(heuristic_scores["gain_ratio_dual"]),
+            float(heuristic_scores["error_single"]),
+        )
+        scored_dual_sections.append((hard_score, section_index))
+
+    if not scored_dual_sections:
+        return set()
+
+    hard_count = min(len(scored_dual_sections), int(math.ceil(hard_ratio * len(scored_dual_sections))))
+    if hard_count <= 0:
+        return set()
+
+    scored_dual_sections.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    return {section_index for _, section_index in scored_dual_sections[:hard_count]}
 
 
 def _estimate_budget_fixed_bytes(
@@ -1471,6 +1634,11 @@ def encode_anchor_plus_tail_latents(
         selected_modes=selected_modes,
         codec_config=codec_config,
     )
+    adaptive_soft_pool_hard_indices = _select_adaptive_dual_head_soft_pool_hard_indices(
+        section_analyses=section_analyses,
+        selected_modes=selected_modes,
+        codec_config=codec_config,
+    )
     section_payloads: List[Dict[str, object]] = []
     cheap_tail_factor = (
         None
@@ -1480,16 +1648,66 @@ def encode_anchor_plus_tail_latents(
     cheap_tail_ratio = float(train_mixed_dual_tail_ratio)
     dual_head_spatial_factor = _dual_head_anchor_spatial_factor(codec_config)
     base_head_spatial_factor = _as_int(codec_config, "anchor_spatial_factor")
-    for section_index, (section_analysis, selected_mode) in enumerate(zip(section_analyses, selected_modes)):
+    selected_decoded_history = decoded_global_keyframe.float().contiguous()
+    selected_sections_since_refresh = 0
+    for section_index, ((section_start, section_end), selected_mode) in enumerate(zip(section_ranges, selected_modes)):
+        section_latents = clean_full_latents[:, section_start:section_end]
+        section_shape = tuple(int(value) for value in section_latents.shape)
+        section_analysis = _analyze_section_mode_candidates(
+            section_latents=section_latents,
+            history_latents=selected_decoded_history,
+            codec_config=codec_config,
+            sections_since_refresh=selected_sections_since_refresh,
+            move_to_cpu=move_to_cpu,
+        )
         encoded_anchor_blocks = list(section_analysis["encoded_blocks_by_mode"][selected_mode])
+        single_head_fidelity = None
         dual_head_fidelity = None
         dual_tail_fidelity = None
+        if selected_mode == SINGLE_REFRESH_SECTION_MODE:
+            single_head_fidelity = (
+                f"soft_pool_x{_single_head_soft_pool_spatial_factor(codec_config)}"
+                if _single_head_codec_type(codec_config) == SINGLE_HEAD_SOFT_POOL_CODEC_TYPE
+                else "full"
+            )
         if selected_mode == DUAL_REFRESH_SECTION_MODE:
             dual_head_fidelity = "full"
             if _dual_head_codec_type(codec_config) == DUAL_HEAD_P_DELTA_CODEC_TYPE:
                 dual_head_fidelity = f"p_delta_x{_dual_head_p_delta_spatial_factor(codec_config)}"
             elif _dual_head_codec_type(codec_config) == DUAL_HEAD_SOFT_POOL_CODEC_TYPE:
                 dual_head_fidelity = f"soft_pool_x{_dual_head_soft_pool_spatial_factor(codec_config)}"
+                hard_factor = _adaptive_dual_head_soft_pool_hard_factor(codec_config)
+                if (
+                    hard_factor is not None
+                    and section_index in adaptive_soft_pool_hard_indices
+                    and len(encoded_anchor_blocks) > 0
+                    and len(section_analysis["clean_blocks_by_mode"][DUAL_REFRESH_SECTION_MODE]) > 0
+                ):
+                    head_block_start, head_clean_latents = section_analysis["clean_blocks_by_mode"][
+                        DUAL_REFRESH_SECTION_MODE
+                    ][0]
+                    hard_head_payload = encode_head_soft_pool(
+                        head_clean_latents,
+                        codec_config,
+                        move_to_cpu=move_to_cpu,
+                        spatial_factor_override=hard_factor,
+                    )
+                    old_head_block = encoded_anchor_blocks[0]
+                    encoded_anchor_blocks = list(encoded_anchor_blocks)
+                    encoded_anchor_blocks[0] = {
+                        "start": int(head_block_start),
+                        "length": int(head_clean_latents.shape[1]),
+                        "payload": hard_head_payload,
+                        "bytes": _estimate_refresh_anchor_bytes(hard_head_payload),
+                        "head_codec_type": DUAL_HEAD_SOFT_POOL_CODEC_TYPE,
+                    }
+                    dual_head_fidelity = f"soft_pool_x{hard_factor}"
+                    if budget_result["estimated_selected_bytes"] is not None:
+                        budget_result["estimated_selected_bytes"] = int(
+                            budget_result["estimated_selected_bytes"]
+                            + int(encoded_anchor_blocks[0]["bytes"])
+                            - int(old_head_block["bytes"])
+                        )
             elif (
                 dual_head_spatial_factor is not None
                 and dual_head_spatial_factor != base_head_spatial_factor
@@ -1497,7 +1715,7 @@ def encode_anchor_plus_tail_latents(
             ):
                 dual_head_fidelity = f"cheap_x{dual_head_spatial_factor}"
                 if section_index in adaptive_full_head_indices:
-                    full_head_block = dict(section_analysis["encoded_blocks_by_mode"][SINGLE_REFRESH_SECTION_MODE][0])
+                    full_head_block = dict(section_analysis["full_head_encoded_block"])
                     cheap_head_block = encoded_anchor_blocks[0]
                     encoded_anchor_blocks = list(encoded_anchor_blocks)
                     encoded_anchor_blocks[0] = full_head_block
@@ -1508,7 +1726,11 @@ def encode_anchor_plus_tail_latents(
                             + int(full_head_block["bytes"])
                             - int(cheap_head_block["bytes"])
                         )
-            dual_tail_fidelity = "full"
+            dual_tail_fidelity = (
+                f"p_delta_x{_dual_tail_p_delta_spatial_factor(codec_config)}"
+                if _dual_tail_codec_type(codec_config) == DUAL_TAIL_P_DELTA_CODEC_TYPE
+                else "full"
+            )
             if (
                 cheap_tail_factor is not None
                 and cheap_tail_factor > 1
@@ -1536,11 +1758,30 @@ def encode_anchor_plus_tail_latents(
                     "bytes": _estimate_refresh_anchor_bytes(cheap_tail_payload),
                 }
                 dual_tail_fidelity = f"cheap_x{cheap_tail_factor}"
+        decoded_anchor_blocks = _decode_section_anchor_blocks_from_payload(
+            anchor_blocks=encoded_anchor_blocks,
+            decoded_history=selected_decoded_history,
+            section_shape=section_shape,
+            target_device=selected_decoded_history.device,
+        )
+        decoded_section = _build_proxy_section_from_history(
+            history_latents=selected_decoded_history,
+            section_shape=section_shape,
+            anchor_blocks=decoded_anchor_blocks,
+        )
+        selected_decoded_history = torch.cat(
+            [selected_decoded_history, decoded_section.float()],
+            dim=1,
+        ).contiguous()
+        selected_sections_since_refresh = (
+            0 if selected_mode != PREDICT_ONLY_SECTION_MODE else selected_sections_since_refresh + 1
+        )
         section_payloads.append(
             {
                 "mode": str(selected_mode),
                 "anchor_blocks": encoded_anchor_blocks,
                 "heuristic_scores": dict(section_analysis["heuristic_scores"]),
+                "single_head_fidelity": single_head_fidelity,
                 "dual_head_fidelity": dual_head_fidelity,
                 "dual_tail_fidelity": dual_tail_fidelity,
             }
@@ -1562,6 +1803,77 @@ def encode_anchor_plus_tail_latents(
     }
 
 
+def _decode_section_anchor_blocks_from_payload(
+    anchor_blocks: Sequence[Dict[str, object]],
+    decoded_history: torch.Tensor,
+    section_shape: Tuple[int, int, int, int],
+    target_device: torch.device,
+) -> List[Tuple[int, torch.Tensor]]:
+    channel_count, section_length, height, width = (int(value) for value in section_shape)
+    decoded_anchor_blocks: List[Tuple[int, torch.Tensor]] = []
+    head_p_delta_blocks: List[Dict[str, object]] = []
+    head_soft_pool_blocks: List[Dict[str, object]] = []
+    tail_p_delta_blocks: List[Dict[str, object]] = []
+    for anchor_block in anchor_blocks:
+        anchor_payload = anchor_block["payload"]
+        block_codec_type = str(
+            anchor_block.get(
+                "head_codec_type",
+                anchor_block.get(
+                    "tail_codec_type",
+                    anchor_payload.get("codec_type", DUAL_TAIL_ANCHOR_CODEC_TYPE),
+                ),
+            )
+        )
+        if block_codec_type == DUAL_HEAD_SOFT_POOL_CODEC_TYPE:
+            head_soft_pool_blocks.append(anchor_block)
+            continue
+        if block_codec_type == DUAL_HEAD_P_DELTA_CODEC_TYPE:
+            head_p_delta_blocks.append(anchor_block)
+            continue
+        if block_codec_type == DUAL_TAIL_P_DELTA_CODEC_TYPE:
+            tail_p_delta_blocks.append(anchor_block)
+            continue
+        decoded_anchor = decode_refresh_anchor(anchor_payload).to(device=target_device, dtype=torch.float32)
+        decoded_anchor_blocks.append((int(anchor_block["start"]), decoded_anchor))
+    for anchor_block in sorted(head_soft_pool_blocks, key=lambda block: int(block["start"])):
+        block_start = int(anchor_block["start"])
+        decoded_head = decode_head_soft_pool(anchor_block["payload"]).to(
+            device=target_device,
+            dtype=torch.float32,
+        )
+        decoded_anchor_blocks.append((block_start, decoded_head))
+    for anchor_block in sorted(head_p_delta_blocks, key=lambda block: int(block["start"])):
+        block_start = int(anchor_block["start"])
+        block_length = int(anchor_block["length"])
+        prediction_without_head = _build_proxy_section_from_history(
+            history_latents=decoded_history,
+            section_shape=(channel_count, section_length, height, width),
+            anchor_blocks=decoded_anchor_blocks,
+        ).to(device=target_device, dtype=torch.float32)
+        predicted_head = prediction_without_head[:, block_start : block_start + block_length].contiguous()
+        decoded_head = decode_head_p_delta(anchor_block["payload"], predicted_head).to(
+            device=target_device,
+            dtype=torch.float32,
+        )
+        decoded_anchor_blocks.append((block_start, decoded_head))
+    for anchor_block in sorted(tail_p_delta_blocks, key=lambda block: int(block["start"])):
+        block_start = int(anchor_block["start"])
+        block_length = int(anchor_block["length"])
+        prediction_without_tail = _build_proxy_section_from_history(
+            history_latents=decoded_history,
+            section_shape=(channel_count, section_length, height, width),
+            anchor_blocks=decoded_anchor_blocks,
+        ).to(device=target_device, dtype=torch.float32)
+        predicted_tail = prediction_without_tail[:, block_start : block_start + block_length].contiguous()
+        decoded_tail = decode_tail_p_delta(anchor_block["payload"], predicted_tail).to(
+            device=target_device,
+            dtype=torch.float32,
+        )
+        decoded_anchor_blocks.append((block_start, decoded_tail))
+    return decoded_anchor_blocks
+
+
 def decode_anchor_plus_tail_latents(codec_payload: Dict[str, object], learned_tail_codec=None) -> torch.Tensor:
     global_keyframe = decode_global_keyframe(codec_payload).float()
     target_device = _module_device(learned_tail_codec) or global_keyframe.device
@@ -1578,67 +1890,12 @@ def decode_anchor_plus_tail_latents(codec_payload: Dict[str, object], learned_ta
         width = int(global_keyframe.shape[3])
         for (section_start, section_end), section_payload in zip(section_ranges, codec_payload["section_payloads"]):
             section_length = int(section_end) - int(section_start)
-            decoded_anchor_blocks: List[Tuple[int, torch.Tensor]] = []
-            head_p_delta_blocks: List[Dict[str, object]] = []
-            head_soft_pool_blocks: List[Dict[str, object]] = []
-            tail_p_delta_blocks: List[Dict[str, object]] = []
-            for anchor_block in section_payload.get("anchor_blocks", []):
-                anchor_payload = anchor_block["payload"]
-                block_codec_type = str(
-                    anchor_block.get(
-                        "head_codec_type",
-                        anchor_block.get(
-                        "tail_codec_type",
-                        anchor_payload.get("codec_type", DUAL_TAIL_ANCHOR_CODEC_TYPE),
-                        ),
-                    )
-                )
-                if block_codec_type == DUAL_HEAD_SOFT_POOL_CODEC_TYPE:
-                    head_soft_pool_blocks.append(anchor_block)
-                    continue
-                if block_codec_type == DUAL_HEAD_P_DELTA_CODEC_TYPE:
-                    head_p_delta_blocks.append(anchor_block)
-                    continue
-                if block_codec_type == DUAL_TAIL_P_DELTA_CODEC_TYPE:
-                    tail_p_delta_blocks.append(anchor_block)
-                    continue
-                decoded_anchor = decode_refresh_anchor(anchor_payload).to(device=target_device, dtype=torch.float32)
-                decoded_anchor_blocks.append((int(anchor_block["start"]), decoded_anchor))
-            for anchor_block in sorted(head_soft_pool_blocks, key=lambda block: int(block["start"])):
-                block_start = int(anchor_block["start"])
-                decoded_head = decode_head_soft_pool(anchor_block["payload"]).to(
-                    device=target_device,
-                    dtype=torch.float32,
-                )
-                decoded_anchor_blocks.append((block_start, decoded_head))
-            for anchor_block in sorted(head_p_delta_blocks, key=lambda block: int(block["start"])):
-                block_start = int(anchor_block["start"])
-                block_length = int(anchor_block["length"])
-                prediction_without_head = _build_proxy_section_from_history(
-                    history_latents=decoded_history,
-                    section_shape=(channel_count, section_length, height, width),
-                    anchor_blocks=decoded_anchor_blocks,
-                ).to(device=target_device, dtype=torch.float32)
-                predicted_head = prediction_without_head[:, block_start : block_start + block_length].contiguous()
-                decoded_head = decode_head_p_delta(anchor_block["payload"], predicted_head).to(
-                    device=target_device,
-                    dtype=torch.float32,
-                )
-                decoded_anchor_blocks.append((block_start, decoded_head))
-            for anchor_block in sorted(tail_p_delta_blocks, key=lambda block: int(block["start"])):
-                block_start = int(anchor_block["start"])
-                block_length = int(anchor_block["length"])
-                prediction_without_tail = _build_proxy_section_from_history(
-                    history_latents=decoded_history,
-                    section_shape=(channel_count, section_length, height, width),
-                    anchor_blocks=decoded_anchor_blocks,
-                ).to(device=target_device, dtype=torch.float32)
-                predicted_tail = prediction_without_tail[:, block_start : block_start + block_length].contiguous()
-                decoded_tail = decode_tail_p_delta(anchor_block["payload"], predicted_tail).to(
-                    device=target_device,
-                    dtype=torch.float32,
-                )
-                decoded_anchor_blocks.append((block_start, decoded_tail))
+            decoded_anchor_blocks = _decode_section_anchor_blocks_from_payload(
+                anchor_blocks=section_payload.get("anchor_blocks", []),
+                decoded_history=decoded_history,
+                section_shape=(channel_count, section_length, height, width),
+                target_device=target_device,
+            )
             decoded_section = _build_proxy_section_from_history(
                 history_latents=decoded_history,
                 section_shape=(channel_count, section_length, height, width),
